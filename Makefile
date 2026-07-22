@@ -15,7 +15,8 @@ venv: ## Create virtual environment (inherits system torch/neuronx)
 	python3 -m venv --system-site-packages $(VENV)
 	$(PIP) install --upgrade pip
 
-install: venv ## Install dependencies into venv
+install: venv ## Install dependencies into venv (including Neuron SDK)
+	$(PIP) install torch-neuronx neuronx-cc --extra-index-url https://pip.repos.neuron.amazonaws.com
 	$(PIP) install -r requirements.txt
 
 verify: ## Run neuron device path verification (Week 1 goal)
