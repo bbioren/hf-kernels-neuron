@@ -1,6 +1,10 @@
 # HF Kernels on Neuron — dev tasks
 # Run `make help` for available targets
+#
+# On Neuron DLAMI: uses the pre-installed PyTorch venv at /opt/aws_neuronx_venv_pytorch_2_9
+# Override with: make install NEURON_VENV=/path/to/other/venv
 
+NEURON_VENV := /opt/aws_neuronx_venv_pytorch_2_9
 VENV := .venv
 PYTHON := $(VENV)/bin/python
 PIP := $(VENV)/bin/pip
@@ -11,12 +15,19 @@ help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  %-15s %s\n", $$1, $$2}'
 
-venv: ## Create virtual environment (inherits system torch/neuronx)
-	python3 -m venv --system-site-packages $(VENV)
+venv: ## Create venv linked to Neuron PyTorch environment
+	@if [ -d "$(NEURON_VENV)" ]; then \
+		echo "Using Neuron venv at $(NEURON_VENV)"; \
+		python3 -m venv --system-site-packages $(VENV); \
+		echo "$(NEURON_VENV)/lib/python3.12/site-packages" > $(VENV)/lib/python3.12/site-packages/neuron.pth; \
+	else \
+		echo "Neuron venv not found at $(NEURON_VENV), creating standalone venv"; \
+		python3 -m venv $(VENV); \
+		$(PIP) install torch-neuronx neuronx-cc --extra-index-url https://pip.repos.neuron.amazonaws.com; \
+	fi
 	$(PIP) install --upgrade pip
 
-install: venv ## Install dependencies into venv (including Neuron SDK)
-	$(PIP) install torch-neuronx neuronx-cc --extra-index-url https://pip.repos.neuron.amazonaws.com
+install: venv ## Install project dependencies
 	$(PIP) install -r requirements.txt
 
 verify: ## Run neuron device path verification (Week 1 goal)
