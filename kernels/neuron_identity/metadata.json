@@ -1,0 +1,9 @@
+{
+  "name": "neuron-identity",
+  "id": "neuron_identity",
+  "version": 0,
+  "license": "Apache-2.0",
+  "backend": {
+    "type": "neuron"
+  }
+}
