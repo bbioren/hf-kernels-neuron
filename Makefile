@@ -11,8 +11,8 @@ help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  %-15s %s\n", $$1, $$2}'
 
-venv: ## Create virtual environment
-	python3 -m venv $(VENV)
+venv: ## Create virtual environment (inherits system torch/neuronx)
+	python3 -m venv --system-site-packages $(VENV)
 	$(PIP) install --upgrade pip
 
 install: venv ## Install dependencies into venv
