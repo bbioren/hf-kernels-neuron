@@ -7,7 +7,7 @@
 # HuggingFace stack
 # kernels: PyPI has the latest release with neuron device path
 # transformers: install from main for latest kernel integration
-kernels>=0.11.0
+kernels>=0.15,<0.16
 transformers @ git+https://github.com/huggingface/transformers.git@main
 
 # Utilities
