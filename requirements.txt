@@ -1,0 +1,13 @@
+# HF Kernels project dependencies
+# Install on trn2 host: pip install -r requirements.txt
+#
+# Note: torch-neuronx and neuronx-cc come from the Neuron SDK,
+# installed separately via the Neuron repo. Do NOT pip install them here.
+
+# HuggingFace stack (install from main for latest neuron device path)
+kernels @ git+https://github.com/huggingface/kernels.git@main
+transformers @ git+https://github.com/huggingface/transformers.git@main
+
+# Utilities
+numpy
+pytest

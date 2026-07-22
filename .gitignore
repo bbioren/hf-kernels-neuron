@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Neuron
+neuron_cache/
+.neuron_cache/
+*.neff
+*.ntff
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project
+*.log
+tmp/
