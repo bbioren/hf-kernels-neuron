@@ -91,7 +91,6 @@ def main():
         "IdentityScale": {
             "neuron": LocalLayerRepository(
                 repo_path=repo_path,
-                package_name="neuron_identity",
                 layer_name="NeuronIdentityScale",
             )
         }

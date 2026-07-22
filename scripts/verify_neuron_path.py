@@ -118,7 +118,6 @@ def check_local_layer_repository():
     try:
         local_repo = LocalLayerRepository(
             repo_path=repo_path,
-            package_name="neuron_rmsnorm",
             layer_name="NeuronRMSNorm",
         )
         print(f"  ✓ LocalLayerRepository created for neuron_rmsnorm")
@@ -181,7 +180,6 @@ def check_forward_swap():
         "RMSNorm": {
             "neuron": LocalLayerRepository(
                 repo_path=repo_path,
-                package_name="neuron_rmsnorm",
                 layer_name="NeuronRMSNorm",
             )
         }
