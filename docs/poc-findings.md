@@ -4,6 +4,25 @@ Tracking pain points, gaps, and observations as we integrate NKI kernels with th
 
 ---
 
+## Documentation Sources
+
+These are the primary references we used. Critically, they describe different layers of the system and sometimes contradict each other (especially around `LocalLayerRepository` API):
+
+| Source | What it covers | URL |
+|--------|---------------|-----|
+| `kernels` lib docs — Layers | `kernelize()`, `use_kernel_mapping`, `LocalLayerRepository`, layer requirements | https://github.com/huggingface/kernels/blob/main/docs/source/layers.md |
+| `kernels` lib docs — Kernel Requirements | Hub repo layout, `metadata.json` schema, backend types, build variants | https://huggingface.co/docs/kernels/kernel-requirements |
+| `kernels` lib docs — Quickstart | `get_kernel()`, basic loading | https://huggingface.co/docs/kernels/basic-usage |
+| transformers PR #46754 | "Writing kernels" doc — the two-class pattern, `KernelConfig`, module fusion, **single-file kernel example** | https://github.com/huggingface/transformers/pull/46754/files |
+| transformers PR #46339 | Extended kernel fusion API via `KernelConfig`, `register_kernel_replacements_and_fusions` | https://github.com/huggingface/transformers/pull/46339 |
+| transformers docs — Kernels | `_KERNEL_MAPPING`, `use_kernels=True`, `KernelConfig` | https://huggingface.co/docs/transformers/main/kernels |
+| `kernels-community/layer_norm` Hub repo | Example of a published CUDA kernel (build.toml, source layout) | https://huggingface.co/kernels-community/layer_norm/tree/v1 |
+| HF Blog — Kernel Hub intro | High-level overview of the Kernel Hub vision | https://huggingface.co/blog/hello-hf-kernels |
+
+**Key insight:** The `kernels` library docs describe the Hub *build artifact* format (multiple directories, build variants, compiled `.so` files). But transformers PR #46754 shows that for local/dev kernels, a kernel is just **one Python file** with a class that has `forward()` + a `layers` namespace class + `metadata.json`. Our initial scaffold was over-engineered because we followed the Hub build docs instead of the transformers integration pattern.
+
+---
+
 ## Summary Table
 
 | # | Finding | Severity | Status |
@@ -13,6 +32,7 @@ Tracking pain points, gaps, and observations as we integrate NKI kernels with th
 | 3 | `metadata.json` required fields not documented for local dev | Medium | Resolved |
 | 4 | No `kernel-builder` Neuron build variant | High | Open |
 | 5 | Neuron device shows "not detected (CPU-only mode)" despite hardware present | Low | Investigating |
+| 6 | Kernel can be a single file — our multi-file layout was over-engineered | Low | Resolved |
 
 ---
 
@@ -80,6 +100,33 @@ Tracking pain points, gaps, and observations as we integrate NKI kernels with th
 **Impact:** Low — this is a cosmetic issue in our test script, not a real problem. The `kernelize()` path works with `device="neuron"` as a string override regardless of runtime device detection. NKI kernels will compile and execute on NeuronCores when actually called (Week 2 will confirm).
 
 **Recommendation:** For eager-mode kernel development, device detection isn't needed — you pass `device="neuron"` explicitly. The kernels library's auto-detection path (inferring device from model parameters) may need Neuron-specific logic if it doesn't already handle this.
+
+---
+
+### 6. Minimal kernel structure is simpler than Hub docs suggest
+
+**What happened:** We initially built a multi-file layout (`__init__.py`, `layers.py`, `nki_rmsnorm.py`, `metadata.json`) following the Hub kernel-requirements docs. But transformers PR #46754 reveals the actual pattern is much simpler — **a single Python file** with:
+
+```python
+class NeuronRMSNorm(nn.Module):
+    def forward(self, hidden_states):
+        ...
+
+class layers:
+    NeuronRMSNorm = NeuronRMSNorm
+```
+
+Plus a `metadata.json`. That's the complete kernel. The `layers` thing isn't a separate file — it's a plain class used as a namespace to expose kernel classes.
+
+**Root cause:** Two different docs describe two different things:
+- `kernels` library kernel-requirements docs → describe the Hub *build artifact* (compiled CUDA kernels with build variants, `.so` files, etc.)
+- transformers PR #46754 "Writing kernels" → describes the *author-facing* pattern for Python-only kernels (NKI kernels are pure Python via `@nki.jit`)
+
+For NKI kernels (which are Python, not compiled C++/CUDA), the simpler single-file pattern is correct.
+
+**Impact:** Low — our multi-file version still works, it's just more files than needed. Will simplify going forward.
+
+**Recommendation:** The PoC doc should clarify that NKI kernels follow the single-file pattern from PR #46754, not the multi-directory CUDA build pattern. NKI kernels are Python source, so they don't need the `kernel-builder` compilation step.
 
 ---
 
