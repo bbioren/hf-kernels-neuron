@@ -42,10 +42,13 @@ Prove the `"neuron"` device path in the `kernels` library works on Trainium:
 
 | Package | Version | Notes |
 |---------|---------|-------|
-| `kernels` | TBD | pin after first trn2 run |
-| `transformers` | TBD | pin after first trn2 run |
-| `torch-neuronx` | TBD | SDK version on host |
-| `neuronx-cc` | TBD | compiler version on host |
+| `kernels` | 0.15.2 | from PyPI |
+| `transformers` | 5.15.0.dev0 | from main, commit `bb3ffb97` |
+| `torch` | 2.9.1+cu128 | from Neuron DLAMI |
+| `torch_neuronx` | available | from Neuron DLAMI |
+| `neuronx-cc` | 2.26.6360.0+6f180f47 | from Neuron DLAMI |
+| Python | 3.12.3 | Ubuntu 24.04 |
+| Instance | trn2.3xlarge | 1 device, 4 NeuronCores, 96 GB HBM |
 
 ## Links
 

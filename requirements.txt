@@ -8,7 +8,8 @@
 # kernels: PyPI has the latest release with neuron device path
 # transformers: install from main for latest kernel integration
 kernels>=0.15,<0.16
-transformers @ git+https://github.com/huggingface/transformers.git@main
+# transformers: pinned to the commit we verified on trn2 (2026-07-22)
+transformers @ git+https://github.com/huggingface/transformers.git@bb3ffb9703e3acb84f06db1d3799756e977662c2
 
 # Utilities
 numpy
