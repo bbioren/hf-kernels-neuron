@@ -81,15 +81,29 @@ These are the primary references we used. Critically, they describe different la
 
 ---
 
-### 4. No `kernel-builder` Neuron build variant [OPEN]
+### 4. No `kernel-builder` Neuron build variant [PARTIALLY RESOLVED]
 
-**What happened:** The `kernel-builder` tool (used to build and publish kernels to the Hub) has documented build variants for CUDA, ROCm, Metal, CPU, XPU, and CANN. The `backend.type` field accepts `"neuron"` (confirmed in kernel-requirements docs), but there's no documented `kernel-builder` workflow for producing a Neuron build variant.
+**What happened:** The `kernel-builder` tool has no documented Neuron target. We investigated whether this actually blocks Hub publishing for NKI kernels.
 
-**Impact:** High — this is the gap between "local dev works" and "published on the Hub for anyone to use." We can develop and validate kernels locally via `LocalLayerRepository`, but cannot publish them to the Hub without a build variant.
+**Investigation (2026-07-22):**
 
-**Status:** Known gap per project doc. Week 3 will determine if this blocks Hub publishing or if we can work around it with a manual upload.
+We dug into the `kernels` library source on trn2 and found:
+- `kernels/backends.py` has a `Neuron` class that parses `"neuron"` variant strings ✓
+- `kernels/variants.py` can parse `torch29-neuron-x86_64-linux` as a valid variant ✓
+- `parse_backend("neuron")` works ✓
 
-**Recommendation:** This is the #1 finding for the kernels team. The mechanism (device path, metadata, layer loading) all works for Neuron. The missing piece is the build tooling to produce a publishable artifact.
+**BUT:** The variant resolver in `get_local_kernel()` auto-detects the backend from torch's build config. On the DLAMI, torch reports `cu128` (CUDA), NOT `neuron`. So a Hub repo with a `build/torch29-neuron-x86_64-linux/` variant directory won't resolve — the loader looks for a CUDA variant, doesn't find one, and fails.
+
+**Why our flat structure works:** When variant resolution fails, `get_local_kernel()` has a fallback: it tries to import `repo_path` directly (as if the repo root IS the kernel). That's why our current layout (`__init__.py` + `metadata.json` at repo root, no `build/` subdirectory) works — it hits the fallback path.
+
+**The real blocker:** `LocalLayerRepository.load()` calls `get_local_kernel(repo_path)` WITHOUT passing a `backend` arg. There's no way to override the backend detection. Even if you pass `device="neuron"` to `kernelize()`, that only affects which kernel mapping entry to look up — it does NOT tell the variant resolver which variant directory to load.
+
+**Conclusion:** Hub publishing for Neuron kernels would need either:
+1. A change to `LocalLayerRepository` / `get_local_kernel` to accept a backend override (so `device="neuron"` propagates to variant resolution)
+2. OR: publish kernels in the flat format (no variant dirs) and rely on the fallback path — this works today but feels like a hack
+3. OR: The DLAMI's torch needs to report `neuron` as its backend (via `torch.neuron` attribute) — this check exists in `backends.py` line 198 (`if hasattr(torch, "neuron")`) but doesn't fire on current DLAMI
+
+**Impact:** Medium — we can still publish to the Hub using the flat format today. The variant system isn't strictly needed for pure-Python NKI kernels (there's only one "build" — it's just Python source). But it means multi-backend repos (CUDA + Neuron in one package) won't work until the resolver is fixed.
 
 ---
 
