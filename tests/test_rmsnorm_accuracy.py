@@ -12,15 +12,24 @@ This test exercises:
 3. Comparison against the actual Qwen3RMSNorm from transformers
 """
 
+import importlib.util
 import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def load_neuron_rmsnorm_module():
+    """Load the neuron_rmsnorm package from our local kernel directory."""
+    kernel_path = PROJECT_ROOT / "kernels" / "neuron_rmsnorm" / "__init__.py"
+    spec = importlib.util.spec_from_file_location("neuron_rmsnorm", kernel_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -62,8 +71,8 @@ def get_qwen3_rmsnorm():
 
 def get_neuron_rmsnorm():
     """Load our NeuronRMSNorm kernel."""
-    from kernels.neuron_rmsnorm import layers
-    return layers.NeuronRMSNorm
+    mod = load_neuron_rmsnorm_module()
+    return mod.layers.NeuronRMSNorm
 
 
 def test_accuracy(hidden_size, seq_len, batch_size=1, eps=1e-6, dtype=torch.float32):
@@ -88,8 +97,8 @@ def test_accuracy(hidden_size, seq_len, batch_size=1, eps=1e-6, dtype=torch.floa
 
     # NKI kernel output — simulate the kernelize swap by calling
     # NeuronRMSNorm.forward with self = ref_norm (the original module)
-    from kernels.neuron_rmsnorm import layers
-    neuron_forward = layers.NeuronRMSNorm.forward
+    mod = load_neuron_rmsnorm_module()
+    neuron_forward = mod.layers.NeuronRMSNorm.forward
 
     with torch.no_grad():
         # Bind the NeuronRMSNorm forward to the ref_norm module
@@ -111,8 +120,9 @@ def main():
     print()
 
     # Check if NKI is available
-    from kernels.neuron_rmsnorm import _HAS_NKI
-    if _HAS_NKI:
+    mod = load_neuron_rmsnorm_module()
+    has_nki = mod._HAS_NKI
+    if has_nki:
         print("  Backend: NKI kernel (NeuronCores)")
     else:
         print("  Backend: PyTorch fallback (CPU)")
