@@ -15,9 +15,10 @@ Versions these were verified against: `kernels 0.15.2`, `transformers 5.15.0.dev
 | 2 | Make `_backend()` report `neuron` | `torch_neuronx` | 1 attribute | Root-caused, fix not built | #7, #12 |
 | 3 | Resolve the `nki` / `neuronxcc.nki` capability split | NKI team | needs a decision | Documented only | #14 |
 | 4 | Add `nkilib` to the `python-depends` allowlist | HF `kernels` | ~6 lines | Feasibility verified | #16 |
+| 5 | Fused MLP divides by zero single-core when `I > 4096` | nki-library | bug fix | **Boundary measured, 10 data points** | #18 |
 
 Fixes 1 and 4 are asks to HuggingFace (raise with Samir). Fix 2 is internal to Neuron.
-Fix 3 is an NKI-team decision.
+Fixes 3 and 5 go to the NKI / nki-library teams.
 
 ---
 
@@ -352,6 +353,68 @@ present this as free.
 
 ---
 
+## Fix 5 — Fused MLP divides by zero single-core above `intermediate_size = 4096`
+
+### The problem
+
+`nkilib.core.mlp.mlp` fails to compile when launched single-core with
+`intermediate_size > 4096`. Sharp boundary, measured across 10 configurations spanning three
+`hidden_size` values: **passes iff `I <= 4096`**. I=4096 passes; I=4224 fails.
+
+```
+error: 'floordiv' does not allow division by zero
+  nkilib/core/utils/kernel_helpers.py:104   (numerator + denominator - 1) // denominator
+  nkilib/core/utils/tile_info.py:37         get_ceil_quotient(tiled_dim_size, tile_size)
+  nkilib/core/mlp/mlp_cte/mlp_cte_tile_info.py:236
+                                            build_with_subtiling(bxs_dim_size, ..., bxs_dim_subtile_size)
+  nkilib/core/mlp/mlp.py:340                mlp_cte(mlp_params, out, fused_add_out)
+```
+
+Not affected by sequence length (tested S=128/256/512), `force_cte_mode=True`, or
+`mode=PREFILL`.
+
+Likely cause: the CTE sharding heuristic in `mlp_cte_sharding.py` forces
+`shard_on_inter = True` when `intermediate_size > 4096` — exactly our boundary — and with no
+SPMD launch grid the inter-sharding path derives a zero subtile size.
+
+### Why it matters
+
+Every realistic model is excluded: Qwen3-8B (I=12288), Llama-3-8B and Mistral-7B (I=14336).
+Only Qwen3-0.6B-scale configs work. And unlike Finding #17, **a wrapper cannot work around
+this** — it's the kernel's own tile arithmetic.
+
+Nothing documents an `I <= 4096` single-core limit. The documented constraint is
+`H % 128 == 0`, which I=12288 satisfies.
+
+### What to do
+
+1. **File against nki-library** with the boundary table from
+   `scripts/spike_nkilib_mlp.py` (Q4 section reproduces it in ~2 minutes).
+2. Ask the two questions that determine whether the fused MLP is viable for HF at all:
+   - Is single-core operation above `I = 4096` intended to work? If yes, this is a bug in the
+     subtile computation.
+   - If no, can the constraint be asserted explicitly (via `kernel_assert`, like the other
+     documented constraints) rather than failing inside tile math with a divide-by-zero?
+3. **Separately, ask whether an SPMD launch fixes it.** If the kernel works multi-core at
+   I=12288, the real question becomes whether an HF per-layer forward swap can legitimately
+   launch SPMD. That is an architecture question for the HF kernels team and a more
+   interesting one than the weight layout. We did not attempt it — it needs a launch-grid
+   setup outside the per-layer swap model.
+
+### Broader implication worth raising in the same conversation
+
+Week 2 listed "SPMD multi-core assumptions don't fit the per-layer swap model" as a general
+concern. This is that concern with a measured boundary. For RoPE, stripping SPMD was a clean
+and harmless reduction (`num_shards = 1`). For the fused MLP it is not optional — the tiling
+requires the multi-core path at any useful size.
+
+So **SPMD-strippability is per-kernel, and for fused kernels it may not hold at all.** That is
+a structural point about whether the Kernel Hub's one-layer-one-core model can host
+nki-library's fused kernels, and it belongs in the Week 6 recommendation independent of how
+#17 and #18 are resolved.
+
+---
+
 ## Not a fix: Finding #17 (weight layout) is a design decision
 
 See `docs/poc-findings.md` #17 for the full analysis. Summarised here because it will come up
@@ -360,11 +423,17 @@ patch** — we should ask a question.
 
 Fused kernels want weights in a different layout than `nn.Linear` provides, and `kernelize()`
 has no parameter-transformation hook. All three HF MLP weights are transposed relative to
-`nkilib.core.mlp.mlp`, the transpose must be materialized, and every workaround is bad:
-in-place mutation silently breaks `save_pretrained` round-tripping; a transposed copy roughly
-doubles MLP weight memory; lazy-cache adds the same memory plus a first-step stall;
-per-forward transposing costs three weight-sized HBM round trips per layer per step and
-erases the speedup.
+`nkilib.core.mlp.mlp`.
+
+**Note the correction in `docs/poc-findings.md` #17 before quoting this.** We originally said
+non-contiguous views are rejected and the transpose must be materialized. Measured: the kernel
+*accepts* a device-side `.t()` result and is numerically correct, and `is_contiguous()` returns
+True on XLA even after `.t()` — XLA normalizes layout, so `.t()` is a real graph op rather than
+a stride view. The memory cost and the missing hook both stand; whether per-forward transposing
+is expensive depends on whether XLA hoists it, which we have not profiled.
+
+What remains solid: in-place mutation silently breaks `save_pretrained` round-tripping
+(layout-independent), and there is nowhere in the API for a one-time weight transform to live.
 
 The two questions to put to the HF kernels team:
 
@@ -382,10 +451,18 @@ work. It needs an answer before any fusion-API implementation starts.
 
 ## Filing order
 
-1. **Fix 1** — biggest customer impact, and we have a verified patch plus a working demo.
-   Strongest thing to lead with.
-2. **Fix 2** — cheapest, entirely within Neuron's control, unblocks two things at once.
-3. **Finding #17 question** — gates Week 5, so the answer is needed early even though it
-   isn't a patch.
-4. **Fix 4** — changes the shape of the whole program, but only becomes useful after Fix 2.
-5. **Fix 3** — real, but a productivity tax rather than a customer blocker.
+1. **Fix 1** (transformers) — biggest customer impact, and we have a verified patch plus a
+   working demo. Strongest thing to lead with.
+2. **Fix 2** (`torch_neuronx`) — cheapest, entirely within Neuron's control, unblocks two
+   things at once.
+3. **Fix 5** (nki-library) — a concrete bug with a measured boundary, and it *gates* the
+   fused-MLP work outright. Promoted above the #17 question because #17 is moot until #5 is
+   resolved: there is no point designing a weight-transformation contract for a kernel that
+   cannot compile at any useful size.
+4. **Finding #17 question** — still needed before Week 5 MoE work, but sequence it after #5.
+5. **Fix 4** (`nkilib` allowlist) — changes the shape of the whole program, but only becomes
+   useful after Fix 2.
+6. **Fix 3** (import-path split) — real, but a productivity tax rather than a customer blocker.
+
+Bundle 3 and 5 into one nki-library conversation — both are questions for the same team, and
+the SPMD-strippability point connects them.

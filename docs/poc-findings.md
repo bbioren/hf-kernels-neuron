@@ -43,7 +43,8 @@ These are the primary references we used. Critically, they describe different la
 | 14 | The two NKI import paths (`nki` vs `neuronxcc.nki`) have different capabilities; neither is a superset | High | Open |
 | 15 | Interception-point inventory: several `_KERNEL_MAPPING` entries are unreachable (incl. `SwiGLUMLP`) | Reference | Confirmed |
 | 16 | **`nkilib` is already installed and its kernels are directly callable — thin-wrapper porting is feasible today** | **High** | Open (policy blocker only) |
-| 17 | Fused MLP port is blocked by weight-layout transpose with no lifecycle hook in `kernelize()` | High | Open (design decision) |
+| 17 | Fused MLP: `kernelize()` has no weight-transformation hook | High | Open (design decision) — **premise partly corrected, see #17** |
+| 18 | **Fused MLP kernel cannot run single-core when `intermediate_size > 4096` — excludes every real model** | **High** | Open (nki-library bug; no wrapper workaround) |
 
 ---
 
@@ -668,19 +669,52 @@ wants**, and `kernelize()` provides nowhere to fix that.
 | `up_proj` | `[I, H]` | `[H, I]` |
 | `down_proj` | `[H, I]` | `[I, H]` |
 
-`.t()` is a free view in torch, but the kernel DMAs from HBM assuming row-major layout,
-and non-contiguous tensor failures are a known live issue on the Neuron beta — so a view
-cannot safely be passed. The transpose must be **materialized**.
+### CORRECTION (measured 2026-07-29, `scripts/spike_nkilib_mlp.py`)
+
+The first version of this finding said: *"`.t()` is a free view in torch, but the kernel DMAs
+from HBM assuming row-major layout, and non-contiguous tensor failures are a known live issue
+on the Neuron beta — so a view cannot safely be passed. The transpose must be materialized."*
+
+**That framing was wrong.** It was reasoned, not measured. What the measurement shows:
+
+- The kernel **accepts** the result of a device-side `.t()` and produces correct output —
+  `cos_sim 0.999989` at H=1024, I=3072. There is no non-contiguous rejection.
+- On XLA, `is_contiguous()` returns **`True` even after `.t()`**. XLA normalizes layout, so
+  `.t()` is not a stride view that can be passed around for free; it becomes a real transpose
+  op in the graph, producing a real tensor.
+
+The conclusion partly survives, but the reasoning and the confidence both change:
+
+| Claim | Status |
+|-------|--------|
+| Non-contiguous transposed tensors are rejected | **withdrawn** — they are accepted |
+| A stride-only view could avoid the transpose | **withdrawn** — XLA has no such thing here |
+| The transposed tensor is real, so the memory cost is real | **stands** |
+| `kernelize()` has no parameter-transformation hook | **stands**, unchanged |
+| Per-forward transposing costs HBM traffic | **unverified** |
+
+**The open question is narrower than first written.** Because `.t()` on XLA is a graph op, the
+cost depends on whether XLA hoists it out of repeated forwards (paid once — in which case
+"lazy transpose + cache" is nearly free and this finding is minor) or re-emits it every step
+(in which case the per-forward cost is real and the finding is severe). `is_contiguous()`
+cannot answer that; it needs a multi-step profile. Week 4 work.
+
+Until then the table below lists *candidate* costs, not established ones. What **is**
+established is the missing hook.
 
 `kernelize()` rewrites `forward` pointers. It never transforms parameters. There is no
-"on kernelize" or "on weight load" hook. Every workaround is bad in a different way:
+"on kernelize" or "on weight load" hook. Candidate approaches:
 
-| Option | Cost |
-|--------|------|
-| Mutate parameters in place at kernelize time | `state_dict()` / `save_pretrained()` emit transposed weights that won't load into a stock `Qwen3MLP`. Silent checkpoint corruption. |
-| Keep a second transposed copy | ~2x MLP weight memory. MLP dominates Qwen3-8B, so near 2x model memory — likely fatal on 96 GB at real batch sizes. |
-| Transpose lazily on first forward, cache | Same memory cost plus a first-step stall |
-| Transpose every forward | Three weight-sized HBM round trips per layer per step — erases the speedup entirely |
+| Option | Possible cost |
+|--------|---------------|
+| Mutate parameters in place at kernelize time | `state_dict()` / `save_pretrained()` emit transposed weights that won't load into a stock `Qwen3MLP`. Silent checkpoint corruption. **This one is layout-independent and stands regardless of the profiling result.** |
+| Keep a second transposed copy | ~2x MLP weight memory. MLP dominates Qwen3-8B, so near 2x model memory. |
+| Transpose lazily on first forward, cache | Same memory cost plus a first-step stall. **May be the right answer** if XLA hoists. |
+| Transpose every forward | Potentially three weight-sized HBM round trips per layer per step — unverified, see above |
+
+**Practical note:** this finding is currently moot for real models anyway, because Finding #18
+prevents the fused MLP from running single-core at any realistic `intermediate_size`. Resolve
+#18 first; #17 only becomes actionable after it.
 
 **Why this is a first-class finding rather than an implementation detail:** it blocks
 *every* fused-kernel port on Neuron, not just the MLP. Any kernel whose weight layout
@@ -709,3 +743,129 @@ Landing it in HF via the fusion API, correct *and* faster, is 2-3 weeks. Note al
 nki-library's own MLP tests use `rtol=2e-2`, two orders of magnitude looser than the
 `cos_sim > 0.999` bar we hold RMSNorm/RoPE to — decide which bar applies before starting,
 because a fused three-matmul kernel will not be bit-identical.
+
+## 18. The fused MLP kernel cannot run single-core when `intermediate_size > 4096` [HIGH — harder than #17]
+
+Found by the Week 4 derisking spike (`scripts/spike_nkilib_mlp.py`). This is a **sharp,
+reproducible boundary**, and it excludes every model anyone would actually want to accelerate.
+
+### The measurement
+
+Calling `nkilib.core.mlp.mlp` single-core (no SPMD launch grid) from PyTorch/XLA, bf16,
+B=1, S=128:
+
+| hidden_size | intermediate_size | Result |
+|---|---|---|
+| 1024 | 3072 | pass — cos_sim 0.999995 |
+| 1024 | **4096** | pass — cos_sim 0.999996 |
+| 1024 | **5120** | **compile error** |
+| 2048 | 4096 | pass — cos_sim 0.999988 |
+| 2048 | 6144 | **compile error** |
+| 4096 | 4096 | pass — cos_sim 0.999979 |
+| 4096 | **4224** | **compile error** |
+| 4096 | 4608 | **compile error** |
+| 4096 | 5120 | **compile error** |
+| 4096 | 8192 | **compile error** |
+| 4096 | 12288 | **compile error** |
+
+Ten data points across three `hidden_size` values: **passes iff `intermediate_size <= 4096`**.
+Not a ratio effect — H=1024/I=5120 fails while H=4096/I=4096 passes. The boundary is between
+4096 and 4224.
+
+Varying sequence length (S=128, 256, 512) does not help. Neither does `force_cte_mode=True`
+nor `mode=ComputationMode.PREFILL`.
+
+### The error
+
+```
+error: 'floordiv' does not allow division by zero
+  nkilib/core/utils/kernel_helpers.py:104   return (numerator + denominator - 1) // denominator
+  nkilib/core/utils/tile_info.py:37         tile_count = get_ceil_quotient(tiled_dim_size, tile_size)
+  nkilib/core/utils/tile_info.py:59         TiledDimInfo.build(...)
+  nkilib/core/mlp/mlp_cte/mlp_cte_tile_info.py:236
+                                            build_with_subtiling(bxs_dim_size, bxs_dim_tile_size,
+                                                                 bxs_dim_subtile_size)
+  nkilib/core/mlp/mlp_cte/mlp_cte.py:262    build_mlp_cte_tile_info(shard_mlp_params, ...)
+  nkilib/core/mlp/mlp.py:340                mlp_cte(mlp_params, out, fused_add_out)
+```
+
+A tile/subtile size computes to zero, so the ceil-division blows up.
+
+### Why (inferred, consistent with the data)
+
+nki-library's CTE sharding heuristic in `mlp_cte_sharding.py` forces
+`shard_on_inter = True` when `intermediate_size > 4096` — which is exactly our boundary. We
+launch single-core, so there is no SPMD grid and no worker count to shard across; the
+inter-sharding path then derives a zero subtile size.
+
+In other words: **above I=4096 the kernel assumes it is being launched multi-core.** The
+`> 4096` threshold in the heuristic and the `> 4096` failure boundary matching exactly is
+strong circumstantial evidence, though we have not read the shipped `mlp_cte_sharding.py` to
+confirm the mechanism directly.
+
+### Why this matters more than Finding #17
+
+| | Finding #17 (weight layout) | Finding #18 (this) |
+|---|---|---|
+| Nature | design question — how should weights be transformed | kernel limitation / bug |
+| Who can fix | HF kernels team (a hook) or nki-library | nki-library only |
+| Workaround from a wrapper | yes, several (all with costs) | **none** |
+| Affects | all fused ports | all fused MLP at real sizes |
+
+A wrapper can choose *some* weight-transformation strategy. A wrapper cannot make the kernel's
+own tile arithmetic stop dividing by zero.
+
+And every realistic model is on the wrong side of the line:
+
+| Model | intermediate_size | Single-core fused MLP? |
+|-------|-------------------|------------------------|
+| Qwen3-0.6B | 3072 | yes (but a toy) |
+| Qwen3-8B | 12288 | **no** |
+| Llama-3-8B | 14336 | **no** |
+| Mistral-7B | 14336 | **no** |
+
+So the fused MLP is currently usable only at sizes nobody deploys.
+
+### This is the general SPMD concern, now measured
+
+Week 2's porting analysis listed "SPMD multi-core assumptions don't fit the per-layer swap
+model" as a general worry. This is that worry with a number on it. For RoPE, stripping SPMD
+was a clean, harmless reduction (`num_shards = 1`). For the MLP it is not optional — the
+kernel's tiling *requires* the multi-core path at any useful size.
+
+That is a meaningful update to the porting thesis: **SPMD-strippability is per-kernel, and for
+the fused kernels it may not hold.** The HF Kernel Hub swaps one layer at a time on one core;
+kernels written for a sharded inference runtime may simply not fit that model, independent of
+weight layout or dependency packaging.
+
+### What to do
+
+1. **Report to the nki-library team.** A divide-by-zero in the kernel's own tile arithmetic on
+   a legal, documented-as-supported input is a bug. `H % 128 == 0` is the documented
+   constraint and I=12288 satisfies it; nothing documents an `I <= 4096` single-core limit.
+   Ask whether single-core operation above I=4096 is intended to work, and if not, whether the
+   constraint can be asserted clearly instead of failing inside tile math.
+2. **Test whether an SPMD launch fixes it.** If the kernel works multi-core at I=12288, the
+   question becomes whether an HF per-layer swap can legitimately launch SPMD — which is a
+   architecture question for the kernels team, and a more interesting one than the weight
+   layout. Not attempted here; it needs a launch-grid setup outside the per-layer swap model.
+3. **Do not start the fusion-API integration.** Both #17 and #18 gate it, and #18 has no
+   workaround. The 1-2 day spike was worth doing precisely because it surfaced this before
+   2-3 weeks went into the integration.
+
+### What the spike *did* establish (the positive result)
+
+Worth stating separately, because it is real: **the production fused MLP kernel is drivable
+directly from PyTorch/XLA with HF weights and produces correct results.**
+
+| Config | dtype | cos_sim | max_diff |
+|--------|-------|---------|----------|
+| H=1024, I=3072 | fp32 | 0.999989 | 1.5e-02 |
+| H=1024, I=3072 | bf16 | 0.999995 | 9.6e-03 |
+| H=4096, I=4096 | bf16 | 0.999979 | 1.3e-02 |
+
+No vendoring, no reimplementation — `from nkilib.core.mlp.mlp import mlp`, transpose the three
+weights, take `[0]` off the returned list. That further supports Finding #16's thin-wrapper
+thesis. `max_diff ~1e-2` is expected for a fused three-matmul and is consistent with
+nki-library's own `rtol=2e-2` test tolerance; it is well outside the `cos_sim > 0.999`-plus-tight-`max_diff`
+bar we hold RMSNorm and RoPE to, which is the tolerance question flagged earlier.

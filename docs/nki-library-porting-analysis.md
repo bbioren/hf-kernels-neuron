@@ -322,9 +322,57 @@ The fusion API does at least provide a home for the chosen strategy:
 `make_parent_class_for_kernel_fusion` collapses sibling modules to `nn.Identity()`, so the
 surviving `gate_proj` module is an obvious place to hold transposed weights.
 
-**Effort estimate:** validating `nkilib.mlp()` standalone against `mlp_torch_ref` on
-hardware is a 1-2 day spike and should happen before any Kernel Hub work. Getting it into
-HF via the fusion API, correct *and* faster, is 2-3 weeks.
+### SPIKE RESULT (2026-07-29) — the kernel works, but only at toy sizes
+
+The 1-2 day derisking spike recommended below was run (`scripts/spike_nkilib_mlp.py`). Two
+outcomes, and the second one changes the plan.
+
+**Positive: the production kernel is drivable directly from PyTorch/XLA with HF weights.**
+No vendoring, no reimplementation — `from nkilib.core.mlp.mlp import mlp`, transpose the three
+weights, take `[0]` off the returned list:
+
+| Config | dtype | cos_sim vs Qwen3MLP | max_diff |
+|--------|-------|---------------------|----------|
+| H=1024, I=3072 | fp32 | 0.999989 | 1.5e-02 |
+| H=1024, I=3072 | bf16 | 0.999995 | 9.6e-03 |
+| H=4096, I=4096 | bf16 | 0.999979 | 1.3e-02 |
+
+`max_diff ~1e-2` is expected for a fused three-matmul and consistent with nki-library's own
+`rtol=2e-2` tolerance — but well outside the tight bar we hold RMSNorm and RoPE to. The
+tolerance question flagged earlier is real, not hypothetical.
+
+**Blocking: it cannot run single-core above `intermediate_size = 4096`.** Sharp boundary,
+10 configs across three `hidden_size` values, passes iff `I <= 4096` (I=4096 passes, I=4224
+fails). Not fixed by sequence length, `force_cte_mode`, or `mode=PREFILL`. Fails inside the
+kernel's own tile arithmetic:
+
+```
+error: 'floordiv' does not allow division by zero
+  kernel_helpers.py:104  <-  tile_info.py:37  <-  mlp_cte_tile_info.py:236
+                             build_with_subtiling(bxs_dim_size, ..., bxs_dim_subtile_size)
+```
+
+Almost certainly the CTE sharding heuristic forcing `shard_on_inter = True` above I=4096 —
+exactly our boundary — with no SPMD grid to shard across.
+
+Every real model is on the wrong side: Qwen3-8B I=12288, Llama-3-8B and Mistral-7B I=14336.
+See Finding #18. **A wrapper cannot work around this**, unlike the weight-layout question.
+
+**This is the general SPMD concern, measured.** This document's Week 2 section listed "SPMD
+multi-core assumptions don't fit the per-layer swap model" as a general worry. For RoPE,
+stripping SPMD was clean and harmless (`num_shards = 1`). For the fused MLP it is not
+optional — the tiling *requires* the multi-core path at any useful size. So
+**SPMD-strippability is per-kernel, and for fused kernels it may not hold at all.** That is a
+structural question about whether the Kernel Hub's one-layer-one-core model can host
+nki-library's fused kernels, independent of dependency packaging or weight layout.
+
+**Revised effort estimate:** the spike is done (worth it — it surfaced #18 before 2-3 weeks
+went into the integration). Landing the fused MLP in HF is now **blocked**, not merely
+expensive: Finding #18 must be resolved by nki-library first, then Finding #17 decided by the
+HF kernels team. Do not start the fusion-API work until both.
+
+**Original estimate, for the record:** validating standalone was a 1-2 day spike; getting it
+into HF via the fusion API, correct *and* faster, was 2-3 weeks.
 
 **Note on tolerance:** nki-library's own MLP tests use `rtol=2e-2` — two orders of
 magnitude looser than the `cos_sim > 0.999` bar we hold RMSNorm/RoPE to. A fused
@@ -437,3 +485,11 @@ Worth reporting upstream:
 3. `mlp()`'s mode assert message says `"PREFILL (token gen) or DECODE (context
    encoding)"` — the parenthetical labels are swapped relative to actual behaviour.
    Anyone debugging from the error message will wire the mode backwards.
+4. Nothing documents the single-core `intermediate_size <= 4096` limit for `mlp()`. The
+   documented constraint is `H % 128 == 0`, which I=12288 satisfies, so the failure looks
+   like a compiler bug rather than an unmet precondition. If the limit is intentional it
+   should be a `kernel_assert` with a clear message; if not, it is a bug (Finding #18).
+5. The integration tests use `"q_out.must_alias_input"` for destination-passing kernels,
+   which suggests outputs are mutated in place. From PyTorch/XLA they are **not** — the
+   results come back via the return value and the passed tensors stay untouched. Following
+   the test idiom silently yields zeros (Finding #16).
