@@ -219,6 +219,117 @@ def test_discrimination(mod, device):
     )
 
 
+def test_guard_conditions(mod, device):
+    """Every guard in _nki_unsupported_reason must fall back, warn, and stay correct.
+
+    These are the constraints inherited from nki-library's `_validate_apply_rope_inputs`,
+    which the original enforces with hard asserts. We convert them to a graceful
+    fallback, so each one needs to be exercised — an over-permissive guard would crash
+    at compile time, and an over-strict one would silently disable acceleration.
+    """
+    print()
+    print("-" * 76)
+    print("Guard conditions (each must fall back, warn, and remain correct)")
+    print("-" * 76)
+
+    b, qh, kh, d = 1, 4, 2, 64
+    # (label, inputs, kwargs, check_correctness)
+    #
+    # check_correctness=False for cases where the eager reference cannot produce a
+    # golden value either (mismatched cos width, or unsqueeze_dim=2 against 4D q/k).
+    # For those, the meaningful assertion is still "declined the kernel and said so" —
+    # the guard's job is to route away from NKI, not to make invalid input valid.
+    cases = []
+
+    q, k, cos, sin = make_inputs(b, qh, kh, 100, d, torch.float32)
+    cases.append(("seq_len=100 (not multiple of 128)", (q, k, cos, sin), {}, True))
+
+    q2, k2, cos2, sin2 = make_inputs(b, qh, kh, 128, d, torch.float32)
+    cases.append(("unsqueeze_dim=2", (q2, k2, cos2, sin2), {"unsqueeze_dim": 2}, False))
+
+    # 3D inputs (kernel is 4D-only)
+    cases.append(("3D q/k (kernel is 4D-only)", (q2[:, 0], k2[:, 0], cos2, sin2), {}, True))
+
+    # odd head_dim
+    q4, k4, cos4, sin4 = make_inputs(b, qh, kh, 128, 66, torch.float32)
+    cases.append(
+        ("odd head_dim=65",
+         (q4[..., :65], k4[..., :65], cos4[..., :65], sin4[..., :65]), {}, True)
+    )
+
+    # cos last dim != head_dim
+    cases.append(
+        ("cos width mismatch",
+         (q2, k2, cos2[..., : d // 2], sin2[..., : d // 2]), {}, False)
+    )
+
+    # q/k dtype mismatch
+    cases.append(
+        ("q/k dtype mismatch", (q2, k2.to(torch.bfloat16), cos2, sin2), {}, False)
+    )
+
+    results = []
+    for label, (qq, kk, cc, ss), kwargs, check_correct in cases:
+        mod._warned.clear()
+
+        golden_q = None
+        if check_correct:
+            try:
+                cos_ref = cc if cc.ndim == 3 else cc.unsqueeze(0)
+                sin_ref = ss if ss.ndim == 3 else ss.unsqueeze(0)
+                golden_q, _ = reference_rope(
+                    qq, kk, cos_ref, sin_ref, kwargs.get("unsqueeze_dim", 1)
+                )
+            except Exception as e:
+                print(f"  note: reference unavailable for {label} ({type(e).__name__});"
+                      " checking dispatch only")
+                check_correct = False
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with nki_call_counter(mod, NKI_NAMES, FALLBACK_NAMES) as counts:
+                try:
+                    with torch.no_grad():
+                        q_out, _ = mod.apply_rotary_pos_emb(
+                            qq.to(device), kk.to(device), cc.to(device), ss.to(device), **kwargs
+                        )
+                    sync()
+                    q_cpu = q_out.cpu()
+                    err = None
+                except Exception as e:
+                    q_cpu, err = None, e
+
+        warned = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+        fell_back = counts.fallback > 0 and counts.nki == 0
+
+        if check_correct:
+            correct = err is None and q_cpu is not None and cosine_similarity(golden_q, q_cpu) > 0.999
+            detail = f"fallback={fell_back} warned={len(warned) > 0} correct={correct}"
+            ok = fell_back and len(warned) > 0 and correct
+        else:
+            # Invalid input: only require that we declined NKI and warned. The eager
+            # path may legitimately raise, since the input is genuinely malformed.
+            correct = True
+            detail = f"fallback={fell_back} warned={len(warned) > 0} (dispatch only)"
+            ok = fell_back and len(warned) > 0
+
+        if err is not None:
+            detail += f" eager_raised={type(err).__name__}"
+        print(f"  {'PASS' if ok else 'FAIL'}  {label:36s} {detail}")
+        results.append(ok)
+
+    all_ok = all(results) and len(results) > 0
+    print(f"  {'PASS' if all_ok else 'FAIL'} — {sum(results)}/{len(results)} guards behave correctly")
+    return AccuracyResult(
+        label="guard conditions fall back correctly",
+        cos_sim=1.0 if all_ok else 0.0,
+        max_diff=0.0,
+        counts=CallCounts(nki=1, fallback=0),
+        passed=all_ok,
+        notes=[] if all_ok else ["one or more guards misbehaved"],
+    )
+
+
 def main():
     device = require_neuron()
     mod = load_kernel_module("neuron_rope")
@@ -277,7 +388,8 @@ def main():
 
     disc = test_discrimination(mod, device)
     fb = test_fallback_is_loud(mod, device)
-    return 0 if (ok and disc.passed and fb.passed) else 1
+    guards = test_guard_conditions(mod, device)
+    return 0 if (ok and disc.passed and fb.passed and guards.passed) else 1
 
 
 if __name__ == "__main__":

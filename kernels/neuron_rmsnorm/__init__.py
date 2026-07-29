@@ -93,6 +93,41 @@ def _pytorch_rmsnorm(hidden_states, weight, eps):
     return weight * hidden_states.to(input_dtype)
 
 
+_warned: set[str] = set()
+
+
+def _warn_once(reason: str) -> None:
+    """Announce a fallback instead of taking it silently.
+
+    This kernel is the reason Finding #8 exists: it fell back on CPU tensors with no
+    signal of any kind, and an entire accuracy suite passed while never executing NKI.
+    Correct-but-unaccelerated is the failure mode that costs the most time, precisely
+    because nothing looks wrong. So say so, once, with the reason.
+    """
+    import warnings
+
+    if reason not in _warned:
+        _warned.add(reason)
+        warnings.warn(
+            f"neuron_rmsnorm: falling back to eager PyTorch RMSNorm ({reason}). "
+            "The NKI kernel is NOT being used.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+
+def _nki_unsupported_reason(hidden_states: torch.Tensor):
+    """Return None if the NKI kernel can run, else the reason it cannot."""
+    if not _HAS_NKI:
+        return "NKI unavailable"
+    # @nki.jit hard-errors on CPU tensors, so this guard is mandatory.
+    if hidden_states.device.type == "cpu":
+        return "input on CPU; NKI requires XLA/Neuron tensors"
+    if hidden_states.numel() == 0:
+        return "empty tensor"
+    return None
+
+
 class NeuronRMSNorm(nn.Module):
     """Stateless RMSNorm kernel layer for the HF Kernel Hub.
 
@@ -115,13 +150,15 @@ class NeuronRMSNorm(nn.Module):
         # Flatten to 2D: [batch * seq_len, hidden_size]
         hidden_2d = hidden_states.reshape(-1, hidden_states.shape[-1])
 
-        if _HAS_NKI and hidden_states.device.type != "cpu":
+        reason = _nki_unsupported_reason(hidden_states)
+        if reason is None:
             # Run NKI kernel on NeuronCores
             output_2d = _nki_rmsnorm_kernel(
                 hidden_2d, self.weight, self.variance_epsilon
             )
         else:
-            # PyTorch fallback (CPU or no NKI available)
+            # PyTorch fallback — announced, never silent. See Finding #8.
+            _warn_once(reason)
             output_2d = _pytorch_rmsnorm(
                 hidden_2d, self.weight, self.variance_epsilon
             )
