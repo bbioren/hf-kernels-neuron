@@ -18,7 +18,29 @@ What would a customer struggle with if they tried to use NKI kernels via the HF 
 
 | Issue | Severity | Notes |
 |-------|----------|-------|
-| | | |
+| `use_kernels=True` cannot select the neuron path at all | **Critical** | transformers' `kernelize(model, mode)` has no `device` arg; it reads `model.device.type`, which is `"cpu"` or `"xla"` on Neuron — never `"neuron"`. See Finding #9. |
+| `"xla"` is not a supported device type in `kernels` | **Critical** | Kernelizing a model that has been moved to a Neuron device raises `Unsupported device type 'xla'`. So the correct way to run *breaks*, and the incorrect way (params on host) silently no-ops. |
+| Customer must call the `kernels` library directly, bypassing transformers | High | `kernelize(model, device="neuron", mode=Mode.INFERENCE)` works, but it is not the documented transformers entry point and skips `KernelConfig` handling. |
+| No way to ask "is my kernel actually active?" | High | Nothing reports which implementation is live. Combined with silent fallback, a customer cannot tell acceleration from no-op. |
+| Function kernels swap process-globally | Medium | Kernelizing one model changes `apply_rotary_pos_emb` for every model in the process. Surprising for multi-model serving. |
+| `@nki.jit` hard-errors on CPU tensors | Medium | Forces every kernel to carry a device guard, which is what creates the silent-fallback trap. |
+
+## Silent Failure Modes (highest-risk category)
+
+These are the issues where the customer gets **no error and no warning**, and would
+reasonably believe things are working.
+
+| Failure | What the customer sees | What's actually happening |
+|---------|------------------------|---------------------------|
+| Kernel falls back on host tensors | Correct numbers, no warning. Our own test even printed "Backend: NKI kernel" | Eager PyTorch. Zero NKI execution. Cost us a week of false confidence — see Finding #8. |
+| `"neuron"` mapping ignored on a `cpu`-device model | `use_kernels=True` returns successfully | Mapping lookup misses; original forward retained |
+| Accuracy test passes with `max_diff = 0.00e+00` | "Bit-identical, great" | Both sides ran the same PyTorch code. For a hardware kernel, a perfect match means the kernel didn't run. |
+
+**The general lesson for the PoC:** on Neuron, the dangerous outcome is not a crash,
+it's a no-op that looks like success. Any customer-facing story for NKI kernels on the
+Hub needs an affirmative "this kernel is live on this layer" signal. Numerical
+correctness alone cannot distinguish acceleration from fallback, because the fallback is
+*also* numerically correct.
 
 ## Documentation Gaps
 

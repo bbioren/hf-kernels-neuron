@@ -64,6 +64,29 @@ Running log of things that were harder than expected, took extra time, or blocke
 **Resolution:** Used tutorial-derived kernel for PoC. Documented that production kernels need unfused entry points.
 **Takeaway:** nki-library is designed for the NxDI inference pipeline (always fused with quant). Needs a simple `nkilib.ops.*` API for the HF use case.
 
+### [2026-07-29] Week 2 accuracy results were measuring the PyTorch fallback, not NKI
+**Time lost:** ~1 hour (spotting it, writing the instrumented probe, re-validating)
+**Would affect:** both — and this is the worst kind of problem because it fails silently
+**Resolution:** `@nki.jit` requires XLA tensors and hard-errors on CPU ones. Our kernel
+guards with `device.type != "cpu"`, so CPU-tensor tests took the fallback branch every
+time. Fixed by adding `tests/nki_test_utils.py`, which places tensors on the XLA device
+and asserts via a call counter that the NKI branch actually ran.
+**Takeaway:** The tell was `max_diff = 0.00e+00`. For a hardware kernel, a *perfect*
+match is evidence of failure, not success — real NKI reductions differ from PyTorch by
+~1e-4. Never accept exact-zero diff as a pass. Always assert the kernel executed, not
+just that the numbers look right.
+
+### [2026-07-29] `use_kernels=True` can't reach the neuron device path — two independent gaps
+**Time lost:** ~45 min investigating (across kernels + transformers source, then a probe)
+**Would affect:** customers (this is the headline user-facing gap)
+**Resolution:** No fix available locally. transformers' `kernelize(model, mode)` has no
+`device` parameter and derives everything from `model.device.type`; Neuron reports
+`"cpu"` (mapping ignored) or `"xla"` (rejected as unsupported). Worked around in tests by
+calling the `kernels` library directly with `device="neuron"`.
+**Takeaway:** Documented the minimal upstream patch — map `"xla"` → `"neuron"` in
+`kernels._find_device` using `xm.xla_device_hw()`, which we confirmed returns `"NEURON"`.
+Filed as Finding #9. This is the single highest-value upstream change for the project.
+
 ---
 
 ## Summary Statistics
@@ -73,5 +96,6 @@ Running log of things that were harder than expected, took extra time, or blocke
 | Documentation gaps | 3 | ~65 min |
 | Environment/setup | 3 | ~75 min |
 | API instability | 1 | ~20 min |
-| Architecture mismatch | 2 | ~1.5 hours |
-| **Total** | **9** | **~4 hours** |
+| Architecture mismatch | 3 | ~2.25 hours |
+| Silent-failure / test methodology | 1 | ~60 min |
+| **Total** | **11** | **~5.75 hours** |

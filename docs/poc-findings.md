@@ -31,8 +31,13 @@ These are the primary references we used. Critically, they describe different la
 | 2 | `LocalLayerRepository` API underdocumented / changed between versions | Medium | Resolved |
 | 3 | `metadata.json` required fields not documented for local dev | Medium | Resolved |
 | 4 | No `kernel-builder` Neuron build variant | High | Open |
-| 5 | Neuron device shows "not detected (CPU-only mode)" despite hardware present | Low | Investigating |
+| 5 | Neuron device shows "not detected (CPU-only mode)" despite hardware present | Low | Resolved (see #8) |
 | 6 | Kernel can be a single file — our multi-file layout was over-engineered | Low | Resolved |
+| 7 | Variant resolver detects CUDA, not Neuron; flat layout works via fallback | Medium | Open |
+| 8 | **NKI kernels silently fall back on CPU tensors — no warning. Invalidated our Week 2 accuracy results** | **Critical** | Resolved (methodology fixed) |
+| 9 | **`use_kernels=True` cannot reach the `"neuron"` device path at all** | **High** | Open (upstream fix identified) |
+| 10 | Function-kernel replacement is process-global, not per-model | Medium | Open |
+| 11 | transformers kernel-decorator coverage is much wider than assumed (110 RMSNorm / 95 RoPE model files) | Positive | Confirmed |
 
 ---
 
@@ -176,3 +181,182 @@ For NKI kernels (which are Python, not compiled C++/CUDA), the simpler single-fi
 4. Fallback — works (unmapped layers keep original forward)
 
 **Conclusion:** The HF Kernel Hub mechanism works end-to-end for Neuron. The device path is merged, the layer loading works, stateless kernels swap correctly. The remaining work is kernel implementation (NKI), not plumbing.
+
+---
+
+# Week 3 Findings
+
+## 8. NKI kernels silently fall back on CPU tensors — and this invalidated our Week 2 accuracy results [CRITICAL]
+
+**This is the most important finding of the PoC so far.**
+
+**What happened:** The Week 2 accuracy test reported `cos_sim = 1.000000` and
+`max_diff = 0.00e+00` for all 8 shapes. Bit-identical output is a red flag: a real
+NKI kernel on hardware does its reductions in a different order than PyTorch and
+will differ by ~1e-4 in fp32. Exact zero means the two sides were running the
+*same code*.
+
+They were. `NeuronRMSNorm.forward` gates the kernel on:
+
+```python
+if _HAS_NKI and hidden_states.device.type != "cpu":
+    output_2d = _nki_rmsnorm_kernel(...)   # NKI
+else:
+    output_2d = _pytorch_rmsnorm(...)      # fallback
+```
+
+The Week 2 tests build inputs with `torch.randn(...)` — CPU tensors. So every test
+took the `else` branch. `_pytorch_rmsnorm` is mathematically identical to
+`Qwen3RMSNorm.forward`, so it compared the fallback against itself and reported a
+perfect score.
+
+**Verified with instrumentation** (`scripts/probe_nki_execution.py`, run on trn2):
+
+| Probe | Result |
+|-------|--------|
+| CPU tensors, count which branch runs | NKI calls = **0**, fallback calls = **1** |
+| `@nki.jit` called directly with CPU tensors | `RuntimeError: Expected all tensors in the given list to be XLA tensors` |
+| `@nki.jit` on XLA tensors (`xla_device_hw` = `NEURON`) | Compiles + runs. cos_sim `1.000000`, max_diff **`1.731e-04`** |
+| Full `NeuronRMSNorm` layer on XLA tensors | NKI calls = **1**, fallback = 0. cos_sim `1.000000`, max_diff `1.297e-04` |
+
+**Two conclusions, and they point opposite directions:**
+
+1. *The kernel itself is correct.* On real Neuron hardware it produces
+   `cos_sim = 1.000000` with a `~1.3e-4` max absolute difference, which is exactly
+   the rounding behaviour you expect from a genuine hardware reduction. RMSNorm
+   passes the quality bar — **now** it's actually been measured.
+2. *Our test methodology was wrong and would have stayed wrong.* Nothing in the
+   test surfaced that the kernel wasn't running. The test even printed
+   `"Backend: NKI kernel (NeuronCores)"`, because it was reporting `_HAS_NKI`
+   (is NKI importable) rather than "did the NKI branch execute".
+
+**Impact on customers:** severe, and this is the generalizable part. `@nki.jit`
+hard-errors on CPU tensors, so *any* HF Neuron kernel needs a device guard, and the
+natural way to write that guard produces a silent fallback. A customer sets
+`use_kernels=True`, sees no warning, sees correct numbers, and concludes they have
+NKI acceleration. They have eager PyTorch. There is no signal anywhere — no log
+line, no attribute, no counter.
+
+**Recommendations:**
+- Every Neuron kernel accuracy test must assert the NKI branch actually executed,
+  not just that the output is numerically close. A numerically-perfect result is
+  *evidence of failure* for a hardware kernel. We now do this via a call counter
+  (`tests/nki_test_utils.py::nki_call_counter`).
+- Kernels should `logger.warning_once` when they fall back, naming the reason.
+- The `kernels` library should expose which implementation is live per layer
+  (e.g. `model.get_kernel_report()`), so users can verify rather than trust.
+- Ban exact-zero diffs as a pass condition. Assert `0 < max_diff < tol` for
+  hardware kernels.
+
+## 9. `use_kernels=True` cannot reach the `"neuron"` device path [HIGH]
+
+The Week 3 goal "confirm `use_kernels=True` alone triggers the swaps on Neuron"
+**cannot be met today**, for two independent reasons. Verified empirically in
+`scripts/probe_neuron_device_path.py`.
+
+**Reason A — transformers has no device override.**
+
+```python
+# transformers/integrations/hub_kernels.py
+def kernelize(model: "PreTrainedModel", mode: "Mode | None" = None):
+    ...
+    device_type = model.device.type          # <- only source of truth
+    device = Device(type=device_type)
+```
+
+The signature is `(model, mode)`. There is no `device` parameter, unlike the
+underlying `kernels.kernelize(model, *, mode, device=None, use_fallback=True)`,
+which does accept one. So a caller cannot ask for `"neuron"`.
+
+**Reason B — Neuron never reports `"neuron"` as a device type.**
+
+| Model state | `model.device.type` | `_find_device()` | Outcome |
+|---|---|---|---|
+| As constructed (eager, params on host) | `"cpu"` | `Device(type='cpu')` | neuron mapping **silently ignored** |
+| Moved to Neuron via `xm.xla_device()` | `"xla"` | `Device(type='xla')` | **hard error**: `Unsupported device type 'xla'. Supported device types are: cpu, cuda, mps, neuron, npu, rocm, xpu` |
+
+`"xla"` is not in the supported set, and nothing maps `"xla"` → `"neuron"`.
+Separately, `hasattr(torch, "neuron")` is `False` even after
+`import torch_neuronx`, so `_has_neuron_ops()` is also `False`.
+
+So the user-facing path has three failure modes and zero success modes: ignore the
+mapping, crash on an unsupported device, or fail the `_has_neuron_ops` gate.
+
+**What still works:** calling the `kernels` library directly with an explicit
+device, which is what our tests do and what Weeks 1-2 validated:
+
+```python
+kernelize(model, device="neuron", mode=Mode.INFERENCE)   # kernels lib, not transformers
+```
+
+**Minimal upstream fix.** The cleanest change is in `kernels`, not transformers,
+because it fixes auto-detection for everyone rather than adding an override that
+each framework must thread through. In `kernels/layer/kernelize.py::_find_device`:
+
+```python
+dev_type = param.device.type
+if dev_type == "xla" and _is_neuron_xla():
+    return Device(type="neuron")
+```
+
+where `_is_neuron_xla()` checks the XLA runtime reports Neuron hardware. We
+confirmed this is detectable today: `xm.xla_device_hw(xm.xla_device())` returns
+exactly `"NEURON"` on trn2. See `docs/porting-recommendations.md` for the
+proposed patch.
+
+A complementary, independently useful fix: have `torch_neuronx` set a `torch.neuron`
+attribute so `_has_neuron_ops()` fires. That alone is *not* sufficient — it does not
+change what `_find_device` returns.
+
+## 10. Function-kernel replacement is process-global, not per-model [MEDIUM]
+
+`@use_kernel_func_from_hub("rotary_pos_emb")` replaces the module-level
+`apply_rotary_pos_emb` with a *single instance* of a generated `Func(nn.Module)`
+wrapper. `@use_kernelized_func(apply_rotary_pos_emb)` on `Qwen3Attention` then
+stores that same instance into each attention module's `_hidden_kernels` dict.
+
+Verified: the object in `model.layers.N.self_attn._hidden_kernels["rotary_pos_emb"]`
+**is** (identity, not equality) `modeling_qwen3.apply_rotary_pos_emb`.
+
+Consequences:
+- Every layer of every Qwen3 instance in the process shares one wrapper object.
+- The call site `apply_rotary_pos_emb(query_states, key_states, cos, sin)` resolves
+  the module-level global, so an in-place swap is what makes the replacement
+  visible — by design.
+- But it means you cannot have two models in one process with different RoPE
+  kernels, and kernelizing one model mutates RoPE for all of them.
+
+Not a blocker for the PoC. Worth flagging for anyone doing multi-model serving, and
+worth confirming with the HF team that this is intentional rather than incidental.
+
+## 11. transformers kernel-decorator coverage is wider than we assumed [POSITIVE]
+
+The steering doc estimated 87 model files with RMSNorm and 66 with rotary
+embeddings. Actual counts in transformers `5.15.0.dev0`:
+
+| Decorator | Kernel name | Model files |
+|-----------|-------------|-------------|
+| `@use_kernel_forward_from_hub("RMSNorm")` | `RMSNorm` | **110** |
+| `@use_kernel_func_from_hub("rotary_pos_emb")` | `rotary_pos_emb` | **95** |
+
+Qwen3 opts into **both**, so no transformers-side changes are needed to target it:
+
+```python
+@use_kernel_forward_from_hub("RMSNorm")
+class Qwen3RMSNorm(nn.Module): ...
+
+@use_kernel_func_from_hub("rotary_pos_emb")
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1): ...
+
+@use_kernelized_func(apply_rotary_pos_emb)
+class Qwen3Attention(nn.Module): ...
+```
+
+This strengthens the leverage argument: two Neuron kernels would light up 110 and 95
+model files respectively, if the device-path gap in Finding #9 is closed. The
+interception points already exist upstream and are already wired into the models —
+the only missing pieces are the `"neuron"` mapping entries and device detection.
+
+`"rotary_pos_emb"` already has `cuda`, `rocm`, and `xpu` entries in
+`_FUNCTION_KERNEL_MAPPING`. There is no `"neuron"` entry. That is a one-block
+addition, not an architectural change.
