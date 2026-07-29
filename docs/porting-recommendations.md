@@ -36,10 +36,20 @@ kernels/neuron_<name>/
 2. **Get `nkilib` on HF `python-depends` allowed list:**
    - Then HF kernel wrappers become trivial one-liners
    - Contact HF (danieldk) about adding to the curated dependency set
+   - **The ask is now concrete:** `kernels/python_depends.json` already has a
+     `neuron` backend section whitelisting `nki`, so the precedent and the exact
+     JSON shape to copy live in the same file. Adding `nkilib` alongside it is a
+     four-line change, not a design discussion. (Finding #12)
 
-3. **Fix variant resolution for Neuron:**
-   - `torch_neuronx` should set `torch.neuron = True` so auto-detection works
-   - Or: `LocalLayerRepository.load()` should accept a `backend` override
+3. **Fix `_backend()` so it reports `neuron` on Neuron hosts — highest leverage.**
+   - Root cause is a single check: `hasattr(torch, "neuron")` is False, even after
+     `import torch_neuronx`. So `torch_neuronx` setting that attribute is the fix.
+   - This one change unblocks **two** independent things:
+     build-variant resolution (Finding #7) and `python-depends` validation
+     (Finding #12). Today a Neuron kernel must declare `python-depends: []` while
+     importing `nki`, because the neuron allowlist table is never consulted.
+   - Note it does NOT fix device *routing* for `use_kernels=True` — that needs the
+     separate transformers change in Finding #9. Two distinct fixes; don't conflate.
 
 ### Long-term (full automation)
 
@@ -77,13 +87,51 @@ A script could walk `nkilib.ops.*` and generate these + metadata.json for each.
 | What we actually used | Tutorial kernel (equivalent math, clean implementation) |
 | Accuracy | Bit-identical to Qwen3RMSNorm on all tested shapes |
 
-### RoPE
+### RoPE — the easy case, and the one that reverses the RMSNorm narrative
 
 | Aspect | Finding |
 |--------|---------|
-| nki-library source | TBD (Week 3) |
-| HF integration type | `FuncRepository` (function replacement, not layer) |
-| Notes | `apply_rotary_pos_emb` is a function decorated with `@use_kernel_forward_from_hub` |
+| nki-library source | `core/embeddings/rope_hf.py` — **standalone and already HF-shaped** |
+| Standalone available? | **Yes.** Two variants: `rope_hf` (HF layout) and `RoPE` (Neuron-native layout `[d_head, B, heads, S]`) |
+| Tutorial available? | **No.** Zero rotary examples anywhere in nki-samples. nki-library is the only source. |
+| Dependencies to inline | Only 3 symbols: `kernel_assert`, `div_ceil`, `get_verified_program_sharding_info`. No `common_types`. ~15 lines total. |
+| Interface adaptation | Small. Signature already takes precomputed cos/sin and returns a tuple. Main change: destination-passing → internal allocation. |
+| SPMD handling | Stripped (`num_shards = 1`). Biggest semantic reduction of the port. |
+| What we actually used | **The production kernel**, ported. Not a reimplementation. |
+| Accuracy | 20/20 cases, cos_sim ≥ 0.999951, bit-identical (elementwise op, so expected) |
+| Key constraint inherited | `seq_len % (128 × LNC) == 0`, 4D only, `unsqueeze_dim=1` |
+
+**This case inverts the RMSNorm conclusion, and that matters for the recommendation.**
+For RMSNorm the production kernel was unusable (fused with FP8 quant, no unfused path)
+so we wrote one from the tutorial. For RoPE the production kernel is the *better*
+starting point and no tutorial exists at all. So "nki-library kernels are too fused to
+port" is not a general truth — it is per-kernel, and the `embeddings/` module shows the
+library already contains HF-friendly code.
+
+**Porting friction actually encountered:**
+
+1. **Destination-passing vs return-value.** `rope_hf(q, k, q_out, k_out, ...)` requires
+   preallocated outputs; HF returns a tuple. Resolved by allocating in
+   `nl.shared_hbm` inside the kernel and returning both — verified multi-output
+   `@nki.jit` works. Adds no cost and removes the mismatch entirely.
+2. **The `seq_len % 128` constraint is the real limitation.** HF passes arbitrary
+   sequence lengths, so a Python-level guard plus eager fallback is mandatory. This
+   is the single most likely reason a customer silently gets no acceleration.
+3. **No concat primitive in NKI.** `rotate_half`'s `torch.cat((-x2, x1), -1)` becomes
+   writes into disjoint slices of a preallocated destination, with the negation folded
+   into `op=nl.subtract`. Worth documenting as the canonical NKI idiom — it is not
+   obvious, and nki-library's own implementation is the best reference for it.
+4. **Function vs layer asymmetry.** Layer repos resolve `kernel.layers.<name>`;
+   func repos resolve `<name>` at module top level. A function kernel placed inside
+   the `layers` namespace will not be found. Also `has_backward` defaults to **True**
+   for functions and **False** for layers, so it must be set explicitly.
+5. **Import path is a non-issue here.** Both `nki` and `neuronxcc.nki` resolve on the
+   DLAMI, so nki-library source can be copied with its imports intact.
+
+**Docs bugs found in nki-library's public API reference:**
+- `rope_hf` is absent from the API reference entirely — source-only.
+- The reference cites `nkilib.core.rope.RoPE`; the real path is
+  `nkilib.core.embeddings.rope.RoPE`. `nkilib/core/rope.py` does not exist.
 
 ### SiLU
 

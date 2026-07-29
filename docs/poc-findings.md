@@ -38,6 +38,8 @@ These are the primary references we used. Critically, they describe different la
 | 9 | **`use_kernels=True` cannot reach the `"neuron"` device path at all** | **High** | Open (upstream fix identified) |
 | 10 | Function-kernel replacement is process-global, not per-model | Medium | Open |
 | 11 | transformers kernel-decorator coverage is much wider than assumed (110 RMSNorm / 95 RoPE model files) | Positive | Confirmed |
+| 12 | HF already whitelists `nki` as a Neuron dependency — but the entry is unreachable, so kernels must under-declare | High | Open |
+| 13 | nki-library HAS a standalone HF-layout RoPE kernel (`rope_hf`), undocumented in the public API reference | Positive | Confirmed |
 
 ---
 
@@ -392,3 +394,85 @@ the only missing pieces are the `"neuron"` mapping entries and device detection.
 `"rotary_pos_emb"` already has `cuda`, `rocm`, and `xpu` entries in
 `_FUNCTION_KERNEL_MAPPING`. There is no `"neuron"` entry. That is a one-block
 addition, not an architectural change.
+
+## 12. HF already whitelists `nki` for Neuron — but the entry is unreachable [HIGH]
+
+Good news first: `kernels/python_depends.json` in 0.15.2 contains a `neuron` backend
+section, and it whitelists exactly one dependency — `nki`:
+
+```json
+"backends": {
+  "cuda":   { "nvidia-cutlass-dsl": {...} },
+  "neuron": { "nki": { "nix": [], "python": [{ "pkg": "nki", "import": "nki" }] } },
+  ...
+}
+```
+
+So HuggingFace has already anticipated NKI kernels and made room for them. That is a
+meaningfully better starting position than `docs/porting-recommendations.md` assumed
+(it recorded the allowlist as only `einops` + `nvidia-cutlass-dsl`; corrected there).
+
+**But the entry cannot be used.** `_import_from_path()` calls:
+
+```python
+validate_dependencies(module_name, metadata.python_depends, _backend())
+```
+
+and `validate_dependencies` looks the declared dependency up in
+`general` first, then `backends[backend.name]`. On the Neuron DLAMI:
+
+```
+_backend()      = CUDA(version=Version('12.8'))
+_backend().name = 'cuda'
+```
+
+so it consults the **cuda** table, which contains only `nvidia-cutlass-dsl`. Verified
+against a real copy of our RoPE kernel:
+
+| `python-depends` | Result |
+|---|---|
+| `[]` | loads OK |
+| `["nki"]` | `ValueError: Kernel module 'neuron_rope' uses unsupported kernel dependency: nki` |
+| `["nkilib"]` | `ValueError: ... unsupported kernel dependency: nkilib` |
+
+**This is Finding #7 compounding.** `_backend()` misreports because
+`hasattr(torch, "neuron")` is False, and that single root cause now breaks two
+separate things: build-variant resolution *and* dependency validation. A Neuron kernel
+today is forced to ship `python-depends: []` while importing `nki` — i.e. to
+under-declare its dependencies in order to load at all. That works only because the
+DLAMI happens to have NKI preinstalled. On a host without it, the kernel would fail at
+import with a bare `ImportError` instead of the intended actionable
+`"requires Python dependency nki. Please install with: pip install nki"`.
+
+**Recommendation.** Fixing `_backend()` to report `neuron` on Neuron hosts is now the
+highest-leverage single upstream change, because it unblocks variant resolution and
+dependency declaration together. The root cause is the same `hasattr(torch, "neuron")`
+check, so `torch_neuronx` setting that attribute is the cleanest fix — and unlike its
+effect on device *routing* (where it does nothing, per Finding #9), here it is
+genuinely sufficient.
+
+**Separately:** `nkilib` is not whitelisted. The ask to add it is now much more
+concrete, because `nki` establishes the precedent and the exact JSON shape to copy in
+the same file. That is the prerequisite for the "thin wrapper" porting strategy
+(Option D in `docs/nki-library-porting-analysis.md`).
+
+### metadata.json requirements, measured
+
+Probed by removing one field at a time:
+
+| Field | Required? |
+|-------|-----------|
+| `name`, `id`, `version`, `license`, `python-depends`, `backend` | **required** — parse fails without any of them |
+| `digest` | **optional** — loads fine without it |
+
+So the minimum viable Neuron kernel repo is two files, and the `digest` boilerplate we
+have been carrying (`{"algorithm": "sha256", "files": {}}`) can be dropped:
+
+```
+kernels/neuron_<op>/
+├── __init__.py      # kernel class + `class layers:`  (or a top-level function)
+└── metadata.json    # name, id, version, license, python-depends, backend
+```
+
+Confirmed both our real kernels load from this flat layout, and that the func kernel
+correctly has **no** `layers` namespace while the layer kernel does.
