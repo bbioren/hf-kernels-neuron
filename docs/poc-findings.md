@@ -289,24 +289,56 @@ device, which is what our tests do and what Weeks 1-2 validated:
 kernelize(model, device="neuron", mode=Mode.INFERENCE)   # kernels lib, not transformers
 ```
 
-**Minimal upstream fix.** The cleanest change is in `kernels`, not transformers,
-because it fixes auto-detection for everyone rather than adding an override that
-each framework must thread through. In `kernels/layer/kernelize.py::_find_device`:
+**Correction to Reason B, found by testing the fix.** The failure is not actually a
+hard error on the `use_kernels=True` path — it is a *silent no-op*, which is worse.
+transformers passes a `Device` **object** rather than a string, and
+`kernels.kernelize` only calls `_validate_device_type` when it receives a string:
 
 ```python
-dev_type = param.device.type
-if dev_type == "xla" and _is_neuron_xla():
-    return Device(type="neuron")
+if device is None:      device_type = _find_device(model)
+elif isinstance(device, str):
+                        _validate_device_type(device); device_type = Device(type=device)
+else:                   device_type = Device(device.type)      # <- unvalidated
 ```
 
-where `_is_neuron_xla()` checks the XLA runtime reports Neuron hardware. We
-confirmed this is detectable today: `xm.xla_device_hw(xm.xla_device())` returns
-exactly `"NEURON"` on trn2. See `docs/porting-recommendations.md` for the
-proposed patch.
+So `Device(type="xla")` passes straight through, matches no mapping entry, and every
+layer quietly keeps its original forward. `kernelize()` returns successfully. The
+`Unsupported device type 'xla'` error only appears if you call the kernels library
+directly with `device="xla"` as a string.
+
+**Minimal upstream fix — and where it actually goes.** Our first proposal was to
+patch `kernels._find_device`. **That would not have worked**, and the e2e test caught
+it: the transformers wrapper computes the device itself and passes it explicitly, so
+`_find_device` is never consulted on the `use_kernels=True` path. The fix has to be in
+transformers:
+
+```python
+# transformers/integrations/hub_kernels.py::kernelize
+device_type = model.device.type
+if device_type == "cuda" and is_rocm_platform():
+    device_type = "rocm"
+elif device_type == "xla" and _is_neuron_xla():     # <- the fix
+    device_type = "neuron"
+device = Device(type=device_type)
+```
+
+`_is_neuron_xla()` checks `xm.xla_device_hw(xm.xla_device()) == "NEURON"`, which we
+confirmed returns exactly `"NEURON"` on trn2 — reliable, no new dependency.
+
+**Verified sufficient.** Applied in-process (`tests/test_qwen3_neuron_e2e.py` test 2),
+this single branch takes Qwen3 from **0 → 9 swapped RMSNorm layers** through the
+transformers `use_kernels` path, with logits `cos_sim = 1.000001`. So the change is
+not merely proposed, it is demonstrated. The same fix is worth applying to
+`kernels._find_device` as well (Change 1b), for callers that rely on auto-detection.
 
 A complementary, independently useful fix: have `torch_neuronx` set a `torch.neuron`
-attribute so `_has_neuron_ops()` fires. That alone is *not* sufficient — it does not
-change what `_find_device` returns.
+attribute so `_has_neuron_ops()` fires. That alone is *not* sufficient — it changes
+neither the transformers device computation nor `_find_device`'s return.
+
+**Lesson worth carrying into the PoC:** we would have shipped a wrong recommendation
+had we not built a test that actually applies the proposed patch. "Propose a fix" and
+"verify the fix works" are different activities, and for an upstream ask aimed at
+another team, the second one is what makes the recommendation credible.
 
 ## 10. Function-kernel replacement is process-global, not per-model [MEDIUM]
 
