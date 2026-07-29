@@ -7,36 +7,63 @@ and validate end-to-end on Qwen3 dense running on Trainium with `use_kernels=Tru
 
 ```
 kernels/                  # Local kernel repos (Hub-format layout)
-  neuron_rmsnorm/         # NKI RMSNorm kernel (Week 2)
-  neuron_rope/            # NKI RoPE kernel (Week 3)
-  neuron_silu/            # NKI SiLU activation kernel (Week 4)
-  neuron_identity/        # Minimal identity kernel for Week 1 PoC
-scripts/                  # Dev scripts (install, test, validate)
-tests/                    # Accuracy and integration tests
-docs/                     # PoC doc, notes, writeups
-notebooks/                # Exploration notebooks
+  neuron_rmsnorm/         # NKI RMSNorm kernel      (layer swap,    Week 2)
+  neuron_rope/            # NKI RoPE kernel         (function swap, Week 3)
+  neuron_silu/            # NKI SiLU activation     (layer swap,    Week 3)
+  neuron_identity/        # Minimal identity kernel for the Week 1 PoC
+scripts/                  # Dev scripts, investigation probes, registration
+tests/                    # Accuracy and integration tests (must run on trn2)
+docs/                     # Findings, sticking points, porting analysis
+deliverables/             # Weekly writeups
 ```
 
 ## Quick Start (on trn2)
 
 ```bash
-# Install deps
+source /opt/aws_neuronx_venv_pytorch_2_9/bin/activate
 pip install -r requirements.txt
 
-# Verify neuron device path works
-python scripts/verify_neuron_path.py
+# Per-kernel accuracy suites (RMSNorm, RoPE, SiLU)
+make test-nki
 
-# Run identity kernel swap demo (Week 1)
-python scripts/demo_identity_swap.py
+# Qwen3 end-to-end kernel swap
+make test-e2e
+
+# Investigation probes (device path, NKI execution, API surface, packaging)
+make probe
+
+# Print the neuron kernel mapping + the proposed upstream diff
+make registration
 ```
 
-## Week 1 Goal
+Developing locally? `make sync` rsyncs the tree to trn2 — tests must run there.
 
-Prove the `"neuron"` device path in the `kernels` library works on Trainium:
-1. `kernelize()` accepts `device="neuron"` and selects `_NeuronRepos`
-2. A minimal stateless NKI kernel loads via `LocalLayerRepository`
-3. The forward swap fires (confirmed by numerical signature)
-4. Fallback works when mapping is absent
+## Important: tests must run on Trainium
+
+`@nki.jit` requires XLA tensors. A kernel handed CPU tensors takes its PyTorch
+fallback, produces numerically *correct* output, and reports nothing. In Week 2 this
+caused an entire test suite to pass while never executing a single NKI instruction.
+
+So every accuracy test here calls `require_neuron()` (which refuses to report results
+unless `xla_device_hw() == "NEURON"`) and asserts via a call counter that the NKI branch
+ran and the fallback did not. **For a hardware kernel, a bit-identical result against a
+PyTorch reference is evidence of failure, not success** — unless the op is elementwise.
+See `docs/poc-findings.md` Finding #8.
+
+## Current status
+
+| Kernel | Interception point | Registrations upstream | Accuracy (on hardware) |
+|--------|-------------------|------------------------|------------------------|
+| RMSNorm | `RMSNorm` (layer) | 115 | 11/11 pass, NKI verified |
+| RoPE | `rotary_pos_emb` (func) | 95 model files | 20/20 pass, NKI verified |
+| SiLU | `SiLU` (layer) | 1 (covers all `ACT2FN["silu"]` users) | 9/9 pass, NKI verified |
+
+End-to-end on Qwen3: all three execute (RMSNorm 9×, RoPE 2×, SiLU 2× per forward),
+logits `cos_sim 1.000001` vs the unkernelized model.
+
+**Known blocker:** `use_kernels=True` cannot reach the `"neuron"` device path
+(Finding #9). Use the `kernels` library directly with `device="neuron"`, or see
+`scripts/neuron_kernel_registration.py` for the verified minimal upstream fix.
 
 ## Versions Tested
 

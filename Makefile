@@ -9,7 +9,7 @@ VENV := .venv
 PYTHON := $(VENV)/bin/python
 PIP := $(VENV)/bin/pip
 
-.PHONY: help venv install verify demo test clean
+.PHONY: help venv install verify demo test test-nki test-e2e probe registration sync lint clean versions
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -36,14 +36,41 @@ verify: ## Run neuron device path verification (Week 1 goal)
 demo: ## Run identity kernel swap demo
 	$(PYTHON) scripts/demo_identity_swap.py
 
-test: ## Run all tests
-	$(PYTHON) -m pytest tests/ -v
+# Kernel accuracy suites. These are standalone scripts, not pytest modules: each
+# owns its device setup and prints a result table. They MUST run on Trainium —
+# require_neuron() refuses to report results otherwise, because a CPU run silently
+# exercises the PyTorch fallback instead of NKI (docs/poc-findings.md Finding #8).
+NKI_TESTS := tests/test_rmsnorm_nki.py tests/test_rope_nki.py tests/test_silu_nki.py
+E2E_TESTS := tests/test_qwen3_neuron_e2e.py
 
-lint: ## Check code style
-	$(PYTHON) -m py_compile kernels/neuron_rmsnorm/layers.py
-	$(PYTHON) -m py_compile kernels/neuron_identity/layers.py
-	$(PYTHON) -m py_compile scripts/verify_neuron_path.py
-	$(PYTHON) -m py_compile scripts/demo_identity_swap.py
+test: test-nki test-e2e ## Run all kernel + e2e tests (must be on trn2)
+
+test-nki: ## Run per-kernel accuracy suites (RMSNorm, RoPE, SiLU)
+	@for t in $(NKI_TESTS); do \
+		echo "===== $$t ====="; \
+		$(PYTHON) $$t || exit 1; \
+	done
+
+test-e2e: ## Run the Qwen3 end-to-end kernel swap test
+	@for t in $(E2E_TESTS); do \
+		echo "===== $$t ====="; \
+		$(PYTHON) $$t || exit 1; \
+	done
+
+probe: ## Run all investigation probes (device path, NKI execution, API, packaging)
+	$(PYTHON) scripts/probe_neuron_device_path.py
+	$(PYTHON) scripts/probe_nki_execution.py
+	$(PYTHON) scripts/probe_nki_api.py
+	$(PYTHON) scripts/probe_hub_packaging.py
+
+registration: ## Print the neuron kernel mapping + proposed upstream diff
+	$(PYTHON) scripts/neuron_kernel_registration.py
+
+sync: ## rsync the working tree to trn2 for testing
+	./scripts/sync_to_trn2.sh
+
+lint: ## Byte-compile all kernels, scripts, and tests
+	$(PYTHON) -m compileall -q kernels scripts tests
 
 clean: ## Remove caches and compiled artifacts
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
