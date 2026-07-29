@@ -141,11 +141,48 @@ def probe_multi_output_jit():
         print("  => must use destination-passing like nki-library does")
 
 
+def probe_activations():
+    """Which activation primitives exist? Needed for the SiLU kernel."""
+    print()
+    print(SEP)
+    print("5. Activation primitives (for SiLU / GELU kernels)")
+    print(SEP)
+    try:
+        import neuronxcc.nki.isa as nisa
+        import neuronxcc.nki.language as nl
+    except Exception as e:
+        print(f"  cannot import: {e}")
+        return
+
+    cands = ["silu", "swish", "sigmoid", "gelu", "gelu_tanh", "gelu_apprx_tanh",
+             "exp", "tanh", "relu", "sqrt", "rsqrt", "multiply", "divide",
+             "add", "subtract", "negative", "reciprocal"]
+    present = [c for c in cands if hasattr(nl, c)]
+    missing = [c for c in cands if not hasattr(nl, c)]
+    print(f"  nl has     : {present}")
+    print(f"  nl missing : {missing}")
+
+    act_like = sorted(
+        a for a in dir(nl)
+        if any(t in a.lower() for t in ("silu", "sigmoid", "gelu", "swish", "erf"))
+    )
+    print(f"  activation-ish names in nl: {act_like}")
+
+    if hasattr(nisa, "activation"):
+        import inspect
+
+        try:
+            print(f"  nisa.activation signature: {inspect.signature(nisa.activation)}")
+        except Exception as e:
+            print(f"  nisa.activation signature unavailable: {e}")
+
+
 def main():
     probe_import_paths()
     probe_primitives()
     probe_tensor_methods()
     probe_multi_output_jit()
+    probe_activations()
     print()
     print(SEP)
     print("PROBE COMPLETE")

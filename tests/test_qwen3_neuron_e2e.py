@@ -112,8 +112,11 @@ def test_kernels_execute_via_repo_objects(device):
     rms_repo_path = PROJECT_ROOT / "kernels" / "neuron_rmsnorm"
     rope_repo_path = PROJECT_ROOT / "kernels" / "neuron_rope"
 
+    silu_repo_path = PROJECT_ROOT / "kernels" / "neuron_silu"
+
     rms_kernel_mod = get_local_kernel(rms_repo_path)
     rope_kernel_mod = get_local_kernel(rope_repo_path)
+    silu_kernel_mod = get_local_kernel(silu_repo_path)
 
     model, config = build_qwen3()
     model = model.to(device)
@@ -134,39 +137,50 @@ def test_kernels_execute_via_repo_objects(device):
 
     with nki_call_counter(rms_kernel_mod, ["_nki_rmsnorm_kernel"], ["_pytorch_rmsnorm"]) as rms_counts:
         with nki_call_counter(rope_kernel_mod, ["_nki_rope_hf"], ["_torch_rope"]) as rope_counts:
-            with torch.no_grad():
-                nki_logits = model(ids).logits
-            sync()
-            nki_logits = nki_logits.cpu()
+            with nki_call_counter(silu_kernel_mod, ["_nki_silu_kernel"], ["_torch_silu"]) as silu_counts:
+                with torch.no_grad():
+                    nki_logits = model(ids).logits
+                sync()
+                nki_logits = nki_logits.cpu()
 
     cos = cosine_similarity(ref_logits, nki_logits)
     diff = max_abs_diff(ref_logits, nki_logits)
 
-    # Expected counts for a 2-layer Qwen3: RMSNorm = 4 per layer
-    # (input_layernorm, post_attention_layernorm, q_norm, k_norm) + 1 final norm = 9.
-    # RoPE = 1 per layer = 2.
+    # Expected counts for a 2-layer Qwen3:
+    #   RMSNorm = 4 per layer (input_layernorm, post_attention_layernorm,
+    #             q_norm, k_norm) + 1 final model norm  = 9
+    #   RoPE    = 1 per layer  = 2
+    #   SiLU    = 1 per layer (mlp.act_fn)  = 2
     n_layers = config.num_hidden_layers
     expected_rms = 4 * n_layers + 1
     expected_rope = n_layers
+    expected_silu = n_layers
 
     print()
     print(f"  RMSNorm dispatch : {rms_counts}  (expected nki={expected_rms})")
     print(f"  RoPE    dispatch : {rope_counts}  (expected nki={expected_rope})")
+    print(f"  SiLU    dispatch : {silu_counts}  (expected nki={expected_silu})")
     print(f"  logits cos_sim   : {cos:.6f}")
     print(f"  logits max_diff  : {diff:.3e}")
 
     rms_ran = rms_counts.nki > 0 and rms_counts.fallback == 0
     rope_ran = rope_counts.nki > 0 and rope_counts.fallback == 0
-    counts_match = rms_counts.nki == expected_rms and rope_counts.nki == expected_rope
+    silu_ran = silu_counts.nki > 0 and silu_counts.fallback == 0
+    counts_match = (
+        rms_counts.nki == expected_rms
+        and rope_counts.nki == expected_rope
+        and silu_counts.nki == expected_silu
+    )
     accurate = cos > 0.999
 
     print()
     print(f"  NKI RMSNorm executed  : {'yes' if rms_ran else 'NO'} ({rms_counts})")
     print(f"  NKI RoPE executed     : {'yes' if rope_ran else 'NO'} ({rope_counts})")
+    print(f"  NKI SiLU executed     : {'yes' if silu_ran else 'NO'} ({silu_counts})")
     print(f"  call counts as expected: {'yes' if counts_match else 'NO'}")
     print(f"  logits match (>0.999) : {'yes' if accurate else 'NO'}")
 
-    passed = rms_ran and rope_ran and counts_match and accurate
+    passed = rms_ran and rope_ran and silu_ran and counts_match and accurate
     print(f"  {'PASS' if passed else 'FAIL'}")
     print()
     return passed

@@ -40,6 +40,8 @@ These are the primary references we used. Critically, they describe different la
 | 11 | transformers kernel-decorator coverage is much wider than assumed (110 RMSNorm / 95 RoPE model files) | Positive | Confirmed |
 | 12 | HF already whitelists `nki` as a Neuron dependency — but the entry is unreachable, so kernels must under-declare | High | Open |
 | 13 | nki-library HAS a standalone HF-layout RoPE kernel (`rope_hf`), undocumented in the public API reference | Positive | Confirmed |
+| 14 | The two NKI import paths (`nki` vs `neuronxcc.nki`) have different capabilities; neither is a superset | High | Open |
+| 15 | Interception-point inventory: several `_KERNEL_MAPPING` entries are unreachable (incl. `SwiGLUMLP`) | Reference | Confirmed |
 
 ---
 
@@ -476,3 +478,97 @@ kernels/neuron_<op>/
 
 Confirmed both our real kernels load from this flat layout, and that the func kernel
 correctly has **no** `layers` namespace while the layer kernel does.
+
+## 14. The two NKI import paths are not interchangeable, and neither is a superset [HIGH]
+
+Both of these import cleanly on the DLAMI:
+
+```python
+import nki, nki.language as nl, nki.isa as nisa            # top-level package
+import neuronxcc.nki as nki, neuronxcc.nki.language as nl  # compiler-bundled
+```
+
+They are different implementations with **different capabilities**, and a kernel is
+effectively pinned to whichever one supports its idiom. Discovered by writing the SiLU
+kernel against the top-level `nki` (matching nki-library's own imports) and having every
+shape fail to compile.
+
+| Idiom | top-level `nki` | `neuronxcc.nki` |
+|---|---|---|
+| `nl.arange` index tensors + `mask=` | **fails**: `error: failed to resolve name 'nki.language.arange'` | works |
+| `//` (floor-div) on tensor shape values | works (shapes are plain ints) | **fails**: `NotImplementedError: math.trunc() is not supported for scalar` |
+| `reshape_dim` / `permute` / `nisa.tensor_tensor` on sliced dests | works | untested (blocked by the above) |
+
+Consequences, verified by swapping the imports in each kernel and re-running the suites:
+
+| Kernel | Idiom used | Required package |
+|--------|-----------|------------------|
+| `neuron_rmsnorm` | `nl.arange` + mask (tutorial style) | `neuronxcc.nki` |
+| `neuron_silu` | `nl.arange` + mask | `neuronxcc.nki` |
+| `neuron_rope` | slicing + `div_ceil` (nki-library style) | top-level `nki` |
+
+**Why this is nastier than it looks.** `hasattr(nl, "arange")` returns **True** under
+the top-level package — the attribute exists, it just cannot be resolved during kernel
+tracing. So there is no reliable feature-detection at import time; you find out at
+compile time, per kernel. And the failure text (`failed to resolve name`) does not hint
+that the sibling package would work.
+
+It also means a project shipping several NKI kernels cannot standardise on one import
+path — ours genuinely needs both, in the same repository. Any "port nki-library kernels
+at scale" effort will hit this immediately, because nki-library source uses the
+top-level `nki` while the tutorials use `neuronxcc.nki`.
+
+**Recommendation.** Ask the NKI team which package is the supported long-term surface,
+and whether the capability gaps are intentional or drift. If the top-level `nki` is the
+future, `nl.arange` needs to resolve there; if `neuronxcc.nki` is, shape values need to
+support integer division. Until then, kernel authors need a documented compatibility
+table — this finding is the start of one.
+
+## 15. Interception-point inventory: what `use_kernels=True` can actually reach [REFERENCE]
+
+Counted from decorator occurrences in transformers `5.15.0.dev0`. This is the real
+surface area available to a Neuron kernel, and it is worth stating precisely because
+`_KERNEL_MAPPING` contains entries that **no model registers**.
+
+**Reachable via `@use_kernel_forward_from_hub` (layer swap):**
+
+| Kernel name | Occurrences | Notes |
+|---|---|---|
+| `RMSNorm` | **115** | the big one. Ported ✓ |
+| `MultiScaleDeformableAttention` | 10 | detection models |
+| `Qwen3_5GatedDeltaNet` | 4 | |
+| `MegaBlocksMoeMLP` | 2 | MoE — relevant to Week 5 |
+| `SiLU` | 1 | one decoration in `activations.py` covers every model using `ACT2FN["silu"]`. Ported ✓ |
+| `GeLU`, `GeluTanh`, `NewGELU`, `FastGELU`, `QuickGELU` | 1 each | same leverage pattern as SiLU |
+| `Llama4TextMoe` | 1 | |
+
+**Reachable via `@use_kernel_func_from_hub` (function swap):**
+
+| Kernel name | Model files | Notes |
+|---|---|---|
+| `rotary_pos_emb` | **95** | Ported ✓ |
+| `ForCausalLMLoss` | — | mapped for cuda training |
+
+**In `_KERNEL_MAPPING` but NOT registered by any model** — dead via the decorator path:
+`SwiGLUMLP`, `GeGLUMLP`, `Linear`, `causal_conv1d_fn`, `causal_conv1d_update`.
+
+`SwiGLUMLP` matters most, because a fused gate/up/SiLU/down MLP is where the real MLP
+performance is (see `kernels/neuron_silu/__init__.py`). It is *not* reachable by
+decorating a layer. Fused replacement goes through a separate, more invasive API —
+`register_kernel_replacements_and_fusions()` / `make_parent_class_for_kernel_fusion()`,
+driven by `KernelConfig`, which swaps the first named child for the kernel and replaces
+its siblings with `nn.Identity()`. That is a different integration shape from the
+per-layer forward swap this PoC validated, and it is what a fused NKI MLP kernel would
+require.
+
+**Leverage summary.** Three kernels (RMSNorm, RoPE, SiLU) cover the two highest-count
+interception points plus the activation family. Because the activation decorations live
+in `activations.py` rather than per-model, one activation kernel covers every model
+using that `ACT2FN` entry. That is the strongest argument for the per-kernel
+(rather than per-model) investment thesis — provided Finding #9's device-routing gap is
+closed, since none of this surface is reachable on Neuron today.
+
+**A third device-inference site.** `transformers/utils/kernel_config.py::infer_device()`
+repeats the same `param.device.type` logic with a cuda/rocm refinement and no xla/neuron
+handling. So the Finding #9 fix needs to be applied in three places to be complete:
+`hub_kernels.kernelize`, `kernel_config.infer_device`, and `kernels._find_device`.

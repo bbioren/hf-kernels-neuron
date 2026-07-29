@@ -37,9 +37,24 @@ import warnings
 
 import torch
 
-# Both `nki` and `neuronxcc.nki` resolve on the current DLAMI (verified via
-# scripts/probe_nki_api.py). nki-library source uses the top-level `nki`, so we
-# match it to keep the port diff small; fall back to the compiler-bundled path.
+# IMPORT PATH MATTERS, AND THIS KERNEL REQUIRES THE TOP-LEVEL `nki`.
+#
+# Both `nki` and `neuronxcc.nki` import successfully, but they are NOT
+# interchangeable at kernel-compile time, and neither is a superset:
+#
+#   * `neuronxcc.nki` supports `nl.arange` index tensors, but treats tensor shape
+#     values as symbolic scalars, so `//` on them raises
+#         NotImplementedError: math.trunc() is not supported for scalar
+#     which breaks the `div_ceil` this kernel inherits from nki-library.
+#   * top-level `nki` gives concrete ints for shapes (so `//` is fine) but fails to
+#     resolve `nl.arange` at compile time:
+#         error: failed to resolve name 'nki.language.arange'
+#     even though `hasattr(nl, "arange")` is True.
+#
+# So each kernel is effectively pinned to whichever package its idiom requires. This
+# one uses slicing + `//`, so it needs top-level `nki`. Our RMSNorm and SiLU kernels
+# use arange index tensors, so they need `neuronxcc.nki`. Verified both ways by
+# swapping the imports and re-running the suites. See docs/sticking-points.md.
 _HAS_NKI = False
 try:
     import nki

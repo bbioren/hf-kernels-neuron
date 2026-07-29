@@ -50,6 +50,15 @@ NEURON_KERNELS = {
         "repo": "neuron_rope",
         "symbol": "apply_rotary_pos_emb",
     },
+    # @use_kernel_forward_from_hub("SiLU") on transformers.activations.SiLUActivation.
+    # Registered for mechanism coverage; see kernels/neuron_silu/__init__.py for why
+    # a standalone elementwise activation is not expected to be a speedup, and why
+    # "SwiGLUMLP" is the interception point that actually matters for MLP performance.
+    "SiLU": {
+        "kind": "layer",
+        "repo": "neuron_silu",
+        "symbol": "NeuronSiLU",
+    },
 }
 
 

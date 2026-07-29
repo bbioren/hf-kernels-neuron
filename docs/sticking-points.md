@@ -87,6 +87,36 @@ calling the `kernels` library directly with `device="neuron"`.
 `kernels._find_device` using `xm.xla_device_hw()`, which we confirmed returns `"NEURON"`.
 Filed as Finding #9. This is the single highest-value upstream change for the project.
 
+### [2026-07-29] `nki` and `neuronxcc.nki` are not interchangeable — neither is a superset
+**Time lost:** ~50 min (SiLU failed on all 9 shapes; then a wrong "standardise on one
+package" attempt broke all 20 RoPE cases before I reverted)
+**Would affect:** both — anyone porting more than one nki-library kernel hits this
+**Resolution:** Pinned each kernel to the package its idiom needs. RMSNorm and SiLU use
+`nl.arange` index tensors, which only resolve under `neuronxcc.nki`. RoPE uses slicing
+plus `//` on shape values, which only works under top-level `nki` (`neuronxcc.nki`
+treats shapes as symbolic scalars and raises
+`NotImplementedError: math.trunc() is not supported for scalar`). Our repo genuinely
+needs both packages.
+**Takeaway:** `hasattr(nl, "arange")` is True under the top-level package even though
+the name cannot be resolved at trace time, so there is no import-time feature detection
+— you find out at compile time, per kernel. And the error text never hints that the
+sibling package would work. nki-library source uses top-level `nki` while the tutorials
+use `neuronxcc.nki`, so a mass-porting effort meets this immediately. Needs a supported
+compatibility table from the NKI team. Finding #14.
+
+### [2026-07-29] My own test instrumentation gave a false negative
+**Time lost:** ~20 min
+**Would affect:** engineering (anyone writing kernel tests)
+**Resolution:** In the e2e test I patched a freshly `load_kernel_module()`-ed copy of the
+kernel, but `LocalLayerRepository` had loaded its *own* module object, so the counters
+read nki=0 while the kernel was demonstrably running (logits had changed). Fixed by
+instrumenting via `get_local_kernel()`, which caches and returns the same object the
+repository used.
+**Takeaway:** Ironic and instructive: this is a false negative of exactly the shape
+Finding #8 is a false positive of. Whenever you assert on "did the kernel run", confirm
+you are observing the same module object the framework loaded — Python module identity
+is easy to get wrong when a package is loaded by path.
+
 ---
 
 ## Summary Statistics
@@ -95,7 +125,20 @@ Filed as Finding #9. This is the single highest-value upstream change for the pr
 |----------|-------|----------------|
 | Documentation gaps | 3 | ~65 min |
 | Environment/setup | 3 | ~75 min |
-| API instability | 1 | ~20 min |
+| API instability | 2 | ~70 min |
 | Architecture mismatch | 3 | ~2.25 hours |
-| Silent-failure / test methodology | 1 | ~60 min |
-| **Total** | **11** | **~5.75 hours** |
+| Silent-failure / test methodology | 2 | ~80 min |
+| **Total** | **13** | **~7 hours** |
+
+### Where the time actually goes
+
+Two categories dominate, and they are not the ones you would guess from Week 1:
+
+- **Silent failures and test methodology (~80 min).** Nothing crashed. The kernels
+  produced correct numbers while not running at all. This cost a week of false
+  confidence in Week 2 and was only caught by noticing an implausibly *perfect* result.
+- **Undocumented capability splits (~70 min).** Two NKI packages that both import, both
+  pass `hasattr`, and fail differently at compile time.
+
+Neither shows up as an error message a customer could search for. That is the through-line
+of this PoC: the Neuron + HF Kernel Hub integration mostly fails *quietly*.
