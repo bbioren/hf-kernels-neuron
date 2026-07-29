@@ -14,6 +14,7 @@ Run on trn2:
 """
 
 import sys
+import warnings
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -22,8 +23,12 @@ import torch
 import torch.nn as nn
 
 from nki_test_utils import (
+    AccuracyResult,
+    CallCounts,
     assert_nki_accuracy,
+    cosine_similarity,
     load_kernel_module,
+    max_abs_diff,
     nki_call_counter,
     report,
     require_neuron,
@@ -71,6 +76,60 @@ def run_case(mod, device, hidden_size, seq_len, batch_size, dtype=torch.float32,
         out_cpu = out.cpu()
 
     return assert_nki_accuracy(label, golden, out_cpu, counts, max_diff_tol=tol)
+
+
+def test_fallback_is_loud(mod, device):
+    """A CPU input must fall back, warn, and stay correct.
+
+    This is the Finding #8 scenario reproduced deliberately. Before Week 3 this path was
+    silent, which is how an entire accuracy suite passed without executing NKI. The
+    warning is the fix, so it needs a test — otherwise the same regression could recur
+    unnoticed, which is exactly the failure mode we are guarding against.
+    """
+    print()
+    print("-" * 76)
+    print("Fallback behaviour (CPU input — the Finding #8 scenario)")
+    print("-" * 76)
+
+    hidden, eps = 256, 1e-6
+    torch.manual_seed(0)
+    weight = torch.randn(hidden) * 0.5 + 1.0
+    x = torch.randn(1, 32, hidden)
+    golden = reference_rmsnorm(x, weight, eps)
+
+    mod._warned.clear()
+    layer = mod.layers.NeuronRMSNorm()
+    layer.weight = nn.Parameter(weight.clone())
+    layer.variance_epsilon = eps
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with nki_call_counter(mod, NKI_NAMES, FALLBACK_NAMES) as counts:
+            with torch.no_grad():
+                out = layer(x)  # deliberately CPU, not moved to device
+
+    warned = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+    cos = cosine_similarity(golden, out)
+    took_fallback = counts.fallback > 0 and counts.nki == 0
+
+    print(f"  dispatch        : {counts}")
+    print(f"  took fallback   : {took_fallback}")
+    print(f"  warning emitted : {len(warned) > 0}")
+    if warned:
+        print(f"  warning text    : {str(warned[0].message)[:95]}")
+    print(f"  still correct   : cos_sim={cos:.6f}")
+
+    ok = took_fallback and len(warned) > 0 and cos > 0.999
+    print(f"  {'PASS' if ok else 'FAIL'}")
+    if not warned:
+        print("  (a silent fallback here is precisely the Finding #8 regression)")
+    return AccuracyResult(
+        label="fallback loud + correct (CPU input)",
+        cos_sim=cos,
+        max_diff=max_abs_diff(golden, out),
+        counts=counts,
+        passed=ok,
+    )
 
 
 def main():
@@ -124,7 +183,8 @@ def main():
         print(f"  bf16 case failed: {type(e).__name__}: {e}")
 
     ok = report(results, "NKI RMSNorm on Neuron hardware (execution-verified)")
-    return 0 if ok else 1
+    fb = test_fallback_is_loud(mod, device)
+    return 0 if (ok and fb.passed) else 1
 
 
 if __name__ == "__main__":
