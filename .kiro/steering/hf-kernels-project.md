@@ -128,6 +128,7 @@ Plus `metadata.json` with `{"backend": {"type": "neuron"}}`.
 | neuronx-cc | 2.26.6360.0+6f180f47 |
 | Instance | trn2.3xlarge (4 NeuronCores, 96 GB HBM) |
 | Neuron venv | `/opt/aws_neuronx_venv_pytorch_2_9` |
+| SSH | `ssh trn2` (16.26.235.50, ubuntu, ben-ssh.pem) |
 
 ## Documentation sources
 
