@@ -145,3 +145,24 @@ Plus `metadata.json` with `{"backend": {"type": "neuron"}}`.
 - **Pinak (panpinak)**: SA team reviewer
 - **Hanbo Wang / Karthick Gopalswamy**: kernels team (PoC recipients)
 - **Matt (mmcclean)**: final deliverable recipient
+
+## Tracking Documents — UPDATE THESE THROUGHOUT
+
+These docs accumulate findings that become the final PoC. Update them as you work, not just at the end.
+
+| Document | Purpose | When to update |
+|----------|---------|----------------|
+| `docs/sticking-points.md` | Running log of things that blocked or slowed progress | Every time something takes >10 min to debug or is harder than expected |
+| `docs/customer-experience.md` | What a customer would struggle with today | When you hit setup friction, unclear errors, missing docs, or workflow gaps |
+| `docs/porting-recommendations.md` | How the engineering team should port kernels at scale | When you learn something about nki-library structure, HF requirements, or automation opportunities |
+| `docs/poc-findings.md` | Technical findings with severity ratings | When you discover a gap, API issue, or architectural mismatch |
+| `docs/nki-library-porting-analysis.md` | Deep analysis of nki-library kernel structure | When you investigate a new kernel from nki-library |
+| `deliverables/week-N.md` | Weekly deliverable writeup | End of each week |
+
+## What to Always Be Tracking
+
+1. **Sticking points**: anything that took longer than expected, would trip up a customer, or reveals a systemic gap. Log it with time lost + who it affects.
+2. **Customer experience**: imagine someone just did `pip install transformers` and wants NKI kernels. What's missing? What errors do they hit? What's underdocumented?
+3. **Porting friction**: for each nki-library kernel you look at, note: is it fused? what deps does it pull? does the interface match HF? what would automation need?
+4. **Recommendations**: concrete suggestions for the engineering team. Not just "this is hard" but "here's what to build/change to make it easy."
+5. **Accuracy results**: always record cosine similarity, max abs diff, shapes tested, and whether NKI or fallback was used.
