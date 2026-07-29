@@ -2,8 +2,10 @@
 
 ## SESSION SUMMARY
 
-**Read this first.** Branch `week-3`, 8 commits, nothing pushed. All tests verified on
-trn2. Full writeup in `deliverables/week-3.md`.
+**Read this first.** Branch `week-3`, 12 commits, **nothing pushed**. All four test suites
+verified on trn2 (exit 0). Full writeup in `deliverables/week-3.md`; findings with severity
+in `docs/poc-findings.md` (#8-#17); reproduction scripts indexed at the end of the
+deliverable.
 
 ### What got done
 
