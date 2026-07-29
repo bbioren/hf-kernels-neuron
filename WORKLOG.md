@@ -38,6 +38,15 @@ never called on that path); the e2e test caught it. The correct fix is one branc
 `transformers/integrations/hub_kernels.py`, and I **verified it is sufficient**: applied
 in-process it takes Qwen3 from 0 → 9 swapped layers. Finding #9.
 
+**3. `nkilib` is already installed, and thin-wrapper porting works today.** Found late, and
+it's the most consequential finding for *planning*. Every production kernel is importable
+from the venv, and calling installed `rope_hf` directly from PyTorch/XLA gives
+`cos_sim 1.000001`. Hand-porting doesn't scale — RoPE needed ~15 lines inlined, the MLP
+kernel's closure is 7,249 lines across 22 files. Thin wrappers are a few dozen lines. The
+blocker is the `python-depends` allowlist, i.e. policy, not code. So the ask to HF shrinks
+from "fund a porting program" to four items, three of which are each smaller than one kernel
+port. Finding #16.
+
 ### Other findings worth your attention
 
 - **#12** HF already whitelists `nki` as a Neuron `python-depends` — but `_backend()`
@@ -53,6 +62,11 @@ in-process it takes Qwen3 from 0 → 9 swapped layers. Finding #9.
 - **#15** Several `_KERNEL_MAPPING` entries are registered by no model and are
   unreachable — including `SwiGLUMLP`, which matters because fused MLP is where the real
   MLP performance is. It needs the separate fusion API, not a per-layer swap.
+- **#17** The fused MLP is blocked by **weight layout**, not by the kernel. All three HF
+  `nn.Linear` weights are transposed vs what `nkilib.mlp()` wants, the transpose must be
+  materialized, and `kernelize()` has no parameter hook — only `forward` rewriting. All four
+  workarounds are bad. This blocks *every* fused-kernel port on Neuron, so it needs a
+  kernels-team design decision before Week 5 planning.
 
 ### What's left / needs your input
 
@@ -418,3 +432,53 @@ confirmed optional, minimum repo is 2 files. Unblocked by B1.
 - **Port `nl.gelu` / `gelu_apprx_tanh` activations.** Cheap now that the pattern is
   established; each covers a whole model family via one `activations.py` decoration.
   Same caveat as SiLU: elementwise activations are memory-bound, so don't expect wins.
+
+### 2026-07-29 18:30 UTC — The strategy finding I nearly missed
+Per the "don't stop early" instruction I went looking for remaining in-scope work and
+noticed `docs/nki-library-porting-analysis.md` had never been updated with the RoPE case
+study — the steering doc explicitly says to update it per kernel investigated. While
+writing that up I delegated an MLP-kernel analysis, and its report flagged (as *inferred,
+not verified*) that nkilib might ship bundled with neuronx-cc.
+
+I verified it, and it's better than that: **`nkilib` is a normal install in the Neuron
+venv**, with every production kernel importable — `rope_hf`, `mlp`, `moe_cte`,
+`router_topk`, `rmsnorm_quant`.
+
+Then I tested whether the installed production kernel is actually *callable* from
+PyTorch/XLA:
+
+| Strategy | Result |
+|---|---|
+| preallocated outs, read **return value** | **q cos_sim 1.000001, k cos_sim 1.000000** |
+| preallocated outs, read **mutated args** | cos_sim **0.000000** |
+
+So a **thin wrapper over the production kernel works today**. Destination-passing is
+vestigial across the XLA boundary — outputs are shape templates, results come back via the
+return value. (nki-library's own tests use `must_alias_input`, which points you at the
+second strategy and silently gives zeros. Worth flagging upstream.)
+
+**This is the most consequential finding of the session for planning**, and it reframes the
+Week 2 conclusion. Hand-porting doesn't scale: RoPE needed ~15 lines inlined, the MLP
+kernel's closure is 7,249 lines across 22 files (~480x). Thin wrappers are a few dozen
+lines. So the ask shrinks from "fund a porting program" to four items, three of which are
+each smaller than one kernel port. Blocker is the `python-depends` allowlist — policy, not
+code. Finding #16.
+
+Also logged **Finding #17**: the fused MLP is blocked by weight layout, not by the kernel.
+All three HF `nn.Linear` weights are transposed vs what `nkilib.mlp()` wants, the transpose
+must be materialized, and `kernelize()` has no parameter hook — it only rewrites `forward`.
+All four workarounds are bad (in-place mutation silently breaks `save_pretrained`; a
+transposed copy ~doubles MLP weight memory; lazy-cache adds a stall; per-forward transposing
+erases the speedup). This blocks *every* fused-kernel port on Neuron, so it's a design
+decision for the kernels team, not a PoC choice. Arguably more valuable output than the
+kernel would have been.
+
+Corrected the Week 2 over-generalization while I was there: "nki-library kernels are too
+fused to port" is true of RMSNorm and false of RoPE and MLP (both have quant opt-in or
+absent). RMSNorm is the outlier, not the archetype — a conclusion drawn from one kernel.
+
+**D10. Did not build a thin-wrapper kernel, only proved it works.**
+Tempting to ship a `neuron_rope_thin/` alongside the hand-port. Didn't: it would have to
+under-declare an undeclarable dependency (Finding #12), so it isn't a shippable artifact,
+and the PoC's value is the hand-port's documented friction. The experiment script records
+the feasibility result, which is the part the team needs.
