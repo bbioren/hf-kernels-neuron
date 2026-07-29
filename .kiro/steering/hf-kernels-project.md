@@ -154,10 +154,31 @@ blocker 1 lands. Use `kernelize_for_neuron(model)` from
 `scripts/neuron_kernel_registration.py`, which calls the kernels library directly with
 `device="neuron"` and handles the `_hidden_kernels` attach/detach that function kernels need.
 
-**Open design question (not a bug):** Finding #17 — fused kernels need weights in a layout
-different from `nn.Linear`'s, and `kernelize()` has no parameter-transformation hook. This
-blocks *every* fused-kernel port, so it gates Week 5 MoE work. It needs a decision from the
-HF kernels team, not a workaround from us.
+| 5 | Fused MLP divides by zero single-core when `intermediate_size > 4096` | nki-library | bug fix | **boundary measured, 10 data points**; no wrapper workaround |
+
+**Fused-kernel work is blocked, not merely expensive.** Two independent gates, found by the
+Week 4 derisking spike (`scripts/spike_nkilib_mlp.py`), which was worth running precisely
+because it surfaced them before 2-3 weeks went into the integration:
+
+- **Finding #18 (blocker 5):** `nkilib.core.mlp.mlp` fails to compile single-core above
+  `intermediate_size = 4096`. Sharp boundary across 10 configs. Excludes Qwen3-8B (I=12288),
+  Llama-3-8B and Mistral-7B (I=14336). A wrapper cannot work around it. Resolve this **first** —
+  Finding #17 is moot until a kernel that compiles at useful sizes exists.
+- **Finding #17:** `kernelize()` has no parameter-transformation hook for the weight-layout
+  difference. A design decision for the HF kernels team. Note its premise was partly corrected
+  by measurement — read the CORRECTION block in `docs/poc-findings.md` before quoting it.
+
+The positive half of that spike: the production fused MLP kernel **is** drivable directly from
+PyTorch/XLA with HF weights (cos_sim 0.999979-0.999995), which further supports the
+thin-wrapper thesis in Finding #16.
+
+**Performance measurement caveat (Finding #19).** Eager NKI dispatch costs ~0.36 ms of host
+time per call vs ~0.011 ms for eager PyTorch — roughly 25x. At 217 kernel calls per Qwen3-8B
+forward that is ~76 ms of host-side overhead per step. Two consequences:
+- **Per-layer microbenchmarking cannot resolve kernel quality here** — overhead is 90%+ of
+  measured latency at realistic shapes. Do not quote per-layer NKI-vs-eager ratios. Week 4
+  full-model MFU is the right instrument, and should report launch count alongside MFU.
+- This makes fusion *more* valuable, since one fused call replaces several dispatches.
 
 ## Week-by-week plan
 

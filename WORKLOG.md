@@ -2,10 +2,16 @@
 
 ## SESSION SUMMARY
 
-**Read this first.** Branch `week-3`, 12 commits, **nothing pushed**. All four test suites
-verified on trn2 (exit 0). Full writeup in `deliverables/week-3.md`; findings with severity
-in `docs/poc-findings.md` (#8-#17); reproduction scripts indexed at the end of the
-deliverable.
+**Read this first.** Branch `week-3`, **nothing pushed**. All four test suites verified on trn2
+(exit 0). Full writeup in `deliverables/week-3.md`; findings with severity in
+`docs/poc-findings.md` (#8-#19); upstream asks with patches in `docs/upstream-fixes.md`;
+reproduction scripts indexed at the end of the deliverable.
+
+Two sessions. Session 1 = Week 3 proper (below). **Session 2** (at the bottom) ran the MLP
+derisking spike and a benchmark attempt, and produced three more findings — including two
+corrections to things I'd previously asserted without measuring. If you read only one extra
+thing, read Finding #18: the fused MLP cannot run single-core at any realistic
+`intermediate_size`, which blocks the fused-kernel direction outright.
 
 ### What got done
 
@@ -484,3 +490,111 @@ Tempting to ship a `neuron_rope_thin/` alongside the hand-port. Didn't: it would
 under-declare an undeclarable dependency (Finding #12), so it isn't a shippable artifact,
 and the PoC's value is the hand-port's documented friction. The experiment script records
 the feasibility result, which is the part the team needs.
+
+---
+
+## Session 2 — 2026-07-29 19:50-20:15 UTC
+
+Continued after the Week 3 wrap-up. Two pieces of work, both of which produced findings that
+change the plan, and both of which required me to correct something I'd previously asserted.
+
+### T10 — MLP derisking spike (`scripts/spike_nkilib_mlp.py`)
+
+Ran the 1-2 day spike I'd recommended for Week 4. It paid for itself immediately.
+
+**Positive:** the production fused MLP kernel **is** drivable directly from PyTorch/XLA with HF
+weights. No vendoring. cos_sim vs Qwen3MLP: 0.999989 (fp32), 0.999995 (bf16), 0.999979
+(H=4096 I=4096). Supports the Finding #16 thin-wrapper thesis.
+
+**Blocking — Finding #18:** it cannot run single-core when `intermediate_size > 4096`. Sharp
+boundary, 10 configs across three `hidden_size` values, **passes iff I <= 4096** (4096 passes,
+4224 fails). Not fixed by seq len, `force_cte_mode`, or `mode=PREFILL`. Fails inside the
+kernel's own tile arithmetic (`'floordiv' does not allow division by zero`), almost certainly
+the CTE sharding heuristic forcing `shard_on_inter` above I=4096 with no SPMD grid.
+
+Every real model is excluded: Qwen3-8B I=12288, Llama-3-8B and Mistral-7B I=14336. Unlike #17,
+**a wrapper cannot work around this.** It also turns Week 2's general "SPMD assumptions may not
+fit the per-layer swap model" worry into a measured fact: SPMD-strippability is per-kernel, and
+for fused kernels it may not hold at all.
+
+**Correction to Finding #17.** I had asserted non-contiguous transposed tensors are rejected and
+the transpose must be materialized. Reasoned, not measured — and the measurement contradicts the
+premise. The kernel accepts a device-side `.t()` and is numerically correct, and
+`is_contiguous()` returns True on XLA even after `.t()` (XLA normalizes layout, so `.t()` is a
+real graph op, not a stride view). The memory cost and the missing hook stand; whether
+per-forward transposing is expensive depends on whether XLA hoists it, which I have not
+profiled. Withdrew the two claims that don't hold; marked the cost table as candidate.
+
+My *first* version of the spike also got its own methodology wrong — transposed on host then
+called `.to(device)`, letting the transfer materialize the result, which proved nothing about
+non-contiguous handling. Fixed to transpose on device.
+
+### T11 — Per-kernel benchmark (`scripts/benchmark_kernels.py`)
+
+Set out to test the prediction that RMSNorm/RoPE help and SiLU doesn't. **Could not answer it**,
+and that is the result.
+
+v1 reported every kernel 8-400x slower than eager. Those numbers were garbage. The tell: latency
+didn't vary with tensor size — RMSNorm 0.55 ms at both S=128 and S=2048 (16x the data), eager
+0.07 ms throughout. I never consumed the outputs, so XLA eliminated the computation and I timed
+an empty graph.
+
+After fixing that, latency does respond to size but only 1.1-1.3x for 8x data → **90%+ fixed
+cost**. So even corrected, per-layer microbenchmarking cannot resolve kernel quality here. The
+script now **refuses to report ratios** unless latency scales with problem size, and prints why.
+On repeat runs the gate passes (1.26x) or fails (1.12x) at identical shapes — itself evidence
+the measurement is at the noise floor.
+
+**The signal that did survive — Finding #19:** host-side dispatch is **~0.36 ms/call for NKI vs
+~0.011 ms for eager**, reproducible across runs (~25-33x). At 217 kernel calls per Qwen3-8B
+forward that's **~76 ms of host-side overhead per step**, serial and independent of batch/seqlen.
+Upper bound on serial cost since some may overlap.
+
+This makes fusion *more* important, not less — one fused call replaces several dispatches — so
+#17 and #18 go up in priority on this evidence.
+
+**Finding #19 is Finding #8 in a different costume**, and I've written it up as a pattern rather
+than an isolated slip: on a lazy-execution backend both correctness and performance measurements
+fail silently by default (a fallback is numerically correct; an eliminated computation is fast).
+Every measurement needs an independent check that it exercised the thing measured — call counter
+for correctness, scaling gate for performance.
+
+---
+
+## DECISIONS (continued)
+
+**D11. Suppress the benchmark ratios rather than report them with caveats.**
+I could have published "NKI is 8-400x slower" with a footnote. That would have been actively
+harmful — someone would have quoted the headline. The script now returns exit 2 and explains the
+suppression. The dispatch-overhead number is reported because it's reproducible and
+methodologically clean.
+
+**D12. Do not attempt to fix Finding #18 from our side.**
+Tempting to hunt for a config that dodges the divide-by-zero, or to launch SPMD from the wrapper.
+Didn't: (a) the boundary is in nki-library's tile math and belongs to that team, (b) an SPMD
+launch from a per-layer HF swap is an architecture question for the kernels team, not something
+to improvise, and (c) a workaround would obscure a bug that should be reported. Logged as
+upstream Fix 5 with the reproduction.
+
+**D13. Promoted Fix 5 above the Finding #17 question in filing order.**
+#17 is a design question about how to transform weights for a kernel that currently cannot
+compile at any useful size. Sequencing the design conversation first would waste the kernels
+team's time.
+
+---
+
+## BLOCKED — NEEDS INPUT (updated)
+
+Additions to B1-B4 from session 1:
+
+**B5. Fused-kernel work is blocked pending two upstream items.** Do not start the fusion-API
+integration. Finding #18 (nki-library, no workaround) then Finding #17 (HF design decision).
+The standalone spike is done, so there is no further derisking to do from our side.
+*Recommendation:* file #18 now with the boundary table; it's a clean bug report.
+
+**B6. Week 4 MFU needs a methodology decision.** Per-layer microbenchmarking is dead (#19), so
+MFU on a full model is the only instrument left — but Finding #9 means `use_kernels=True` won't
+route to Neuron, so the measurement has to go through `kernelize_for_neuron()`. Worth deciding
+whether that's an acceptable basis for a customer-facing number, or whether the upstream fix
+should land first. *Recommendation:* measure now via the helper, and state the caveat.
+Also report launch count alongside MFU, per #19.

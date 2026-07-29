@@ -35,6 +35,14 @@ reasonably believe things are working.
 | Kernel falls back on host tensors | Correct numbers, no warning. Our own test even printed "Backend: NKI kernel" | Eager PyTorch. Zero NKI execution. Cost us a week of false confidence — see Finding #8. |
 | `"neuron"` mapping ignored on a `cpu`-device model | `use_kernels=True` returns successfully | Mapping lookup misses; original forward retained |
 | Accuracy test passes with `max_diff = 0.00e+00` | "Bit-identical, great" | Both sides ran the same PyTorch code. For a hardware kernel, a perfect match means the kernel didn't run. |
+| Benchmark shows plausible latency, output discarded | "My kernel is 8x slower" (or faster) | XLA is lazy; with no live output the computation is eliminated. You timed an empty graph — Finding #19. |
+| Kernel appears slow in isolation | "The NKI kernel is bad" | ~0.36 ms/call of host-side dispatch overhead dominates at per-layer granularity. It's the integration model, not the kernel. |
+
+**The pattern worth generalizing:** on a lazy-execution accelerator backend, *both* correctness
+and performance measurements fail silently by default. A fallback is numerically correct, and
+an eliminated computation is fast. Every measurement needs an independent check that it
+exercised the thing being measured — a call counter for correctness, a size-scaling check for
+performance. Neither is standard practice. Both cost us a cycle.
 
 **The general lesson for the PoC:** on Neuron, the dangerous outcome is not a crash,
 it's a no-op that looks like success. Any customer-facing story for NKI kernels on the

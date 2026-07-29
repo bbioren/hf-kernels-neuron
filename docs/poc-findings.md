@@ -45,6 +45,7 @@ These are the primary references we used. Critically, they describe different la
 | 16 | **`nkilib` is already installed and its kernels are directly callable — thin-wrapper porting is feasible today** | **High** | Open (policy blocker only) |
 | 17 | Fused MLP: `kernelize()` has no weight-transformation hook | High | Open (design decision) — **premise partly corrected, see #17** |
 | 18 | **Fused MLP kernel cannot run single-core when `intermediate_size > 4096` — excludes every real model** | **High** | Open (nki-library bug; no wrapper workaround) |
+| 19 | Eager NKI dispatch costs ~0.36 ms host time per call (~25x eager); per-layer microbenchmarking can't resolve kernel quality | High | Open — Week 4 MFU is the right instrument |
 
 ---
 
@@ -869,3 +870,98 @@ weights, take `[0]` off the returned list. That further supports Finding #16's t
 thesis. `max_diff ~1e-2` is expected for a fused three-matmul and is consistent with
 nki-library's own `rtol=2e-2` test tolerance; it is well outside the `cos_sim > 0.999`-plus-tight-`max_diff`
 bar we hold RMSNorm and RoPE to, which is the tolerance question flagged earlier.
+
+## 19. Eager-mode NKI dispatch costs ~0.36 ms of host time per call [HIGH]
+
+Measured by `scripts/benchmark_kernels.py`. Two results: a performance finding, and a
+methodological one about how *not* to measure these kernels.
+
+### The measurement that survived
+
+Host-side cost of issuing one kernel call, without waiting for the device (so this is
+Python/dispatch/graph-construction time, not device execution):
+
+| Path | Host enqueue cost | Reproducibility |
+|------|-------------------|-----------------|
+| NKI SiLU (`@nki.jit` via XLA) | **~0.36 ms/call** | 0.361, 0.372 ms across runs |
+| eager `F.silu` | **~0.011 ms/call** | 0.011, 0.015 ms across runs |
+
+**~25-33x more host time per NKI invocation.** What that costs a real model: Qwen3-8B has 36
+layers, and our kernels are invoked 6× per layer (4 RMSNorm — input, post-attention, q_norm,
+k_norm — plus 1 RoPE and 1 SiLU) plus a final norm = **217 calls per forward**. At ~0.35 ms
+of extra host time each, that is **~76 ms of host-side overhead per forward step**.
+
+That overhead is serial, fixed, and does not shrink with batch or sequence length. Unless it
+overlaps with device execution it sets a floor on step time that no amount of kernel quality
+can beat.
+
+**Caveats, stated plainly:** this is an upper bound on the *serial* cost — some of the enqueue
+work may overlap with device execution in a real model, and some of it may be one-time graph
+construction that XLA caches across steps. It also says nothing about graph mode; these
+kernels declare `can_torch_compile = False`. The Week 4 full-model MFU measurement is what
+settles it.
+
+### Why this makes fusion more important, not less
+
+This is a finding about the **eager per-layer integration model**, not about the kernels. And
+it is the strongest argument yet for the fused-kernel direction: one fused MLP call replaces
+several dispatches, so fusion cuts launch count *as well as* memory traffic. A fused
+gate/up/SiLU/down would remove 2 of the 6 per-layer calls and a fused
+norm+MLP would remove 3.
+
+So Findings #17 (weight-layout hook) and #18 (single-core `I > 4096` failure) get *more*
+important on this evidence, not less. The per-layer swap model that the Kernel Hub is built
+around is the model that suffers most from launch overhead.
+
+### The methodological finding: per-layer microbenchmarking is the wrong instrument
+
+The first version of this benchmark reported that every NKI kernel was 8-400x **slower** than
+eager — RMSNorm 8x, SiLU 13x, RoPE 405x. **Those numbers were meaningless**, and the tell was
+that latency did not vary with tensor size: RMSNorm measured 0.55 ms at both S=128 and
+S=2048 (16x the data), while eager sat at 0.07 ms throughout. Timing that is independent of
+problem size is not measuring the problem.
+
+Two causes, both mine:
+
+1. **Dead-code elimination.** The benchmark discarded every output. XLA is lazy, so at
+   `mark_step()` there was no live result and the computation was never performed. It was
+   timing an empty graph. Fixed by consuming outputs via `.sum().item()`.
+2. **Overhead domination.** Whatever remained was per-call dispatch, which is fixed and
+   therefore identical across shapes.
+
+After fixing (1), latency does respond to size — but only weakly, around **1.1-1.3x for 8x
+data**, which decomposes to roughly **90%+ fixed cost** at these shapes. So even the corrected
+microbenchmark cannot resolve kernel quality: the signal is buried under per-call overhead on
+both paths (and part of that fixed cost is the harness's own sync, which applies to both).
+
+The script now **refuses to report NKI-vs-eager ratios** unless latency demonstrably scales
+with problem size, and prints the suppression reason instead. On repeated runs the gate
+sometimes passes (1.26x) and sometimes fails (1.12x) at the same shapes, which is itself
+evidence that the measurement sits at the noise floor and should not be trusted for ratios.
+
+**This is Finding #8 in a different costume**, and worth noting as a pattern rather than an
+isolated slip. Both were measurements that produced confident, plausible-looking numbers while
+not exercising the thing under test:
+
+| | Finding #8 | Finding #19 (v1) |
+|---|---|---|
+| Symptom | `max_diff = 0.00e+00` — too perfect | latency independent of problem size |
+| Cause | kernel never ran (CPU tensors → fallback) | computation never ran (output discarded → DCE) |
+| Why it fooled us | fallback is numerically correct | overhead is plausible as latency |
+| Guard now in place | call counter asserts NKI executed | scaling gate suppresses overhead-dominated results |
+
+The general lesson for the PoC: **on a lazy-execution accelerator backend, both correctness
+and performance measurements fail silently by default.** Every measurement needs a check that
+it actually exercised the thing being measured — a call counter for correctness, a scaling
+check for performance. Neither is standard practice, and both cost us a cycle.
+
+### What to do
+
+- Do **not** quote per-layer NKI-vs-eager latency ratios from this project. The instrument
+  can't support them.
+- Week 4 MFU on a full model is the measurement that decides whether the kernels help, and it
+  naturally accounts for launch overhead in the way a customer would experience it.
+- When reporting MFU, report launch count too. If step time is launch-bound, MFU alone will
+  look like a kernel-quality problem when it is an integration-model problem.
+- Worth asking the HF kernels team whether per-call dispatch cost is a known concern for
+  non-CUDA backends, and whether there is a batching or persistence mechanism.
