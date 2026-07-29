@@ -1,5 +1,72 @@
 # Week 3 Worklog
 
+## SESSION SUMMARY
+
+**Read this first.** Branch `week-3`, 8 commits, nothing pushed. All tests verified on
+trn2. Full writeup in `deliverables/week-3.md`.
+
+### What got done
+
+Three NKI kernels now execute inside a real Qwen3 forward on Trainium through the HF
+Kernel Hub mechanism, with execution *proven* rather than assumed:
+
+| Kernel | Type | Accuracy | Source |
+|--------|------|----------|--------|
+| RMSNorm | layer (`RMSNorm`, 115 registrations) | 11/11, NKI verified | tutorial (re-validated) |
+| RoPE | function (`rotary_pos_emb`, 95 model files) | 20/20 + 6/6 guards | **nki-library `rope_hf`, ported** |
+| SiLU | layer (`SiLU`, covers all `ACT2FN["silu"]`) | 9/9, NKI verified | `nl.silu` native |
+
+E2E on Qwen3: RMSNorm 9×, RoPE 2×, SiLU 2× per forward, all `fallback=0`, logits
+`cos_sim 1.000001`. All four suites exit 0.
+
+### The two things you most need to know
+
+**1. Week 2's accuracy results were not measuring NKI.** The kernel never ran. It gates
+on `device.type != "cpu"` and the tests fed CPU tensors, so every case took the PyTorch
+fallback and compared it against a mathematically identical reference — reporting a
+perfect `max_diff = 0.00e+00`. The tell was that perfection: a reduction kernel on
+hardware *must* differ by ~1e-4. The kernel turned out to be correct, but it was
+untested. Fixed the harness (`tests/nki_test_utils.py`) so every case asserts the NKI
+branch executed. Finding #8, and the most valuable customer-facing result of the week:
+on Neuron the dangerous outcome isn't a crash, it's a no-op that looks like success.
+
+**2. `use_kernels=True` cannot reach the `"neuron"` device path.** This Week 3 goal
+cannot be met today. It fails as a *silent no-op*: transformers passes a `Device` object,
+`kernelize` only validates device *strings*, so `Device(type="xla")` sails through and
+matches nothing. I initially proposed the wrong fix (patching `kernels._find_device` —
+never called on that path); the e2e test caught it. The correct fix is one branch in
+`transformers/integrations/hub_kernels.py`, and I **verified it is sufficient**: applied
+in-process it takes Qwen3 from 0 → 9 swapped layers. Finding #9.
+
+### Other findings worth your attention
+
+- **#12** HF already whitelists `nki` as a Neuron `python-depends` — but `_backend()`
+  reports cuda on the DLAMI, so the entry is unreachable and kernels must under-declare
+  their own dependency. Same `hasattr(torch, "neuron")` root cause as #7, now breaking
+  two things. Fixing `_backend()` is the highest-leverage single change.
+- **#14** `nki` and `neuronxcc.nki` have different capabilities and **neither is a
+  superset**. RMSNorm/SiLU need one, RoPE needs the other; this repo requires both.
+  `hasattr` lies about `nl.arange`, so you find out at compile time, per kernel.
+- **#13** nki-library *does* have a standalone HF-shaped RoPE (`rope_hf`), undocumented
+  in the public API reference. This **reverses the Week 2 narrative**: "nki-library is
+  too fused to port" is per-kernel, not a general truth.
+- **#15** Several `_KERNEL_MAPPING` entries are registered by no model and are
+  unreachable — including `SwiGLUMLP`, which matters because fused MLP is where the real
+  MLP performance is. It needs the separate fusion API, not a per-layer swap.
+
+### What's left / needs your input
+
+See **BLOCKED — NEEDS INPUT** at the bottom. Short version: the Hub repo-home decision
+(Samir) blocks publishing; three small upstream fixes are owned by other teams; and MFU
+measurement is Week 4. I did not touch the steering doc's week-by-week status — worth
+updating Week 3 to reflect that the `use_kernels=True` goal is blocked upstream rather
+than done.
+
+One correction to the steering doc's assumptions: coverage is larger than estimated —
+115 RMSNorm registrations (est. 87) and 95 RoPE model files (est. 66).
+
+---
+
 Branch: `week-3`. Session start: 2026-07-29 17:04 UTC.
 
 Goal per steering doc Week 3: package RMSNorm for Hub, add RoPE, register `"neuron"`
@@ -164,3 +231,190 @@ finding — hiding it would destroy the PoC's value.
 **D5. Scope guard — no Hub upload, no remote pushes, no contacting Samir.**
 All are outside this session's guardrails. The Hub question (T7) is answered by validating
 repo *structure* locally, not by uploading. Samir coordination is logged for the human.
+
+### 2026-07-29 17:35 UTC — T0b done: harness fixed, RMSNorm re-validated for real
+Added `tests/nki_test_utils.py`: `require_neuron()` (refuses to report results off
+Neuron hardware, checks `xla_device_hw() == "NEURON"`), `nki_call_counter()` (patches the
+kernel module's dispatch targets and asserts nki>0 / fallback==0), dtype-aware
+`max_abs_diff` tolerance with cos_sim as the primary gate.
+
+`tests/test_rmsnorm_nki.py`: **11/11 pass, every case nki=1 fallback=0.** fp32 max_diff
+1.2e-05 → 3.9e-04, bf16 3.1e-02 (expected at 8 mantissa bits; cos_sim still 0.999993).
+Non-zero diffs are the corroborating evidence of real hardware execution.
+
+bf16 first failed a 1e-2 tolerance I'd calibrated for fp32. Added `tol_for_dtype()`
+rather than loosening globally — bf16 genuinely cannot hold 1e-2 absolute at these
+magnitudes.
+
+Kept `test_rmsnorm_accuracy.py` with a warning header instead of deleting it (guardrail:
+don't delete files I didn't create — and it's a useful reproduction of the failure mode).
+
+### 2026-07-29 17:45 UTC — T4/T5 done: NKI RoPE ported and validated
+`kernels/neuron_rope/` — ported from nki-library `rope_hf`. **20/20 cases pass, all
+nki=1 fallback=0**: GQA/MQA, batch 1-4, seq 128-1024, head_dim 64/128, fp32+bf16,
+2D and 3D cos/sin.
+
+Every case is bit-identical (`max_diff = 0.000e+00`). Unlike RMSNorm that is *correct*
+here: RoPE is elementwise, so both backends perform the same three IEEE ops in the same
+order. But "bit-identical everywhere" also looks exactly like a test that measures
+nothing, so I added negative controls to prove the comparison discriminates:
+- vs negated-sin reference: cos_sim **0.430** (correctly rejects)
+- vs unrotated input: cos_sim **0.500** (proves the kernel actually rotated)
+- vs correct reference: cos_sim **1.000000**
+
+Also verified the `seq_len % 128` fallback fires, warns loudly, and stays correct.
+
+### 2026-07-29 18:00 UTC — T6 done: e2e Qwen3, and the upstream fix VERIFIED
+`tests/test_qwen3_neuron_e2e.py` on a real 2-layer Qwen3 at seq_len 128:
+- **NKI RMSNorm executed 9×** (4/layer + final norm), fallback 0
+- **NKI RoPE executed 2×** (1/layer), fallback 0
+- logits cos_sim **1.000001**, max_diff 5.29e-05 vs the unkernelized on-device model
+
+Two things I got wrong and the tests caught — both now corrected in Finding #9:
+
+1. **The proposed upstream fix was in the wrong place.** I had recommended patching
+   `kernels._find_device`. transformers' wrapper computes
+   `Device(type=model.device.type)` itself and passes it explicitly, so `_find_device`
+   is never called on the `use_kernels=True` path. Patching it would have done nothing.
+   The fix must go in `transformers/integrations/hub_kernels.py`.
+2. **The failure mode is a silent no-op, not an error.** transformers passes a `Device`
+   *object*, and `kernelize` only validates device types given as *strings*. So
+   `Device(type="xla")` sails through unvalidated, matches nothing, and every layer
+   quietly keeps its original forward. `kernelize()` returns success.
+
+With the corrected one-branch fix applied in-process, `use_kernels=True` goes from
+**0 → 9 swapped layers**, logits cos_sim 1.000001. The recommendation is now
+demonstrated rather than hypothesised.
+
+Instrumentation gotcha worth remembering: you must patch the module object the
+*repository* loaded (`get_local_kernel()`, which caches), not a fresh
+`load_kernel_module()` copy. Patching the wrong one reports nki=0 while the kernel is
+in fact running — a false negative of exactly the shape of Finding #8.
+
+### 2026-07-29 18:10 UTC — T7 done: Hub packaging, and a compounding bug
+`kernels/python_depends.json` already whitelists `nki` under a `neuron` backend section
+— HF anticipated NKI kernels. But `validate_dependencies()` consults the table for
+whatever `_backend()` reports, and that is `CUDA(version=12.8)` here, so declaring
+`python-depends: ["nki"]` raises `unsupported kernel dependency: nki`. A Neuron kernel
+must therefore under-declare (`[]`) to load at all. Finding #12.
+
+Same `hasattr(torch, "neuron")` root cause as Finding #7, now breaking two things.
+Fixing `_backend()` is the highest-leverage single change; it does *not* fix device
+routing (that's Finding #9's separate transformers change). Two distinct fixes.
+
+Also measured metadata.json field requirements: `digest` is optional (dropping the
+sha256 boilerplate), everything else required. Minimum viable kernel repo is 2 files.
+
+### 2026-07-29 18:05 UTC — T8 done: SiLU kernel (stretch goal)
+`nl.silu` exists natively, so nothing to port. 9/9 pass, all nki=1 fallback=0, including
+Qwen3-8B's 12288 MLP width and bf16. Negative controls: vs GELU 0.991, vs raw input 0.837.
+
+Hit Finding #14 writing this: SiLU failed all 9 shapes under the top-level `nki` package
+with `failed to resolve name 'nki.language.arange'`. Then I tried standardising all three
+kernels onto `neuronxcc.nki` and broke all 20 RoPE cases with
+`NotImplementedError: math.trunc() is not supported for scalar`. Reverted. The two
+packages are genuinely disjoint in capability; each kernel is pinned to the one its idiom
+needs.
+
+Also corrected a claim I'd written into the SiLU docstring before verifying it: I said
+`"SwiGLUMLP"` was the fusion interception point. It's in `_KERNEL_MAPPING` but **no model
+registers it** — `Qwen3MLP` has no decorator at all. Fused MLP needs the separate
+`register_kernel_replacements_and_fusions` API. Caught by grepping before shipping the
+claim; noted because it's the second time this session that writing the verification
+changed the conclusion.
+
+### 2026-07-29 18:15 UTC — T9: docs, deliverable, hygiene
+- `deliverables/week-3.md` — full writeup.
+- Filled the two empty sections of `docs/customer-experience.md` (API friction, runtime
+  issues), added a "Silent Failure Modes" section, and reordered the gap table by
+  blocking impact with owner + effort.
+- `docs/porting-recommendations.md` — corrected the stale `python-depends` claim, wrote
+  up the real RoPE porting friction.
+- Fixed the **Makefile**, which was broken: `lint` referenced
+  `kernels/neuron_rmsnorm/layers.py` (deleted in Week 2) and `test` assumed pytest-style
+  tests that ours aren't. Added `test-nki` / `test-e2e` / `probe` / `registration` /
+  `sync` targets.
+- Closed a gap in my own work: **RMSNorm was still falling back silently** while RoPE and
+  SiLU warned — the exact behaviour that caused Finding #8, in the kernel that caused it.
+  Added `_warn_once` + `_nki_unsupported_reason` to match the other two.
+- Expanded RoPE guard coverage to 6/6 (seq_len%128, unsqueeze_dim, 3D input, odd
+  head_dim, cos width mismatch, dtype mismatch).
+
+Final verification: all four suites exit 0 on trn2.
+
+---
+
+## DECISIONS (continued)
+
+**D6. Pin each kernel to the NKI package its idiom requires, rather than rewriting.**
+On hitting Finding #14 I could have rewritten RoPE's `div_ceil` to avoid `//` and
+standardised on `neuronxcc.nki`. I chose not to: RoPE is a *port*, and its value as a
+case study depends on staying close to the nki-library source. Rewriting idioms to
+satisfy an undocumented package split would have hidden the finding. Documented the split
+instead and pinned per-kernel.
+
+**D7. `has_backward = False` on all three kernels.**
+nki-library's `rope_hf` has a real backward rotation, and `nl.silu_dx` exists, so backward
+kernels are feasible. But we have not wired autograd, so claiming `has_backward=True`
+would let `kernelize` select these in TRAINING mode and produce wrong gradients. False is
+the honest value. Note the default for *function* kernels is True, so this had to be set
+explicitly — an easy footgun.
+
+**D8. Treat a bit-identical result as op-dependent, not universally suspicious.**
+Refined D2. For reduction ops (RMSNorm) a zero diff means the kernel didn't run. For
+elementwise ops (RoPE, SiLU) it's the correct expectation, since both backends perform
+the same IEEE ops in the same order. The call counter — not the diff — is the
+authoritative execution proof; `expect_bit_identical` only controls an advisory note.
+Added negative controls so "bit-identical" is never accepted on trust.
+
+**D9. Did not modify the steering doc.**
+It's your source of truth and it records week-by-week status. Week 3's
+`use_kernels=True` goal is blocked upstream rather than achieved, and coverage numbers
+turned out higher than estimated. Flagged here rather than editing it myself.
+
+---
+
+## BLOCKED — NEEDS INPUT
+
+**B1. Hub repo home: `kernels-community/` vs `aws-neuron/`.**
+Blocks publishing and determines the `repo_id` in the upstream diff
+(`scripts/neuron_kernel_registration.py::PROPOSED_UPSTREAM_DIFF`).
+*Recommendation:* `aws-neuron/`, so Neuron owns versioning and can ship fixes without
+waiting on kernels-community review. Requires the Samir conversation — external
+communication, out of scope for this session.
+
+**B2. Who drives the three upstream fixes?** All are small; none are ours to merge.
+- Finding #9 → transformers, ~5 lines across 3 sites (`hub_kernels.kernelize`,
+  `kernel_config.infer_device`, `kernels._find_device`). **Verified sufficient.**
+- Findings #7/#12 → `torch_neuronx` setting a `torch.neuron` attribute. One line,
+  unblocks variant resolution *and* dependency declaration.
+- Finding #14 → NKI team decision on which import path is supported long-term.
+
+*Recommendation:* file all three now with the reproductions from this branch. Finding #9
+has a verified patch and a demo, so it's the strongest one to lead with.
+
+**B3. Is inference-only acceptable for the beta story?** All three kernels are
+`has_backward=False`, so training mode falls back. If training matters for the beta,
+backward kernels are a real work item (nki-library's `rope_hf` has the backward path;
+`nl.silu_dx` exists; RMSNorm backward would need writing).
+
+**B4. Publishing to the Hub was explicitly out of scope this session** (guardrail: no
+external side effects). Everything needed is ready: flat layout validated, `digest`
+confirmed optional, minimum repo is 2 files. Unblocked by B1.
+
+---
+
+## SUGGESTIONS (out of scope, logged not done)
+
+- **`kernels`-side kernel report.** The single highest-value customer-experience
+  improvement would be an API answering "which implementation is live on which layer".
+  Numerical correctness cannot distinguish acceleration from fallback, so today there is
+  no way for a user to verify. Worth proposing upstream.
+- **A `--strict` mode for `kernelize`** that errors instead of falling back. `use_fallback=False`
+  exists in the kernels library but transformers doesn't expose it.
+- **RoPE `seq_len` padding.** Rather than falling back at `seq_len % 128 != 0`, pad to a
+  multiple of 128 and slice. Would make the kernel usable at arbitrary sequence lengths,
+  which is how HF actually calls it. Needs a perf check — padding may cost more than it saves.
+- **Port `nl.gelu` / `gelu_apprx_tanh` activations.** Cheap now that the pattern is
+  established; each covers a whole model family via one `activations.py` decoration.
+  Same caveat as SiLU: elementwise activations are memory-bound, so don't expect wins.
