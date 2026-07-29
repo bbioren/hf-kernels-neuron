@@ -2,71 +2,146 @@
 
 ## What this project is
 
-A 6-week internship PoC: package NKI kernels from `nki_samples` for the HuggingFace `kernels` library (Kernel Hub) and validate that Qwen3 dense runs end-to-end on Trainium with `use_kernels=True` swapping in NKI-accelerated layers. Final deliverable is a PoC document for the HF kernels team.
+A 6-week internship PoC: take NKI kernels from `aws-neuron/nki-library` (the production kernel library), package them for the HuggingFace `kernels` library (Kernel Hub), and validate that a stock HuggingFace model (Qwen3 dense) runs end-to-end on Trainium with `use_kernels=True` swapping in NKI-accelerated layers. If the dense flow lands cleanly, extend to Qwen3-MoE (router, top_k, blockwise MoE MLP). Final deliverable is a PoC document for the kernels team that captures what worked, what the Kernel Hub integration required, measured MFU impact, and a recommendation on whether Neuron should invest in first-class HF Kernel Hub support.
+
+Ben's first half (the attention tutorial) already ramped him on NKI, the Neuron profiler, and the Native PyTorch beta setup. Week 1 is HF Kernels architecture ramp-up, not Trainium ramp-up.
+
+## Why this project
+
+HuggingFace's `kernels` library is a runtime kernel replacement system that swaps `nn.Module.forward()` methods with optimized implementations pulled from the Hub. It is now merged to transformers mainline. Adding a `"neuron"` device path to the kernel mapping gives every HuggingFace model with RMSNorm (87 model files), rotary embeddings (66 model files), and standard activations access to NKI kernels automatically, in eager mode, with graceful fallback when no Neuron kernel exists.
+
+This is the highest-leverage HF ecosystem integration point for Neuron: per-kernel work that scales to the entire model zoo rather than per-model work. An intern PoC is the right vehicle to prove the mechanism end-to-end and hand the kernels team a validated path.
 
 ## Key concepts
 
 - **KERNEL_MAPPING**: dict of `(layer_class_name, device) → kernel_impl`. Adding `"neuron"` entries gives all HF models with RMSNorm/RoPE/SiLU access to NKI kernels automatically.
 - **Neuron device path**: the routing branch in `kernels` lib that selects `_NeuronRepos` when on Neuron hardware. Already merged to transformers mainline.
 - **kernelize() flow**: walks model tree, matches layer names against KERNEL_MAPPING for current device, hot-swaps `forward()` method pointers. Module weights stay in place.
-- **LocalLayerRepository**: local on-disk kernel repo for development without Hub publishing.
-- **Stateless kernel**: pure function that reads weights from the existing module, no own state. Must subclass `nn.Module`, define only `forward()`, and declare `has_backward` / `can_torch_compile`.
-- **@use_kernel_forward_from_hub("Name")**: decorator on a layer class that makes it swappable. The string name is looked up in KERNEL_MAPPING.
-- **use_kernel_mapping context manager**: scopes a mapping for testing without polluting global state.
+- **LocalLayerRepository**: local on-disk kernel repo for development without Hub publishing. Requires `__init__.py` + `metadata.json`.
+- **KernelConfig(use_local_kernel=True)**: transformers-side API for local kernels. Format: `{"RMSNorm": "path/to/kernel:ClassName"}`.
+- **Stateless kernel**: pure `nn.Module` subclass that reads weights from the adopting module via `self`. No `__init__`, only `forward()`. Declares `has_backward` / `can_torch_compile`.
+- **Single-file kernel pattern (PR #46754)**: kernel class + `class layers:` namespace in one `__init__.py` file. This is the correct authoring pattern for Python-only kernels (NKI).
+- **nki-library**: `aws-neuron/nki-library` — the production NKI kernel library. Source of kernels to port. Kernels are fused, have internal deps, and use different calling conventions than HF expects.
 
-## Repo layout
+## Source of NKI kernels
 
+**Use `aws-neuron/nki-library` (production library), NOT `nki-samples` (tutorial code).**
+
+The PoC's value is documenting how to port production kernels at scale. Key findings so far:
+- nki-library kernels are fused (e.g. RMSNorm+Quant combined) — no standalone ops
+- Internal dependencies (`common_types`, `kernel_helpers`, `kernel_assert`) not allowed by HF
+- Calling conventions differ (explicit args vs `self.weight`)
+- SPMD multi-core assumptions don't fit the per-layer swap model
+- See `docs/nki-library-porting-analysis.md` for full analysis
+
+## Kernel authoring pattern
+
+Single-file, per PR #46754:
+```python
+# kernels/neuron_rmsnorm/__init__.py
+class NeuronRMSNorm(nn.Module):
+    has_backward = False
+    can_torch_compile = False
+    weight: torch.Tensor
+    variance_epsilon: float
+
+    def forward(self, hidden_states):
+        # NKI kernel call here
+        ...
+
+class layers:
+    NeuronRMSNorm = NeuronRMSNorm
 ```
-kernels/
-  neuron_identity/    # Week 1 PoC kernel (identity-scale)
-  neuron_rmsnorm/     # Week 2 kernel (RMSNorm from nki_samples)
-  neuron_rope/        # Week 3 kernel (RoPE)
-  neuron_silu/        # Week 4 kernel (SiLU activation)
-scripts/
-  verify_neuron_path.py   # Validates all 4 Week 1 goals
-  demo_identity_swap.py   # Minimal forward-swap demo
-tests/                    # pytest accuracy + integration tests
-docs/                     # PoC document (Week 6 deliverable)
-```
 
-## How to add a new kernel
-
-1. Create `kernels/neuron_<name>/` with `__init__.py`, `layers.py`, and the NKI kernel file
-2. In `layers.py`: subclass `nn.Module`, set `has_backward = False`, `can_torch_compile = False`, annotate expected state with type hints, implement `forward()`
-3. In `__init__.py`: `from . import layers` and `__all__ = ["layers"]`
-4. Register in test scripts via `LocalLayerRepository(repo_path=..., package_name="neuron_<name>", layer_name="Neuron<Name>")`
-5. For production: add `"neuron"` entry to `_KERNEL_MAPPING` in transformers (Week 3+)
-
-## Design decisions
-
-- Start `has_backward = False` (inference only) unless nki_samples already has a backward kernel
-- Start `can_torch_compile = False` (eager mode only) — Kernel Hub forward-swap works in eager today
-- Use reference PyTorch impl first (validates plumbing), then swap in NKI kernel on trn2
-- The NKI kernel file uses conditional import (`try: import neuronxcc.nki`) so code is testable off-device
+Plus `metadata.json` with `{"backend": {"type": "neuron"}}`.
 
 ## Target model: Qwen3 dense
 
-- RMSNorm: `Qwen3RMSNorm` — manual implementation (not `torch.nn.functional.rms_norm`), reads `self.weight` and `self.variance_epsilon`
-- RoPE: `apply_rotary_pos_emb` — a function, so needs `FuncRepository` not `LayerRepository`
-- SiLU: used in MLP gating layer
+- **RMSNorm**: `Qwen3RMSNorm` — manual implementation, reads `self.weight` and `self.variance_epsilon`
+- **RoPE**: `apply_rotary_pos_emb` — a function, needs `FuncRepository` not `LayerRepository`
+- **SiLU**: used in MLP gating layer, decorator name `"SiLU"` in transformers
 
 ## Accuracy targets
 
 - Cosine similarity > 0.999 against reference layer output
-- For e2e: loss or logits parity vs CPU/CUDA golden reference
+- For e2e: logits parity vs CPU/CUDA golden reference
 
 ## Week-by-week plan
 
-1. Verify neuron device path + minimal identity kernel swap (current)
-2. NKI RMSNorm kernel, validate on Qwen3 dense layer
-3. Package for Hub, add RoPE, register neuron entries in KERNEL_MAPPING
-4. Add SiLU, full Qwen3 dense e2e, measure MFU
-5. (Stretch) Qwen3-MoE extension
-6. PoC document, review, ship
+### Week 1: HF Kernels architecture ramp-up and neuron-path verification ✓ DONE
+- Verified `kernelize(device="neuron")` works on trn2
+- Confirmed `LocalLayerRepository` loads local kernel packages
+- Proved forward swap fires + fallback works
+- Confirmed `KernelConfig(use_local_kernel=True)` accepts neuron mapping
+
+### Week 2: RMSNorm NKI kernel, local validation on Qwen3 dense ✓ DONE
+- Ported NKI RMSNorm kernel (tutorial-derived, production analysis documented)
+- Accuracy: cosine sim = 1.000000 (bit-identical) on isolated layers
+- Accuracy: cosine sim = 0.999954 through full 2-layer Qwen3 model forward
+- Documented nki-library porting friction (fusion, deps, interface mismatch)
+
+### Week 3: Package RMSNorm for Hub, add RoPE, register neuron entries
+- Move from local loading to Hub-style packaged repo
+- Add RoPE NKI kernel as a `FuncRepository` entry
+- Add `"neuron"` entries to `_KERNEL_MAPPING` for RMSNorm and RoPE
+- Confirm `use_kernels=True` alone triggers the swaps on Neuron
+- Coordinate with Samir on Hub repo home (`kernels-community/` vs `aws-neuron/`)
+
+### Week 4: Activations, full Qwen3 dense end-to-end, MFU measurement
+- SiLU NKI activation kernel + registration
+- Full Qwen3 dense with `use_kernels=True` selecting NKI RMSNorm + RoPE + SiLU
+- Confirm correctness (logits parity)
+- Measure MFU with and without `use_kernels=True`
+
+### Week 5: Qwen3-MoE (stretch)
+- Map Qwen3-MoE forward to Kernel Hub layer names
+- Reuse RMSNorm/RoPE/SiLU from weeks 2-4
+- At least one MoE-specific NKI kernel swapped and validated, or gap analysis
+
+### Week 6: PoC document, review, and ship
+- Kernel Hub mechanism and why forward-swap is the correct interception point
+- Upstream state: neuron device path merged, kernel-builder gap
+- What was validated: kernels, models, accuracy, MFU delta
+- What is not done: backward kernels, torch.compile, Hub upload, MoE gaps
+- Recommendation: is first-class HF Kernel Hub support worth engineering investment?
+
+## Definition of done
+
+**Floor (must hit):**
+- `"neuron"` device support working locally with forward-swap proven on Trainium
+- At least NKI RMSNorm and RoPE packaged and validated e2e on Qwen3 dense
+- Measured MFU delta with denominator stated
+- PoC document delivered to the kernels team
+
+**Ceiling (stretch):**
+- SiLU + MLP activation kernels added
+- Hub publishing working for a Neuron kernel
+- At least one Qwen3-MoE kernel swapped and validated
+
+## Environment (verified 2026-07-22)
+
+| Package | Version |
+|---------|---------|
+| kernels | 0.15.2 (PyPI) |
+| transformers | 5.15.0.dev0 (commit bb3ffb97) |
+| torch | 2.9.1+cu128 (Neuron DLAMI) |
+| neuronx-cc | 2.26.6360.0+6f180f47 |
+| Instance | trn2.3xlarge (4 NeuronCores, 96 GB HBM) |
+| Neuron venv | `/opt/aws_neuronx_venv_pytorch_2_9` |
+
+## Documentation sources
+
+| Source | What it covers |
+|--------|---------------|
+| [kernels docs — Layers](https://github.com/huggingface/kernels/blob/main/docs/source/layers.md) | kernelize(), use_kernel_mapping, LocalLayerRepository |
+| [kernels docs — Requirements](https://huggingface.co/docs/kernels/kernel-requirements) | metadata.json schema, backend types, build variants |
+| [transformers PR #46754](https://github.com/huggingface/transformers/pull/46754/files) | "Writing kernels" doc — single-file pattern, KernelConfig |
+| [NKI Tutorial — RMSNorm](https://awsdocs-neuron.readthedocs-hosted.com/en/v2.25.0/general/nki/tutorials/rmsnorm.html) | Reference NKI kernel implementation |
+| [nki-library GitHub](https://github.com/aws-neuron/nki-library) | Production kernel source (rmsnorm, attention, mlp, moe, etc.) |
 
 ## Coordination
 
-- Samir (arsamir): HF kernels team contact, Hub repo home decision
-- Pinak (panpinak): SA team reviewer
-- Hanbo Wang / Karthick Gopalswamy: kernels team (PoC recipients)
-- Matt (mmcclean): final deliverable recipient
+- **Samir (arsamir)**: HF kernels team contact, Hub repo home decision
+- **Pinak (panpinak)**: SA team reviewer
+- **Hanbo Wang / Karthick Gopalswamy**: kernels team (PoC recipients)
+- **Matt (mmcclean)**: final deliverable recipient
