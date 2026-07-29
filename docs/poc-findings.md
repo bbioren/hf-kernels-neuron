@@ -42,6 +42,8 @@ These are the primary references we used. Critically, they describe different la
 | 13 | nki-library HAS a standalone HF-layout RoPE kernel (`rope_hf`), undocumented in the public API reference | Positive | Confirmed |
 | 14 | The two NKI import paths (`nki` vs `neuronxcc.nki`) have different capabilities; neither is a superset | High | Open |
 | 15 | Interception-point inventory: several `_KERNEL_MAPPING` entries are unreachable (incl. `SwiGLUMLP`) | Reference | Confirmed |
+| 16 | **`nkilib` is already installed and its kernels are directly callable — thin-wrapper porting is feasible today** | **High** | Open (policy blocker only) |
+| 17 | Fused MLP port is blocked by weight-layout transpose with no lifecycle hook in `kernelize()` | High | Open (design decision) |
 
 ---
 
@@ -572,3 +574,138 @@ closed, since none of this surface is reachable on Neuron today.
 repeats the same `param.device.type` logic with a cuda/rocm refinement and no xla/neuron
 handling. So the Finding #9 fix needs to be applied in three places to be complete:
 `hub_kernels.kernelize`, `kernel_config.infer_device`, and `kernels._find_device`.
+
+## 16. `nkilib` is already installed, and its kernels are directly callable [HIGH — changes the strategy]
+
+The Week 2 porting analysis listed "use nki-library as a pip dependency" (Option D) as
+blocked, assuming `nkilib` was neither available nor allowed. **Half of that was wrong.**
+
+`nkilib` is already present in the Neuron venv as a normal site-packages install:
+
+```
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/
+```
+
+Every production kernel imports cleanly (`scripts/probe_nkilib_bundled.py`):
+`core.embeddings.rope_hf`, `core.mlp.mlp` (40 params, signature matching GitHub `main`
+including recent additions like `gate_up_w_layout` and `dtype_mode`),
+`core.moe.moe_cte.moe_cte`, `core.router_topk.router_topk`, `core.rmsnorm.rmsnorm_quant`.
+
+**And the production kernel runs correctly when called directly from PyTorch/XLA.**
+Verified on trn2 (`scripts/experiment_nkilib_thin_wrapper.py`) against the installed
+`rope_hf`, the same kernel we hand-ported:
+
+| Calling strategy | Result |
+|---|---|
+| pass preallocated `q_out`/`k_out`, read the **return value** | **q cos_sim 1.000001, k cos_sim 1.000000** |
+| pass preallocated outputs, read the **mutated arguments** | cos_sim **0.000000** — never written |
+
+Two things follow.
+
+**(a) Destination-passing is vestigial across the XLA boundary.** The output tensors must
+still be passed — they serve as shape/dtype templates — but results come back via the
+return value, not by mutation. nki-library's own integration tests use
+`"q_out.must_alias_input"`, which would lead a reader straight to the second strategy and
+silently produce zeros. Worth documenting for anyone wrapping these kernels.
+
+**(b) A thin-wrapper HF kernel is technically feasible today:**
+
+```python
+class NeuronRoPE(nn.Module):
+    def forward(self, q, k, cos, sin, unsqueeze_dim=1):
+        q_out, k_out = torch.empty_like(q), torch.empty_like(k)
+        return rope_hf(q, k, q_out, k_out, cos=cos, sin=sin)   # no vendoring
+```
+
+### Why this changes the recommendation
+
+Week 2 concluded that mass-producing HF wrappers is not automatable because each kernel
+needs defusion, interface adaptation, dependency inlining, and SPMD stripping. That
+remains true for **self-contained** kernels. The thin-wrapper approach removes all four
+steps at once.
+
+The difference in scale is stark. RoPE needed ~15 lines inlined. The MLP kernel's
+dependency closure is **7,249 lines across 22 files** (~480x), which makes hand-porting
+the larger kernels impractical. Importing it is trivial.
+
+So the ask to HuggingFace shrinks from "support a large porting program" to two small
+changes:
+
+1. Add `nkilib` to `kernels/python_depends.json` under the `neuron` backend — four lines,
+   with `nki` already present as precedent and the exact JSON shape to copy.
+2. Fix `_backend()` so the neuron table is consulted at all (Finding #12).
+
+**The remaining blocker is policy, not code.** `python-depends` whitelists `nki` but not
+`nkilib`, and the neuron table is unreachable regardless. A thin wrapper today would have
+to under-declare its dependency and rely on `nkilib` happening to be preinstalled — the
+same fragility that already applies to `nki`.
+
+**Our hand-ported kernels remain the right choice for this PoC**: self-contained, no
+undeclarable dependency, and they document the porting friction, which is the PoC's
+deliverable. But they are not the shape to build an engineering program on, and the PoC
+should say so plainly.
+
+**Caveat we did not resolve:** nki-library's README warns that GitHub `main` is not
+guaranteed compatible with a given compiler version. The installed copy here happens to
+match `main`'s MLP signature, but a thin-wrapper strategy inherits a version-coupling
+problem between the kernel repo, `nkilib`, and `neuronx-cc` that a vendored kernel does
+not have. That tradeoff belongs in the recommendation.
+
+## 17. Fused MLP is blocked by weight layout, and `kernelize()` has no hook for it [HIGH]
+
+The profitable MLP unit is the fused gate/up/SiLU/down, not standalone SiLU (which is
+memory-bandwidth bound). `nkilib.core.mlp.mlp` implements exactly that, and — unlike
+RMSNorm — quantization and normalization are both **opt-in**, defaulting to `NONE` /
+`NO_NORM`. Single-core works; SPMD is optional. Qwen3-8B and Qwen3-0.6B satisfy every
+hard constraint on the BF16 path. So the kernel is not the problem.
+
+**The problem is that all three HF MLP weights are transposed relative to what the kernel
+wants**, and `kernelize()` provides nowhere to fix that.
+
+| Tensor | HF `nn.Linear.weight` | NKI wants |
+|--------|----------------------|-----------|
+| `gate_proj` | `[I, H]` | `[H, I]` |
+| `up_proj` | `[I, H]` | `[H, I]` |
+| `down_proj` | `[H, I]` | `[I, H]` |
+
+`.t()` is a free view in torch, but the kernel DMAs from HBM assuming row-major layout,
+and non-contiguous tensor failures are a known live issue on the Neuron beta — so a view
+cannot safely be passed. The transpose must be **materialized**.
+
+`kernelize()` rewrites `forward` pointers. It never transforms parameters. There is no
+"on kernelize" or "on weight load" hook. Every workaround is bad in a different way:
+
+| Option | Cost |
+|--------|------|
+| Mutate parameters in place at kernelize time | `state_dict()` / `save_pretrained()` emit transposed weights that won't load into a stock `Qwen3MLP`. Silent checkpoint corruption. |
+| Keep a second transposed copy | ~2x MLP weight memory. MLP dominates Qwen3-8B, so near 2x model memory — likely fatal on 96 GB at real batch sizes. |
+| Transpose lazily on first forward, cache | Same memory cost plus a first-step stall |
+| Transpose every forward | Three weight-sized HBM round trips per layer per step — erases the speedup entirely |
+
+**Why this is a first-class finding rather than an implementation detail:** it blocks
+*every* fused-kernel port on Neuron, not just the MLP. Any kernel whose weight layout
+differs from `nn.Linear`'s hits it. The per-layer forward-swap model works cleanly for
+weightless ops (RoPE, SiLU) and for ops that read weights as-is (RMSNorm), and breaks down
+exactly when a kernel wants weights arranged differently — which is common for
+matmul-heavy fused kernels, because that is where layout matters for performance.
+
+**Recommendation.** This is a design decision for the kernels team, not something a PoC
+should quietly pick. The two things worth asking upstream:
+
+1. Does the `kernels` library want a weight-transformation hook (something like
+   `prepare_weights(module)` called once at kernelize time), with a defined contract about
+   whether `state_dict()` reflects original or kernel layout?
+2. If not, is the intended pattern that Neuron kernels accept HF-native layouts and eat
+   the transpose internally? That is a request to nki-library, not to HF, and would be the
+   cleaner division of responsibility — the kernel already knows its own tiling.
+
+The fusion API (`make_parent_class_for_kernel_fusion`) at least gives the chosen strategy
+a place to live: siblings collapse to `nn.Identity()`, so the surviving module can hold
+transposed weights. But it does not decide the question.
+
+**Effort, for planning:** validating `nkilib.mlp()` standalone against its own
+`mlp_torch_ref` on hardware is a 1-2 day spike and should precede any Kernel Hub work.
+Landing it in HF via the fusion API, correct *and* faster, is 2-3 weeks. Note also that
+nki-library's own MLP tests use `rtol=2e-2`, two orders of magnitude looser than the
+`cos_sim > 0.999` bar we hold RMSNorm/RoPE to — decide which bar applies before starting,
+because a fused three-matmul kernel will not be bit-identical.
