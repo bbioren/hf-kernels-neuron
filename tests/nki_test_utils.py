@@ -234,6 +234,7 @@ def assert_nki_accuracy(
     *,
     cos_sim_target: float = COS_SIM_TARGET,
     max_diff_tol: float = DEFAULT_MAX_DIFF_TOL,
+    expect_bit_identical: bool = False,
 ) -> AccuracyResult:
     """Check a kernel result on all three axes that matter.
 
@@ -242,9 +243,14 @@ def assert_nki_accuracy(
     2. Cosine similarity clears the target.
     3. Max absolute difference is within tolerance.
 
-    A max_diff of exactly 0.0 is flagged as suspicious rather than failed: the
-    call counter is the real evidence of execution, but a bit-identical result
-    from a hardware kernel is unusual enough to surface.
+    On `expect_bit_identical`: whether a zero diff is suspicious depends on the op.
+    - Reduction ops (RMSNorm) sum over an axis, so NKI's reduction order differs
+      from PyTorch's and the result should differ by ~1e-4. A zero diff there means
+      the kernel probably didn't run — that is exactly how Finding #8 was caught.
+    - Elementwise ops (RoPE) apply the same few IEEE operations in the same order
+      on both backends, so bit-identical output is the *correct* expectation.
+    Pass `expect_bit_identical=True` for the elementwise case to suppress the note.
+    Either way the call counter, not the diff, is the authoritative execution proof.
     """
     reference = reference.detach().float().cpu()
     actual = actual.detach().float().cpu()
@@ -267,7 +273,7 @@ def assert_nki_accuracy(
         passed = False
         notes.append(f"max_diff exceeds {max_diff_tol:.1e}")
 
-    if diff == 0.0 and counts.nki_ran:
+    if diff == 0.0 and counts.nki_ran and not expect_bit_identical:
         notes.append("suspicious: bit-identical to reference")
 
     return AccuracyResult(
