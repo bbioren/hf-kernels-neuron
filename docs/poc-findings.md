@@ -40,7 +40,7 @@ These are the primary references we used. Critically, they describe different la
 | 11 | transformers kernel-decorator coverage is much wider than assumed (110 RMSNorm / 95 RoPE model files) | Positive | Confirmed |
 | 12 | HF already whitelists `nki` as a Neuron dependency — but the entry is unreachable, so kernels must under-declare | High | Open |
 | 13 | nki-library HAS a standalone HF-layout RoPE kernel (`rope_hf`), undocumented in the public API reference | Positive | Confirmed |
-| 14 | The two NKI import paths (`nki` vs `neuronxcc.nki`) have different capabilities; neither is a superset | High | Open |
+| 14 | ~~Two NKI import paths with different capabilities~~ → **version skew: `nki`=0.5.0, `neuronxcc.nki`=older bundled. `nl.arange` was removed. Our RMSNorm+SiLU use a removed API** | Medium | **Corrected** — now our tech debt, not an upstream ask |
 | 15 | Interception-point inventory: several `_KERNEL_MAPPING` entries are unreachable (incl. `SwiGLUMLP`) | Reference | Confirmed |
 | 16 | **`nkilib` is already installed and its kernels are directly callable — thin-wrapper porting is feasible today** | **High** | Open (policy blocker only) |
 | 17 | Fused MLP: `kernelize()` has no weight-transformation hook | High | Open (design decision) — **premise partly corrected, see #17** |
@@ -510,6 +510,65 @@ Consequences, verified by swapping the imports in each kernel and re-running the
 | `neuron_rmsnorm` | `nl.arange` + mask (tutorial style) | `neuronxcc.nki` |
 | `neuron_silu` | `nl.arange` + mask | `neuronxcc.nki` |
 | `neuron_rope` | slicing + `div_ceil` (nki-library style) | top-level `nki` |
+
+### CORRECTION (measured 2026-07-29, `scripts/probe_nki_versions.py`) — this is version skew, and it is OUR tech debt
+
+The framing above is wrong, and so is the recommendation. It is not a capability split
+between two peer packages; **it is two generations of NKI**, and the "missing" API was
+deliberately removed.
+
+| | `import nki` | `from neuronxcc import nki` |
+|---|---|---|
+| Version | **0.5.0**+28631259367.ga768afa6 | unknown (compiled `.so` bundled in neuronx-cc) |
+| Form | standalone pure-Python package | compiled extension inside the compiler |
+| `nl.arange` | **absent** | present |
+| `nl.mgrid` | **absent** | present |
+| `nl.ds` | present | present |
+| `nl.load` / `store` / `affine_range` / `shared_hbm` / `silu` | present | present |
+
+`nl.arange` and `nl.mgrid` were **removed** in NKI 0.5.0, with `nl.ds` slicing as the
+replacement — and `nl.ds` exists in *both*. So there is a single forward-compatible way to
+write these kernels, and top-level `nki` is the going-forward surface. Corroborated
+independently by the Native PyTorch beta setup notes, which list `nl.arange` as
+"Removed; use `nl.ds` slicing" for NKI 0.5.0.
+
+**Two claims withdrawn:**
+
+1. *"`hasattr(nl, 'arange')` returns True under the top-level package."* **False.** It returns
+   `False`. That reading came from `scripts/probe_nki_api.py`, which imports
+   `neuronxcc.nki.language` — the *old* path. I compared one probe's output against another
+   probe's import and drew a conclusion about a package I hadn't actually queried. The
+   "no import-time feature detection" argument goes with it.
+2. *"Neither is a superset, so a multi-kernel repo genuinely needs both."* **False.** Our repo
+   needs both only because two of our kernels use a removed API. Rewritten against `nl.ds`,
+   all three would target top-level `nki`.
+
+**What actually holds:** the `//`-on-shape-values failure (`math.trunc() is not supported for
+scalar`) is a limitation of the **old** bundled path, not of 0.5.0. That is consistent with
+version skew rather than a split — the newer package is simply better.
+
+**Revised action — this is a work item for us, not an ask for the NKI team.**
+
+Our RMSNorm and SiLU kernels use `nl.arange` + `mask=`, a removed idiom, which is why they
+are pinned to the legacy compiled path. RoPE already uses the current API. So:
+
+- Rewrite `kernels/neuron_rmsnorm` and `kernels/neuron_silu` to tile with `nl.ds` instead of
+  `nl.arange` index tensors, and switch both to `import nki`.
+- Then all three kernels target NKI 0.5.0 on one import path, and the per-kernel import
+  pinning documented above disappears.
+- Re-run all three suites; the execution-asserting harness will confirm nothing regressed.
+
+Estimated effort: a few hours. It also removes a genuine liability — shipping PoC kernels
+written against a removed API would be a poor recommendation to hand the kernels team.
+
+**One thing still worth raising with the NKI team**, much narrower than the original ask: the
+public NKI tutorials (and possibly the NKI Bootcamp reference kernels) teach the `nl.arange`
+idiom, which no longer exists in 0.5.0. That is a docs-currency problem that will mislead every
+new kernel author, and it is how we ended up writing two kernels against the old API.
+
+---
+
+*Original analysis retained below for the record.*
 
 **Why this is nastier than it looks.** `hasattr(nl, "arange")` returns **True** under
 the top-level package — the attribute exists, it just cannot be resolved during kernel
