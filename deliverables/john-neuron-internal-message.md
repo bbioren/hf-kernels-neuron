@@ -19,7 +19,7 @@ methodology. If routing goes through someone else, the content still stands — 
 |---|---|---|
 | Fused MLP divides by zero single-core when `I > 4096` (#18) | **nki-library team** | no |
 | `torch_neuronx` should set a `torch.neuron` attribute (#7/#12) | **torch_neuronx team** | no |
-| NKI tutorials teach a removed API (`nl.arange`) (#14) | **NKI team / docs** | no |
+| NKI tutorials teach a removed API (`nl.arange`) (#14) | NKI docs — *minor, FYI only* | no |
 | Rewrite our RMSNorm + SiLU off the removed API | **us** | no |
 | MFU measurement methodology | **us / internal call** | no |
 | transformers device-routing fix (#9) | HuggingFace | only for "where should the helper live" |
@@ -65,16 +65,15 @@ issue without waiting for him.
 > section, but that table is never consulted — so a Neuron kernel literally cannot declare
 > `python-depends: ["nki"]` and has to ship `[]` while importing nki. Who owns that?
 >
-> **3. Heads up, and it affects the NKI Bootcamp material.** `nl.arange` was **removed** in
-> NKI 0.5.0 (replaced by `nl.ds` slicing). Both `import nki` (0.5.0) and
-> `from neuronxcc import nki` (older, bundled in the compiler) resolve on the DLAMI, and the
-> public NKI tutorials still teach the `nl.arange` idiom — which is how I ended up writing two
-> of our three kernels against a removed API without noticing. I'd assumed it was a capability
-> split between two packages; it's just version skew, and I've corrected our writeup.
+> **3. Minor, mostly FYI: the public NKI tutorials teach a removed API.** `nl.arange` was
+> removed in NKI 0.5.0 (replaced by `nl.ds` slicing), but the tutorials still use it — which is
+> how I wrote two of our three kernels against it without noticing. Both `import nki` (0.5.0)
+> and `from neuronxcc import nki` (older, bundled in the compiler) resolve on the DLAMI, so
+> nothing errors at import; you only find out at kernel-compile time.
 >
-> Fixing our kernels is a few hours and I'll just do it. But the docs-currency problem will
-> mislead every new kernel author, and if the Bootcamp reference kernels use `nl.arange` they
-> may want the same update. Worth a nudge to whoever owns the NKI docs?
+> Fixing our kernels is a few hours and I'll just do it — no ask there. Only flagging it in case
+> it's worth a nudge to whoever owns the NKI docs, since it'll mislead other kernel authors the
+> same way.
 >
 > **4. A call I'd like your read on: how to measure MFU.** This is the last technical
 > deliverable and the PoC's recommendation hinges on it. Two complications:
@@ -158,7 +157,7 @@ free.
 
 - [ ] #18 routed to nki-library owner — get a name and a read on whether single-core >4096 is supported
 - [ ] `torch.neuron` attribute — owner identified in torch_neuronx
-- [ ] NKI docs currency (`nl.arange` removed but still taught) — nudged; check Bootcamp kernels
+- [ ] NKI docs currency (`nl.arange` removed but still taught) — FYI only, no owner needed
 - [ ] MFU methodology — decision: measure now via our helper, or wait for the transformers fix
 - [ ] Green light to send the Samir draft, or he sends/introduces
 - [ ] Our own work item: rewrite RMSNorm + SiLU onto `nl.ds` / `import nki` (few hours)
