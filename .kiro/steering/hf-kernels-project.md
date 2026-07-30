@@ -334,6 +334,11 @@ DECODE labelled backwards.
 
 ## Coordination
 
+- **John**: **internship mentor.** Wrote the project guide and the week-by-week schedule in this
+  document. The person to take *schedule* and *scope* decisions to — whether Week 5 becomes a gap
+  analysis, whether Week 4 is still best spent on MFU, whether to contact HF-side people
+  directly. Not a routing queue for bugs; bring him decisions, not tasks. Check with him before
+  reaching out to external contacts. Draft check-in at `deliverables/john-mentor-checkin.md`.
 - **Samir (arsamir)**: HF kernels team contact, Hub repo home decision.
   **Open as of Week 3.** Draft message ready at
   `deliverables/samir-hub-publishing-message.md` — covers the repo-home question plus the
