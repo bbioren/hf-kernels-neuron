@@ -112,10 +112,22 @@ absent. **Enumerating candidates inside a single framing feels like rigour and i
 
 ### What needs you
 
-See **BLOCKED — NEEDS INPUT** at the bottom. Short version: get onto a stack where
-`torch.compile` works (blocks the decisive experiment), find out whether ~53 ms/invocation is
-expected on this SDK, and decide whether I file the upstream items or you route them. Draft
-messages for John and Samir are both updated with the new findings.
+See **BLOCKED — NEEDS INPUT** at the bottom. Short version, and it changed:
+
+1. **Who owns `nki/compiler/target.py`, and do I write the CR?** One decorator, 102x per call,
+   reproducer ready. Highest-value item in the project and not Kernel Hub specific (B10).
+2. **Is the residual `create_computation` rebuild cacheable?** ~0.59 ms/call. The difference
+   between 3.4x slower and plausibly near parity. Now the top technical ask (B12).
+3. **Sanity-check the recommendation before it goes out** — it *inverted*, from "defer, answer the
+   graph-mode question first" to "fix two caching bugs first" (B9).
+4. **Am I still in scope?** I am now a layer below the Kernel Hub, inside NKI's dispatch path (B13).
+
+Both draft messages are rewritten. The previous Samir draft would have told the HF team their
+per-layer granularity might be structurally wrong for Neuron, on the strength of a number whose
+cause turned out to be ours — worth not sending.
+
+Two earlier asks are gone: getting a stack where `torch.compile` works (withdrawn, it wasn't
+blocking anything) and whether ~53 ms is expected on this SDK (answered — it's a bug).
 
 ### What got done
 
@@ -777,6 +789,75 @@ Week 4/5 scope, which had since resolved by getting done.
 
 ---
 
+## SESSION 4 — Root-causing the slowdown properly
+
+Prompted by a fair push: I had reported the graph-mode question as blocked, and was asked why I
+didn't just run it. Two things were wrong with that position, and both were mine.
+
+### T17 — `torch.compile` is not broken here
+
+`scripts/diagnose_torch_compile.py`. I had concluded "torch.compile doesn't work on this stack"
+from one error message. In fact `torch` 2.9.1 / `torch_xla` 2.9.0 are a matched pair, `openxla` is
+registered, and `add`/`mul`/`relu` all compile on XLA tensors. Only `silu` failed — and the full
+traceback showed why: `torch_neuronx` replaces it with an XLA user computation whose dispatch
+predicate is `if any(is_xla_tensor(it) or is_xla_device(it) ...)`. A `FakeTensor` on `xla:0`
+satisfies that, gets routed into `_xla_user_computation`, and is rejected. No abstract impls, so
+Dynamo can't trace it. The override list includes `Embedding`, `Softmax` and `CrossEntropyLoss`, so
+this hits nearly every transformer. Filed as Finding #23. `torch_xla.compile()` works around it.
+
+### T18 — The question didn't need `torch.compile` at all
+
+`scripts/probe_neff_count.py`. torch-xla is *already* a lazy graph runtime, so I counted device
+executions directly with its `ExecuteTime` metric instead of using compile as a proxy. Steady
+state, `compiles = 0`, three samples within 0.1%:
+
+| variant | wall | device executions | per call |
+|---|---|---|---|
+| 28 NKI calls, 1 `mark_step` | 1446.37 ms | **1** | 51.66 ms |
+| 1 NKI call | 52.80 ms | 1 | 52.80 ms |
+| 28 torch ops | 1.23 ms | 1 | 0.04 ms |
+| 1 torch op | 0.25 ms | 1 | 0.25 ms |
+
+The 28 calls already shared one graph and one execution (196-node graph) and still cost 28x.
+`execs(pre-sync) = 0` closed the one hole — no `nki.jit` call secretly flushes the graph. The
+control scales sublinearly, so the harness sees batching when batching works. Variant C turned out
+stronger than designed: `F.silu` on Neuron is itself an XLA user computation, so **28 XLA custom
+calls cost 1.23 ms and 28 NKI custom calls cost 1446 ms** — the problem was never that custom calls
+don't fuse.
+
+I then wrote this up concluding "the cost is inside the compiled NEFF." Also wrong.
+
+### T19 — Changing instrument, twice, and finding it in 35 minutes
+
+- `scripts/profile_nki_call_cost.py` + neuron-explorer: the NEFF containing all 28 calls executes
+  in **0.609 ms** at 43% MBU and 95% active. `activate_instruction_count = 112` = 28x4 confirms all
+  28 are in it. HBM traffic ~30 tiles in and out, so each call does round-trip through HBM with no
+  inter-call fusion — but that costs 0.6 ms, not 1446.
+- `scripts/probe_where_is_the_time.py`: **99.9% of wall time is spent before `mark_step`.** (First
+  version of this misread torch-xla's metric accumulators as seconds; they're nanoseconds, which
+  produced a nine-digit millisecond figure obvious enough to catch.)
+- `scripts/probe_inside_one_call.py`: cProfile put 51 of 52 ms in `select.poll` under
+  `subprocess.check_output` under `_detect_target` under `resolve_target` under `_compile_opts`.
+
+Reading the source confirmed it and explained why the compile cache doesn't help: `CompileOptions`
+is the cache *key*, so target resolution runs before any lookup. A cache hit pays in full.
+
+### T20 — Verifying the fix, and re-measuring
+
+`scripts/probe_target_override_fix.py`: two fixes, one process, baseline re-run last as a control,
+accuracy asserted on every variant. 51.74 → 0.50 ms (env override) and 0.49 ms (`lru_cache`),
+cos_sim 0.999938 unchanged across all four. The override is set to whatever `_detect_target()`
+returns on the host rather than a hardcoded string, since a wrong target would compile for the wrong
+hardware and could be silently wrong rather than an error.
+
+Then `measure_mfu.py --fix-target-detection`: **8753.65 → 141.43 ms/step, MFU 0.02% → 1.50%.**
+And because the residual looked fixed-per-call, I tested that too rather than asserting it — seq
+2048 gives 2.06x slower instead of 3.36x, with per-call cost up only 1.16x for 2.59x the work.
+
+All five suites re-verified after the change. Finding #24, and the docs updated throughout.
+
+---
+
 ## DECISIONS (continued)
 
 **D14. Root-cause the slowdown instead of reporting it.** "208x slower" is a number; "~53 ms
@@ -857,7 +938,61 @@ resolving deliberately rather than by accident.
 - **`model.get_kernel_report()` in the `kernels` library.** The single highest-value
   customer-experience improvement — today a user cannot distinguish acceleration from a silent
   no-op, because a fallback is numerically correct.
-- **RoPE `seq_len` padding** to remove the `% 128` constraint. Needs a perf check, and is moot
-  until Finding #20 resolves.
-- **GeLU-family activation kernels.** Cheap now that the pattern is established, but memory-bound
-  and moot under #20. Explicitly *not* recommended until graph mode is settled.
+- **RoPE `seq_len` padding** to remove the `% 128` constraint. Needs a perf check. Worth more now
+  than when this was written: with #24 fixed, dispatch is ~0.59 ms/call rather than ~52 ms, so
+  padding cost is no longer swamped and the tradeoff is actually measurable.
+- **GeLU-family activation kernels.** Cheap now that the pattern is established, but elementwise
+  activations are memory-bound and sit far below the ~0.59 ms/call break-even threshold (#24). Still
+  *not* recommended for a perf win — though the reason has changed from "invocation cost swamps
+  everything" to "these ops are too small to clear break-even." Fine as coverage work, not as
+  performance work.
+
+---
+
+## DECISIONS (session 4)
+
+**D19. Ran the experiment instead of reporting it blocked.** I had recorded the graph-mode question
+as unanswerable because `torch.compile` fails here, and was pushed on why I didn't just run it. That
+push was correct on both counts. "Blocked" was doing work that "I haven't checked carefully enough"
+should have been doing. *Rejected:* leaving Finding #21 as "needs a different stack" — it would have
+gone into the PoC as the top ask, and it was wrong.
+
+**D20. Attacked the question directly rather than through a proxy.** torch-xla is already a graph
+runtime, so "does graph mode help" was answerable by counting device executions. Using
+`torch.compile` as the instrument added a dependency on a broken-looking path and answered a
+narrower question anyway. *Rejected:* fixing `torch.compile` first — days of work to answer something
+one metric read settles.
+
+**D21. Changed instrument rather than adding another variant.** After the "it's inside the NEFF"
+conclusion, the tempting next step was another timing variant. Instead: a device profile, then a
+Python profile. That took ~35 minutes after ~5 hours of framework-level experiments that could not
+have falsified the hypothesis. Recorded as the project's main methodological output.
+
+**D22. Kept the wrong conclusions visible instead of overwriting them.** #20's mechanism, #21's
+"inside the NEFF" claim, and #21's three-candidate list are annotated in place rather than deleted,
+and `week-4.md` has a superseded box rather than a rewrite. Two reasons: the measurements are still
+correct and only the attribution was wrong, and the failure mode — a hypothesis surviving four
+experiments because the instrument couldn't see the answer — is more instructive than a clean
+document. *Rejected:* silently correcting. Anyone re-deriving this would hit the same trap.
+
+**D23. Reported "still a net loss" alongside the 102x.** The fix is a good result and the temptation
+was to lead with it. But kernelized is still 3.4x slower than baseline, and break-even needs a kernel
+to save >0.59 ms/call while ours are 15–30x short. Both the README and the PoC state the loss
+explicitly next to the win. *Rejected:* headlining 102x alone — it would get quoted as "the kernels
+work now."
+
+**D24. Measured amortisation rather than asserting it.** I had written "a larger model should narrow
+the gap, we did not measure how much" into a deliverable. A hypothesis shouldn't sit in a deliverable
+unlabelled, so I ran seq 2048: 3.36x → 2.06x, per-call cost up only 1.16x for 2.59x the work. Also
+reported the qualification — 1.16x is not 1.0x, so ~16% does scale with size.
+
+**D25. Did not attempt the `create_computation` fix.** Same class of bug, and it would plausibly take
+the kernels to near parity, which is tempting. But it sits inside `torch_xla`'s op-registry path, it
+is a much larger intervention than one decorator, and a wrong guess there could produce silently
+incorrect results rather than an error. Filed as a scoping question (B12) with the attribution
+attached. *Rejected:* patching it speculatively to get a better headline number.
+
+**D26. Added `scripts/run_all_tests.py` rather than fighting the Makefile.** `make test` shells out
+per suite, which `run_detached.sh` cannot launch since it execs `python` directly — and the e2e suites
+exceed the SSH timeout, so detached running is mandatory. One suite per subprocess, so a crash can't
+mask the others and each gets a clean Neuron runtime.

@@ -9,7 +9,8 @@ VENV := .venv
 PYTHON := $(VENV)/bin/python
 PIP := $(VENV)/bin/pip
 
-.PHONY: help venv install verify demo test test-nki test-e2e probe mfu experiments registration sync lint clean versions
+.PHONY: help venv install verify demo test test-nki test-e2e test-all probe mfu mfu-unfixed \
+        mfu-amortisation rootcause profile experiments registration sync lint clean versions
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -45,6 +46,9 @@ E2E_TESTS := tests/test_qwen3_neuron_e2e.py tests/test_qwen3_moe_e2e.py
 
 test: test-nki test-e2e ## Run all kernel + e2e tests (must be on trn2)
 
+test-all: ## Same coverage as `test`, in one launchable process (use with run_detached.sh)
+	$(PYTHON) scripts/run_all_tests.py
+
 test-nki: ## Run per-kernel accuracy suites (RMSNorm, RoPE, SiLU)
 	@for t in $(NKI_TESTS); do \
 		echo "===== $$t ====="; \
@@ -67,14 +71,34 @@ probe: ## Run all investigation probes (device path, NKI execution, API, packagi
 	$(PYTHON) scripts/probe_hub_packaging.py
 	$(PYTHON) scripts/probe_nkilib_bundled.py
 
-mfu: ## Measure MFU with and without the NKI kernels (long-running)
+mfu: ## Measure MFU with the Finding #24 fix applied (long-running)
+	$(PYTHON) scripts/measure_mfu.py --preset 0.6b --seq 512 --fix-target-detection
+
+mfu-unfixed: ## Same without the fix — reproduces the original 208x regression
 	$(PYTHON) scripts/measure_mfu.py --preset 0.6b --seq 512
 
-experiments: ## Run the perf-attribution experiments behind Findings #20 and #21
+mfu-amortisation: ## Two sequence lengths + comparison, showing the residual is near-fixed per call
+	$(PYTHON) scripts/measure_mfu.py --preset 0.6b --seq 512 --fix-target-detection \
+		--json-out /tmp/mfu_512.json
+	$(PYTHON) scripts/measure_mfu.py --preset 0.6b --seq 2048 --fix-target-detection \
+		--json-out /tmp/mfu_2048.json
+	$(PYTHON) scripts/compare_mfu_runs.py /tmp/mfu_512.json /tmp/mfu_2048.json
+
+rootcause: ## Reproduce Finding #24: graph batching -> device profile -> cProfile -> verified fix
+	$(PYTHON) scripts/probe_neff_count.py
+	$(PYTHON) scripts/probe_where_is_the_time.py
+	$(PYTHON) scripts/probe_inside_one_call.py
+	$(PYTHON) scripts/probe_inside_one_call.py --fix-target-detection
+	$(PYTHON) scripts/probe_target_override_fix.py
+
+profile: ## Generate a NEFF+NTFF for the 28-call graph (then read with neuron-explorer)
+	$(PYTHON) scripts/profile_nki_call_cost.py --calls 28 --outdir /tmp/prof_n28
+
+experiments: ## Run the perf-attribution experiments behind Findings #20, #21 and #23
 	$(PYTHON) scripts/experiment_nkilib_thin_wrapper.py
 	$(PYTHON) scripts/spike_nkilib_mlp.py
 	$(PYTHON) scripts/experiment_nki_graph_break.py
-	$(PYTHON) scripts/experiment_torch_compile_nki.py
+	$(PYTHON) scripts/diagnose_torch_compile.py
 
 registration: ## Print the neuron kernel mapping + proposed upstream diff
 	$(PYTHON) scripts/neuron_kernel_registration.py
