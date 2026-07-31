@@ -84,27 +84,52 @@ Denominator: 632 TFLOPS/device TensorEngine ÷ 2 for LNC2 = 316 TFLOPS. Verified
 similarity identical to six decimals across all variants. **Not Kernel Hub specific** — any eager
 per-layer NKI use pays this today.
 
-**The kernels are still a net loss**, and that is the honest headline. ~0.59 ms/call of host dispatch
-remains against 0.02 ms of device time, spent rebuilding the XLA computation and its HLO protobufs
-on every call. Break-even needs a kernel to save >0.59 ms/call; RMSNorm, RoPE and SiLU at these
-shapes are 15–30x short. The device side is fine: a 28-call NEFF executes in 0.609 ms at 43%
-memory-bandwidth utilisation.
+**But the kernels cannot win even with dispatch free**, and that is the real headline. Measured on
+device with dispatch excluded (Finding #25):
+
+| | device ms (N=28) | HBM traffic | marginal traffic/call | MBU |
+|---|---|---|---|---|
+| NKI SiLU | 0.607 | 188.7 MB | 6.29 MB = **1.00x** the unfused floor | 43.2% |
+| torch SiLU | **0.224** | **6.3 MB** | **~0.00 MB** | 3.9% |
+| NKI RMSNorm | 1.625 | 188.8 MB | 6.29 MB = **1.00x** the floor | 16.2% |
+| torch RMSNorm | **0.637** | **6.4 MB** | **~0.00 MB** | 1.4% |
+
+The kernels are *optimal* — marginal traffic is exactly one read in and one write out, the minimum
+for an op that cannot fuse. Torch's traffic is independent of N, which is only possible if the chain
+fused into one pass. So the 2.5–2.7x gap is entirely the **fusion barrier**: a NKI custom call is
+opaque to the compiler, and each swap forces a HBM round-trip where the data previously stayed
+resident across a fused region.
+
+For memory-bound ops, fusion *is* the optimisation, so a NKI kernel is competing against not touching
+memory at all. **Break-even is unreachable for these ops, not merely distant.** The uncomfortable
+corollary: the ops the Kernel Hub is best at intercepting — RMSNorm (115 registrations), RoPE (95
+model files), all of `ACT2FN` via one decoration — are precisely the ops that lose most from being
+intercepted.
 
 ### Known blockers
 
 | Blocker | Effect |
 |---|---|
-| **`_detect_target()` forks `neuron-ls` per invocation (#24)** | **~52 ms/call. One decorator fixes it; 102x verified. Highest-value item in the project.** |
-| `create_computation` rebuilt per invocation (#24) | ~0.59 ms/call residual. The gap between 3.4x slower and plausibly near parity. Attributed, not fixed. |
+| **Compiler cannot fuse across a NKI custom call (#25)** | **2.5–2.7x on device for memory-bound ops, independent of dispatch cost and of kernel quality. The binding constraint — no plumbing work fixes it.** |
+| **`_detect_target()` forks `neuron-ls` per invocation (#24)** | **~52 ms/call. One decorator fixes it; 102x verified. Highest value-to-effort item, and correct regardless of #25.** |
+| `create_computation` rebuilt per invocation (#24) | ~0.59 ms/call residual. Attributed, not fixed. Demoted by #25 — closing it still leaves the device deficit. |
 | `use_kernels=True` can't reach `"neuron"` (#9) | silent no-op. Use `kernelize_for_neuron()`; a verified ~3-line upstream fix is in `scripts/neuron_kernel_registration.py` |
 | `torch_neuronx` op overrides aren't fake-tensor safe (#23) | breaks `torch.compile` on nearly any transformer (`Embedding`, `Softmax`, `CrossEntropyLoss`, …). `torch_xla.compile()` works around it. Unrelated to this integration. |
 | Fused MLP won't compile single-core above `intermediate_size` 4096 (#18) | excludes every real model |
 | Qwen3-MoE needs `experts_implementation="batched_mm"` (#22) | undocumented; default fails with an unsupported `sort` HLO |
 
-Retracted, so it doesn't get quoted: an earlier version of this README said `torch.compile` is
-broken on this stack and that the decisive open question was whether graph mode amortises the cost.
-`torch.compile` works for ops `torch_neuronx` hasn't overridden, and graph mode was never the lever —
-28 NKI calls already fuse into one HLO graph and one device execution and still cost 28x.
+Retracted, so none of it gets quoted. Earlier versions of this README said, in order: that the
+slowdown was structural graph-transition cost; that `torch.compile` is broken on this stack; that the
+decisive open question was whether graph mode amortises the cost; and that fixing the dispatch
+residual was the difference between 3.4x slower and near parity. All four are wrong.
+`torch.compile` works for ops `torch_neuronx` hasn't overridden (#23). Graph mode was never the
+lever — 28 NKI calls already fuse into one HLO graph and one device execution and still cost 28x.
+And the dispatch residual is no longer decisive, because #25 shows a 2.5–2.7x device deficit survives
+closing it.
+
+The one question that would change the conclusion: **can a NKI custom call participate in compiler
+fusion?** If yes, #25 dissolves. If no, per-layer swapping of small memory-bound ops is closed on
+merit.
 
 All findings with severity: [`docs/poc-findings.md`](docs/poc-findings.md).
 Upstream asks with patches: [`docs/upstream-fixes.md`](docs/upstream-fixes.md).

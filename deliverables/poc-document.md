@@ -626,18 +626,22 @@ and its HLO protobufs on every invocation. That is the same shape of problem as 
 that is cacheable per `(kernel, shape, dtype)` being redone per call — and whether it is fixable is
 a scoping question we have handed over rather than answered.
 
-What survives from the original structural argument, re-derived correctly: a swapped kernel must
-save more than ~0.59 ms of torch time per call to be a net win, and RMSNorm, RoPE and SiLU at these
-shapes are 15–30x short. So per-layer swapping of *small* ops cannot win on arithmetic, however
-good the kernel is. Winning requires replacing more work per call — fused kernels — which is what
-`nki-library` actually ships and what the Kernel Hub's per-layer contract cannot currently express.
-Findings #17 and #18 reach the same conclusion from weight layout and from sharding.
+What survives from the original structural argument, and the dispatch arithmetic is the *weaker* half of
+it: a swapped kernel must save more than ~0.59 ms of torch time per call, and RMSNorm, RoPE and SiLU at
+these shapes are 15–30x short. Amortisation softens that — 4x the sequence length nearly halves the
+penalty, 3.36x → 2.06x — so on dispatch grounds alone the gap looked closable with enough scale plus
+Fix 7.
 
-There is a third route, and it is the one the data actually points at: **more work per call without
-changing the kernels at all.** The residual is near-fixed per call, so 4x the sequence length halves
-the penalty (3.36x → 2.06x). That direction is free — it needs no engineering, only larger models
-and longer sequences than a 0.6B at seq 512. It does not reach a speedup on its own, but it means
-the gap we measured is the *worst* case rather than the representative one.
+**Finding #25 removes that escape.** With dispatch excluded entirely, the same kernels are still
+2.5–2.7x slower *on device*, because each swap costs a compiler fusion. So the dispatch arithmetic was
+never the binding constraint, and the amortisation trend — while real — heads toward a ceiling that is
+itself below parity. Per-layer swapping of small memory-bound ops cannot win, and that is a statement
+about the operation rather than about the overheads.
+
+Winning requires replacing a whole fused region, so the kernel performs the fusion internally instead of
+interrupting the compiler's — which is what `nki-library` actually ships, and what the Kernel Hub's
+per-layer contract cannot currently express. Findings #17 and #18 reach the same place from weight
+layout and from sharding.
 
 Note what this is *not* evidence of. The kernels are fine: a 28-call NEFF executes in 0.609 ms at
 43% memory-bandwidth utilisation and 95% engine active time. The Kernel Hub mechanism is fine: it

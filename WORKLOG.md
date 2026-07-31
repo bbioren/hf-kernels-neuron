@@ -44,19 +44,41 @@ our-kernels-vs-production — because **all four measured wall-clock time at the
 none of them could see inside the 52 ms.** Two changes of instrument settled it in about 35 minutes:
 a device profile (0.609 ms device vs 1459 ms wall) and then a cProfile, which named the function.
 
-### What still holds
+### What still holds — and the harder finding underneath it
 
-Even fixed, the kernels are a net loss at these shapes. ~0.59 ms/call of dispatch remains against
-0.02 ms of device time, and cProfile puts it in `create_computation` rebuilding the XLA computation
-and its HLO protobufs *on every call* — same class of bug, 100x smaller. A torch op costs
-0.02–0.03 ms, so NKI dispatch is still 15–20x a torch op's.
+Even fixed, the kernels are a net loss. ~0.59 ms/call of dispatch remains against 0.02 ms of device
+time, in `create_computation` rebuilding the XLA computation and its HLO protobufs *on every call* —
+same class of bug, 100x smaller.
 
-Break-even needs a kernel to save >0.59 ms/call; RMSNorm, RoPE and SiLU at these shapes are 15–30x
-short. It does amortise — 2.59x more work per call costs only 1.16x more, so 4x the sequence nearly
-halves the penalty — but that heads toward parity, not a speedup. So the structural argument
-survives with a corrected mechanism: the granularity that wins is the granularity the Kernel Hub
-cannot express (#17, #18), not because NKI can't fuse into the graph, but because its per-call
-dispatch is too expensive to amortise over one small layer.
+**But dispatch is no longer the binding constraint. Finding #25 is.** Measured on device with
+dispatch excluded entirely (`neuron-explorer` `total_time`, N=28 chained):
+
+| | device ms | HBM traffic | marginal traffic/call | MBU |
+|---|---|---|---|---|
+| NKI SiLU | 0.607 | 188.7 MB | 6.29 MB = **1.00x** the unfused floor | 43.2% |
+| torch SiLU | **0.224** | **6.3 MB** | **~0.00 MB** | 3.9% |
+| NKI RMSNorm | 1.625 | 188.8 MB | 6.29 MB = **1.00x** the floor | 16.2% |
+| torch RMSNorm | **0.637** | **6.4 MB** | **~0.00 MB** | 1.4% |
+
+NKI is 2.71x slower on SiLU and 2.55x on RMSNorm **with dispatch cost removed**. The kernels are not
+at fault: their marginal traffic is exactly the theoretical floor for an unfused op — one read in, one
+write out, nothing spilled. Torch's traffic is independent of N, which is only possible if the chain
+fused into a single pass.
+
+So a NKI custom call is an **optimisation barrier**. The compiler cannot fuse across it, and each swap
+forces a HBM round-trip where the data previously stayed resident. For memory-bound ops fusion *is*
+the optimisation, so the kernel is competing against not touching memory at all and cannot win.
+
+**Break-even is unreachable for these ops, not distant.** That is a stronger claim than the previous
+"15–30x short on dispatch arithmetic", and it is the one conclusion no plumbing work changes.
+
+The corollary explains the whole project: **the ops the Kernel Hub is best at intercepting are the ops
+that lose most from being intercepted.** RMSNorm has 115 upstream registrations, RoPE covers 95 model
+files, one decoration covers every `ACT2FN` activation — all small, memory-bound, already fused. Reach
+and usefulness are inversely correlated, which is why this looked promising for four weeks.
+
+Four findings now converge from independent directions: #17 (weight layout), #18 (sharding), #24
+(dispatch cost) and #25 (compiler fusion). Only #25 says the approach is *wrong* rather than expensive.
 
 ### What else landed
 
@@ -82,6 +104,7 @@ Worth reading as a set, because the pattern is the most transferable output of t
 | 19 | "NKI is 8-400x slower" | outputs discarded, XLA eliminated the computation — timed an empty graph |
 | 21 | "NKI is incompatible with torch.compile" | my loader didn't register the module in `sys.modules` |
 | **24** | **"per-layer NKI swapping is structurally launch-bound"** | **an uncached `neuron-ls` subprocess; 102x recoverable with one decorator** |
+| **25** | **"the NKI kernels spill an fp32 intermediate to HBM"** | **artifact of dividing non-linear traffic by N. Marginal traffic is exactly 1.00x the floor — the kernels are optimal** |
 
 On a lazy-execution backend, **both correctness and performance measurements fail silently by
 default.** A fallback is numerically correct. An eliminated computation is fast. A harness bug
@@ -110,17 +133,28 @@ three candidate explanations ranked by plausibility. All three were device-side,
 had already concluded the cost was in the execution. The true answer wasn't ranked low — it was
 absent. **Enumerating candidates inside a single framing feels like rigour and isn't.**
 
+And #25 above is a fifth instance, caught before it shipped, with yet another mechanism: **a correct
+calculation applied to a quantity that isn't linear.** Dividing HBM traffic by call count said the
+kernels move 3.00x more data than necessary, which reads as a spilled fp32 intermediate — and the
+`nl.arange` migration had introduced exactly such a temporary, so there was a ready culprit. Landing on
+exactly 3.00x for both ops independently is the tell; a real inefficiency doesn't hit a round number
+twice. Traffic isn't linear in N because a small NEFF carries fixed setup traffic, and solving
+`traffic(N) = FIXED + N x MARGINAL` gives marginal = 1.00x the floor. **Vary N before dividing by N.**
+Same class of error as #19, same fix: vary the independent variable and look at the shape.
+
 ### What needs you
 
 See **BLOCKED — NEEDS INPUT** at the bottom. Short version, and it changed:
 
-1. **Who owns `nki/compiler/target.py`, and do I write the CR?** One decorator, 102x per call,
-   reproducer ready. Highest-value item in the project and not Kernel Hub specific (B10).
-2. **Is the residual `create_computation` rebuild cacheable?** ~0.59 ms/call. The difference
-   between 3.4x slower and plausibly near parity. Now the top technical ask (B12).
-3. **Sanity-check the recommendation before it goes out** — it *inverted*, from "defer, answer the
-   graph-mode question first" to "fix two caching bugs first" (B9).
-4. **Am I still in scope?** I am now a layer below the Kernel Hub, inside NKI's dispatch path (B13).
+1. **Can a NKI custom call participate in compiler fusion?** This is now the question that decides
+   whether the integration can ever be a performance win (B14). It is a question for the compiler
+   team, not an experiment, so it is cheap to ask and I cannot answer it from here.
+2. **Who owns `nki/compiler/target.py`, and do I write the CR?** One decorator, 102x per call,
+   reproducer ready. Highest value-to-effort item, and correct regardless of B14 (B10).
+3. **Sanity-check the recommendation before it goes out** — it has now changed twice, and the current
+   version says per-layer swapping of small memory-bound ops *cannot* win rather than *doesn't yet* (B9).
+4. **Am I still in scope?** I am now two layers below the Kernel Hub — NKI's dispatch path, and the
+   compiler's fusion behaviour (B13).
 
 Both draft messages are rewritten. The previous Samir draft would have told the HF team their
 per-layer granularity might be structurally wrong for Neuron, on the strength of a number whose
@@ -913,9 +947,22 @@ PATH, `_detect_target()` silently returns `"trn3"`, so it would compile for the 
 rather than fail loudly.
 
 **B12. Is the residual `create_computation` cost cacheable?** ~0.59 ms/call, rebuilt on every
-invocation. Same class of bug as B10, 100x smaller, but it is the difference between 3.4x slower and
-plausibly near parity. Not attempted — it sits inside `torch_xla`'s op-registry path, and I would
-rather ask than guess. **This is now the top technical ask.**
+invocation. Same class of bug as B10, 100x smaller. **Demoted** — it was the top technical ask until
+Finding #25 showed that closing it entirely still leaves a 2.5–2.7x device deficit. Worth doing, no
+longer decisive. Not attempted: it sits inside `torch_xla`'s op-registry path, and I would rather ask
+than guess.
+
+**B14. Can a NKI custom call participate in compiler fusion, or be made transparent to the fusion
+pass? THE TOP ASK.** Finding #25: the compiler cannot fuse across a NKI custom call, so each swapped
+op is forced to round-trip through HBM where the data previously stayed resident across a fused
+region. For memory-bound ops that is 2.5–2.7x on device, independent of dispatch cost and of kernel
+quality — our kernels move exactly the theoretical minimum traffic for an unfused op.
+
+If the answer is yes, #25 dissolves, break-even becomes reachable, and B12 goes back to being
+decisive. If no, per-layer swapping of small memory-bound ops is closed on merit and the only viable
+shape is a kernel spanning a whole fused region — which is what nkilib ships and what #17/#18 say the
+Kernel Hub cannot express. Either way it changes the recommendation, and it is a question rather than
+an experiment.
 
 **B13. Scope check.** I am now a layer below the Kernel Hub, inside NKI's dispatch path. In scope
 for this PoC, or hand off and return to kernels?
@@ -996,3 +1043,86 @@ attached. *Rejected:* patching it speculatively to get a better headline number.
 per suite, which `run_detached.sh` cannot launch since it execs `python` directly — and the e2e suites
 exceed the SSH timeout, so detached running is mandatory. One suite per subprocess, so a crash can't
 mask the others and each gets a clean Neuron runtime.
+
+---
+
+## SESSION 5 — Do the kernels actually beat the ops they replace?
+
+Answering the one item under "What is not done" that mattered. Every performance number in the
+project so far measured *dispatch* cost; none said whether the kernels are any good. And the two
+possible answers point opposite ways — if NKI is faster on device, dispatch is the only thing between
+here and a win; if slower, fixing dispatch never produces one.
+
+### T21 — Device-time comparison, dispatch excluded
+
+`scripts/profile_nki_vs_torch_device.py` profiles one `(op, impl, N)` configuration and writes a
+NEFF+NTFF; `scripts/summarise_device_profiles.py` reads them via `neuron-explorer` and compares.
+Identical work both ways — N chained applications, same shape, dtype and compiler defaults.
+
+| config | device ms | ms/call | HBM r+w | MBU | active |
+|---|---|---|---|---|---|
+| silu / NKI / N=28 | 0.607 | 0.0217 | 188.7 MB | 43.2% | 95.1% |
+| silu / torch / N=28 | **0.224** | **0.0080** | **6.3 MB** | 3.9% | 97.8% |
+| rmsnorm / NKI / N=28 | 1.625 | 0.0581 | 188.8 MB | 16.2% | 99.1% |
+| rmsnorm / torch / N=28 | **0.637** | **0.0227** | **6.4 MB** | 1.4% | 94.4% |
+
+NKI 2.71x slower on SiLU, 2.55x on RMSNorm, with ~30x the HBM traffic.
+
+### T22 — The first attribution was wrong, and nearly shipped
+
+Dividing traffic by N at N=1 says NKI moves **exactly 3.00x** the necessary traffic for both ops. That
+reads as a spilled intermediate, and the `nl.arange` migration had introduced an fp32 temporary, so
+there was a ready culprit. Landing on 3.00x twice independently is what made me check.
+
+Traffic isn't linear in N — a small NEFF carries fixed setup traffic. Two call counts solve both terms:
+
+| config | traffic(1) | traffic(28) | marginal/call | vs floor | fixed |
+|---|---|---|---|---|---|
+| silu / NKI | 18.87 MB | 188.74 MB | **6.29 MB** | **1.00x** | 4.0 tiles |
+| silu / torch | 6.29 MB | 6.29 MB | **0.00 MB** | 0.00x | 2.0 tiles |
+| rmsnorm / NKI | 18.88 MB | 188.76 MB | **6.29 MB** | **1.00x** | 4.0 tiles |
+| rmsnorm / torch | 7.88 MB | 6.42 MB | **~0.00 MB** | 0.00x | 2.5 tiles |
+
+The unfused floor for a `[512, 3072]` bf16 tile is 2 tiles = 6.29 MB. **NKI's marginal traffic is
+exactly that.** The kernels spill nothing and are optimal for an op that cannot fuse. Torch's traffic
+is independent of N, which is only possible if the chain fused into one pass.
+
+`scripts/analyse_fusion_barrier.py` does this regression and prints the attribution, so the wrong
+version can't be reproduced by accident.
+
+### T23 — The conclusion
+
+A NKI custom call is opaque to the compiler, so nothing fuses across it. Replacing a torch op with a
+NKI kernel doesn't merely add dispatch cost — it *removes* a fusion opportunity the compiler was
+already exploiting. For memory-bound ops fusion is the entire optimisation, so the kernel is competing
+against not touching HBM at all and cannot win however well written.
+
+Finding #25. It makes break-even **unreachable** for these ops rather than distant, which is a
+stronger and different claim than #24's "15–30x short". Propagated to the PoC document (recommendation
+restructured, item 2 is now the fusion question), README, findings, steering blockers and this file.
+
+## DECISIONS (session 5)
+
+**D27. Measured kernel quality rather than leaving it in "What is not done".** It had been sitting
+there as a known gap for a full session while the recommendation was written around dispatch cost.
+That was the wrong order — the recommendation depended on it. *Rejected:* shipping a recommendation
+whose central arithmetic (break-even) had an unmeasured term in it.
+
+**D28. Profiled device time rather than reasoning from wall clock.** Wall clock conflates dispatch and
+device, and dispatch was known to dominate, so no wall-clock experiment could have answered this. Same
+lesson as session 4, applied deliberately this time instead of after five hours.
+
+**D29. Checked whether traffic was linear before dividing by it.** The 3.00x reading was plausible and
+had a ready culprit in our own recent kernel change, which is exactly when a wrong finding gets
+accepted. Two call counts cost one extra profile run. *Rejected:* reporting "the kernels spill an fp32
+intermediate" — it would have sent someone to optimise a kernel that is already optimal.
+
+**D30. Stated the negative more strongly rather than less.** #25 changes "these ops don't win yet" to
+"these ops cannot win", and the corollary is that the mechanism's best interception points are its
+worst performance targets. That is a harsher conclusion than the PoC started with, and it is what the
+measurement supports. *Rejected:* framing it as "needs more investigation" — the direction is not in
+doubt, only the in-situ magnitude.
+
+**D31. Kept the fusion question open rather than concluding it is fundamental.** Whether a NKI custom
+call *could* participate in fusion is a compiler-team question I cannot answer from here. It is the
+one thing that would dissolve #25, so it is filed as the top ask (B14) rather than assumed shut.

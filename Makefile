@@ -10,7 +10,7 @@ PYTHON := $(VENV)/bin/python
 PIP := $(VENV)/bin/pip
 
 .PHONY: help venv install verify demo test test-nki test-e2e test-all probe mfu mfu-unfixed \
-        mfu-amortisation rootcause profile experiments registration sync lint clean versions
+        mfu-amortisation rootcause fusion profile experiments registration sync lint clean versions
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -83,6 +83,10 @@ mfu-amortisation: ## Two sequence lengths + comparison, showing the residual is 
 	$(PYTHON) scripts/measure_mfu.py --preset 0.6b --seq 2048 --fix-target-detection \
 		--json-out /tmp/mfu_2048.json
 	$(PYTHON) scripts/compare_mfu_runs.py /tmp/mfu_512.json /tmp/mfu_2048.json
+
+fusion: ## Reproduce Finding #25: are the kernels faster than the ops they replace, on device?
+	$(PYTHON) scripts/run_device_profile_sweep.py --calls 1 28
+	$(PYTHON) scripts/analyse_fusion_barrier.py
 
 rootcause: ## Reproduce Finding #24: graph batching -> device profile -> cProfile -> verified fix
 	$(PYTHON) scripts/probe_neff_count.py

@@ -344,6 +344,38 @@ The MoE routing kernel is the exception that does not need break-even arithmetic
 Qwen3-MoE does not run on Neuron at all with transformers' default experts implementation. Enabling
 a model beats speeding one up, and it is blocked by neither #17 nor #18.
 
+### 2b. Break-even is unreachable for memory-bound ops, not just distant — and that changes the table above
+
+Finding #25 supersedes the break-even framing in section 2. That section derived a threshold from
+dispatch cost (~0.59 ms/call) and concluded these ops are 15–30x short of it. Measured on device with
+dispatch excluded entirely, they are *also* 2.5–2.7x slower:
+
+| | device ms (N=28) | marginal HBM/call | vs unfused floor |
+|---|---|---|---|
+| NKI SiLU | 0.607 | 6.29 MB | **1.00x** |
+| torch SiLU | **0.224** | ~0.00 MB | 0.00x |
+| NKI RMSNorm | 1.625 | 6.29 MB | **1.00x** |
+| torch RMSNorm | **0.637** | ~0.00 MB | 0.00x |
+
+The kernels move exactly the theoretical minimum for an op that cannot fuse. Torch moves almost
+nothing, because the compiler fuses the chain into one pass. **A NKI custom call is an optimisation
+barrier** — the compiler cannot fuse across it, so each swap forces a HBM round-trip where the data
+previously stayed resident.
+
+Consequence for porting: for memory-bound ops, **no amount of dispatch work reaches break-even**, and
+no amount of kernel-writing skill does either. The kernel is competing against not touching memory,
+which it cannot do. So the "no" rows in the table above are not "not yet" — they are "not ever, at this
+granularity."
+
+The practical rule this yields, and it is the one to put in a porting checklist:
+
+> **Only port an op if the NKI kernel spans a region the compiler would otherwise fuse, and does that
+> fusion at least as well.** Replacing a single op inside a fusable region is a guaranteed regression
+> on memory-bound work, however good the kernel.
+
+That is also why the fused MLP and fused attention candidates are the *only* interesting ones: they
+span the region rather than interrupting it.
+
 ### 3. Two things larger shapes fix for free
 
 Per-call dispatch overhead is near-fixed, so it amortises: 2.59x more work per call cost only 1.16x
@@ -355,6 +387,32 @@ anyone evaluating a port:
   integration look worse than it is.
 - **Report the shape alongside the ratio.** "3.4x slower" and "2.06x slower" are the same build on
   the same hardware with the same kernels. A ratio without a shape is not a result.
+
+### 3b. Measure fusion loss, not just kernel speed
+
+A kernel benchmarked in isolation looks fine and still regresses the model, because isolation is
+exactly the condition where there is nothing to fuse with. The comparison that matters is *N chained
+applications* both ways, which exposes what the compiler would have done:
+
+```
+N chained NKI calls   vs   N chained torch ops    (same N, same shape, same dtype)
+```
+
+If torch's HBM traffic is roughly independent of N while NKI's grows linearly, the compiler is fusing
+the torch chain and the NKI version is paying a round-trip per call. That is the signal, and it does
+not show up at N=1.
+
+Two arithmetic traps in reading those numbers, both of which caught us:
+
+- **Don't divide traffic by N.** A small NEFF carries fixed setup traffic that dominates at low N, so
+  per-call averages overstate cost there. We read "3.00x the necessary traffic" this way and nearly
+  filed a kernel-inefficiency bug against our own optimal kernels. Measure two call counts and solve
+  `traffic(N) = FIXED + N x MARGINAL`.
+- **Compare marginal traffic against the theoretical floor**, which for an op that cannot fuse is
+  2 tiles: one read in, one write out. At 1.00x the floor the kernel is optimal and any gap is the
+  compiler's fusion, not the kernel's fault. Above ~1.3x, the kernel is spilling something.
+
+`scripts/analyse_fusion_barrier.py` does both.
 
 ### 4. Add a device-time check to the porting checklist
 

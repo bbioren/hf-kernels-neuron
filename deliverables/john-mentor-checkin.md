@@ -2,28 +2,39 @@
 
 **Status: DRAFT, NOT SENT.** Review before sending.
 
-**REWRITTEN.** Two earlier versions of this draft are now wrong and should not be sent. The first
-asked John to decide Week 4/5 scope, which resolved by getting done. The second led with "the
-kernels are 208x slower for structural reasons" and asked for a stack where `torch.compile` works.
-That conclusion was wrong and that ask is withdrawn. Root-causing the slowdown found a one-line
-caching bug in NKI's dispatch path worth 102x per call, which changes the project's recommendation.
+**REWRITTEN TWICE.** Three earlier versions are wrong and should not be sent. (1) Asked John to decide
+Week 4/5 scope — resolved by getting done. (2) Led with "the kernels are 208x slower for structural
+reasons" and asked for a stack where `torch.compile` works — the conclusion was wrong and the ask is
+withdrawn. (3) Led with the one-line NKI caching bug worth 102x and implied fixing dispatch was the
+path to parity — the bug is real but Finding #25 shows dispatch is no longer the binding constraint.
+
+Current version leads with both: the dispatch bug (fix it, 102x, one decorator) *and* the fusion
+barrier (2.5-2.7x on device with dispatch excluded, which no plumbing work fixes). The top ask is now a
+compiler question, not a dispatch one.
 
 ---
 
-## The one thing to read first
+## The two things to read first
 
-Every `@nki.jit` invocation forks a subprocess. `nki/framework/compiled.py::_compile_opts()` calls
-`resolve_target()` on every call, which falls through to `_detect_target()`, which runs `neuron-ls`
-to ask the hardware what it is. **~52 ms per kernel call.** It sits outside `_nki_compile_cache`
-because its result is part of the cache key, so a cache *hit* still pays it in full.
+**One: every `@nki.jit` invocation forks a subprocess.** `nki/framework/compiled.py::_compile_opts()`
+calls `resolve_target()` on every call, which falls through to `_detect_target()`, which runs
+`neuron-ls` to ask the hardware what it is. **~52 ms per kernel call.** It sits outside
+`_nki_compile_cache` because its result is part of the cache key, so a cache *hit* still pays it in
+full. Caching it takes per-call cost from 51.74 ms to 0.49 ms with bit-identical accuracy, and
+Qwen3-0.6B from **208x slower to 3.4x slower**. Not Kernel Hub specific — anything calling NKI kernels
+per-layer from eager PyTorch is paying it right now. Fix it regardless of everything else.
 
-Caching it takes per-call cost from 51.74 ms to 0.49 ms with bit-identical accuracy, and takes
-Qwen3-0.6B from **208x slower to 3.4x slower** (2.06x at seq 2048). It is not specific to the Kernel
-Hub — anything calling NKI kernels per-layer from eager PyTorch is paying it right now.
+**Two: even with dispatch removed entirely, the kernels lose on device by 2.5-2.7x.** Not because they
+are bad — their marginal HBM traffic is *exactly* the theoretical floor for an op that cannot fuse.
+Because a NKI custom call is opaque to the compiler, so nothing fuses across it, and for memory-bound
+ops fusion is the whole optimisation. That makes break-even **unreachable** for RMSNorm / RoPE / SiLU
+rather than distant, and it is the conclusion no plumbing work changes.
 
-I had previously written this up as a structural mismatch and asked you for a different stack. Both
-were wrong. Detail on how that happened is below, because it seems more useful than quietly fixing
-the doc.
+The recommendation therefore ends up: fix the dispatch bug, ask the compiler team whether NKI calls can
+participate in fusion, and don't port small memory-bound ops at per-layer granularity.
+
+I have now been wrong about this three times in a row with correct measurements every time, which is
+itself the most useful thing I have to report. Detail below rather than a quiet doc edit.
 
 ---
 
@@ -64,12 +75,45 @@ the doc.
 > function in one run. My four earlier experiments all measured wall clock at the framework level
 > and none of them *could* have seen this.
 >
-> **What's still true:** even fixed, the kernels are a net loss at these shapes. ~0.59 ms/call of
-> dispatch remains, against 0.02 ms of device time, and cProfile puts it in `create_computation`
-> rebuilding the XLA computation and HLO protobufs on every call — same class of bug, 100x smaller.
-> A torch op costs 0.02-0.03 ms, so NKI dispatch is still 15-20x a torch op. Break-even needs a
-> kernel to save >0.59 ms/call; RMSNorm/RoPE/SiLU at these shapes are 15-30x short. It does
-> amortise though — 4x the sequence length nearly halves the penalty.
+> **Then I found the thing that actually decides it, and it's worse.** I'd been reporting
+> everything in wall-clock time, which conflates dispatch with device work. So I profiled device
+> time only, comparing each NKI kernel against the torch op it replaces on identical work:
+>
+> ```
+>                  device ms (28 calls)   HBM traffic   marginal traffic/call
+>   NKI SiLU              0.607            188.7 MB     6.29 MB = 1.00x floor
+>   torch SiLU            0.224              6.3 MB     ~0.00 MB
+>   NKI RMSNorm           1.625            188.8 MB     6.29 MB = 1.00x floor
+>   torch RMSNorm         0.637              6.4 MB     ~0.00 MB
+> ```
+>
+> **NKI is 2.5-2.7x slower on device, with dispatch excluded entirely.** And it isn't the kernels —
+> their marginal traffic is *exactly* the theoretical floor for an op that can't fuse (one read in,
+> one write out, nothing spilled). Torch's traffic is independent of call count, which is only
+> possible if the compiler fused the whole chain into one pass.
+>
+> So a NKI custom call is an **optimisation barrier**. The compiler can't fuse across it, and every
+> swap forces a HBM round-trip where the data used to stay resident. For memory-bound ops fusion
+> *is* the optimisation, so the kernel is competing against not touching memory at all.
+>
+> **That makes break-even unreachable for these ops, not just distant.** No amount of dispatch work
+> or kernel-writing skill gets there. And the corollary is the sharpest thing in the PoC: the ops the
+> Kernel Hub is *best* at intercepting — RMSNorm 115 registrations, RoPE 95 model files, every
+> `ACT2FN` activation via one decoration — are precisely the ops that lose most from being
+> intercepted. Reach and usefulness are inversely correlated, which is why this looked good for four
+> weeks and then didn't.
+>
+> **The one question that would undo it:** can a NKI custom call participate in compiler fusion, or
+> be made transparent to the fusion pass? If yes, this dissolves. If no, per-layer swapping of small
+> memory-bound ops is closed on merit and the only viable shape is a kernel spanning a whole fused
+> region — which is what nkilib already ships. I can't answer that from here; it's a compiler-team
+> question and it's now my top ask.
+>
+> I also nearly filed a bug against my own kernels on the way to this. Dividing traffic by call count
+> said they move 3.00x more data than necessary, which reads as a spilled fp32 intermediate — and the
+> `nl.arange` migration had introduced exactly such a temporary, so I had a culprit ready. Hitting
+> exactly 3.00x for both ops independently is what made me check. Traffic isn't linear in N, and once
+> you solve for fixed vs marginal the kernels come out optimal. Lesson: vary N before dividing by N.
 >
 > **What landed:** Weeks 3-6 done. Three kernels validated on Qwen3 dense *and* MoE with zero
 > changes for MoE (cos_sim 1.000001 / 1.000002). RoPE is a real port of nki-library's `rope_hf`.
@@ -78,15 +122,16 @@ the doc.
 > experts path uses `torch.sort`/`histc` → unsupported HLO; fix is
 > `experts_implementation="batched_mm"`, undocumented anywhere.
 >
-> **Questions:** (1) who owns `target.py` and do I file it? (2) is
-> `NEURON_PLATFORM_TARGET_OVERRIDE` supported for customers or internal-only — decides whether it
-> goes in docs as a workaround. (3) is the residual `create_computation` cost similarly cacheable,
-> or is per-call rebuild required? That's the difference between 3.4x slower and near parity. (4)
-> I'm now a layer below the Kernel Hub, inside NKI's dispatch path — in scope, or hand off and go
-> back to kernels?
+> **Questions, in order:** (1) **can a NKI custom call participate in compiler fusion?** Who do I ask.
+> This decides whether the integration can ever be a perf win. (2) Who owns `target.py` and do I write
+> the CR for the `lru_cache`? (3) Is `NEURON_PLATFORM_TARGET_OVERRIDE` customer-supported or
+> internal-only — decides whether it can be documented as a workaround. (4) I'm now two layers below
+> the Kernel Hub — NKI's dispatch path and the compiler's fusion behaviour. Still in scope, or hand
+> off and go back to kernels?
 >
-> `deliverables/poc-document.md` has the full thing. Recommendation is now "yes, fix two caching
-> bugs first," not "defer."
+> `deliverables/poc-document.md` has the full thing. Recommendation: fix the one-line dispatch bug
+> regardless, ask the fusion question, and **don't** port small memory-bound ops at per-layer
+> granularity — not "defer", they can't win.
 
 ---
 

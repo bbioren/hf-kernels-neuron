@@ -155,6 +155,7 @@ blocker 1 lands. Use `kernelize_for_neuron(model)` from
 `device="neuron"` and handles the `_hidden_kernels` attach/detach that function kernels need.
 
 | 5 | Fused MLP divides by zero single-core when `intermediate_size > 4096` | nki-library | bug fix | **boundary measured, 10 data points**; no wrapper workaround |
+| **11** | **Can a NKI custom call participate in compiler fusion? Today it is opaque, so each swap forces a HBM round-trip the compiler would otherwise elide** | **NKI / compiler** | **a question** | **THE BINDING CONSTRAINT (#25). 2.5–2.7x on device, independent of dispatch and of kernel quality** |
 | ~~6~~ | ~~Can a NKI kernel be invoked from a compiled graph with invocation cost paid once?~~ | — | — | **ANSWERED — see blocker 0** |
 | ~~7~~ | ~~`torch.compile` doesn't work on this stack even for plain PyTorch~~ | — | — | **WRONG — it works for ops `torch_neuronx` hasn't overridden; see blocker 9** |
 | 8 | Qwen3-MoE needs `experts_implementation="batched_mm"` on Neuron; undocumented | Neuron docs | doc | customer-facing |
@@ -178,10 +179,25 @@ Why the two retracted blockers were wrong, because the pattern is worth not repe
 - **Blocker 7 was concluded from one error message.** `torch.compile` works fine here for
   `add`/`mul`/`relu` on XLA tensors. Only `torch_neuronx`-overridden ops fail (blocker 9).
 
-**What survives:** even fixed, per-layer swapping is a net loss at small shapes. Break-even needs a
-kernel to save >0.59 ms/call and RMSNorm/RoPE/SiLU are 15–30x short. So the structural argument holds
-with a corrected mechanism — the granularity that wins is the one the Kernel Hub can't express
-(blockers 4, 5) — but it is now blocker 10, not graph mode, that gates whether that can change.
+**What survives, and it got worse rather than better (Finding #25).** Even with dispatch removed
+entirely, NKI SiLU is 2.71x slower on device than torch SiLU and NKI RMSNorm 2.55x. The kernels are
+*optimal* — marginal HBM traffic is exactly 1.00x the unfused floor, one read in and one write out,
+nothing spilled. Torch's traffic is independent of call count, which is only possible by fusing the
+chain into a single pass.
+
+So the compiler cannot fuse across a NKI custom call, and each swap forces a HBM round-trip where the
+data previously stayed resident. For memory-bound ops fusion *is* the optimisation, so these kernels
+compete against not touching memory at all. **Break-even is unreachable for them, not distant** —
+a stronger claim than "15–30x short on dispatch arithmetic".
+
+The corollary is the project's sharpest result: **the ops the Kernel Hub is best at intercepting are
+the ops that lose most from being intercepted.** RMSNorm (115 registrations), RoPE (95 model files),
+all of `ACT2FN` via one decoration — small, memory-bound, already fused. Reach and usefulness are
+inversely correlated.
+
+**Blocker 11, not blocker 10, is now what gates whether this can change.** If a NKI custom call could
+participate in fusion, #25 dissolves. If not, the only viable shape is a kernel spanning a whole fused
+region — what nkilib ships, and what blockers 4 and 5 say the Kernel Hub can't express.
 
 **Fused-kernel work is blocked, not merely expensive.** Two independent gates, found by the
 Week 4 derisking spike (`scripts/spike_nkilib_mlp.py`), which was worth running precisely
@@ -277,7 +293,10 @@ forward that is ~76 ms of host-side overhead per step. Two consequences:
   instrument rather than adding a variant. Measure device time against wall time first.**
 - Residual after the fix is ~0.59 ms/call against 0.02 ms of device time, in `create_computation`
   rebuilding the XLA computation and HLO protobufs per call — same class of bug, 100x smaller
-  (blocker 10). Break-even needs a kernel to save >0.59 ms/call; all three of ours are 15–30x short.
+  (blocker 10). On dispatch grounds break-even needs a kernel to save >0.59 ms/call and all three of
+  ours are 15–30x short. **But Finding #25 supersedes this as the binding constraint:** with dispatch
+  excluded the kernels are still 2.5–2.7x slower on device, because each swap costs a compiler fusion.
+  So closing the dispatch residual does not reach parity, and blocker 11 is what matters.
 - RoPE confirmed engaged at seq 512 (28/28, zero fallbacks), so the `% 128` guard is not
   silently disabling it.
 - **The Week 3 prediction about SiLU was right on the conclusion and wrong on the reasoning.**

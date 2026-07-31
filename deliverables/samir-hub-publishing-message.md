@@ -3,17 +3,24 @@
 **Status: DRAFT, NOT SENT.** Review before sending. Slack is probably the right channel; the
 long version below works as a doc or email if he wants detail.
 
-**UPDATED TWICE — the second time matters.** The previous version told Samir the Kernel Hub's
-per-layer granularity might be structurally wrong for Neuron, on the strength of a 208x slowdown.
-**That diagnosis was wrong and the cause was on our side** (an uncached `neuron-ls` subprocess in
-NKI's dispatch path, ~52 ms per kernel call, fixed by one `lru_cache`). Sending the earlier draft
-would have handed the HF team a false problem statement about their own design.
+**UPDATED THREE TIMES.** Worth knowing the history, because two earlier drafts should not have gone out.
 
-What survives is smaller and better posed: after the fix there is still ~0.59 ms/call of dispatch
-overhead, break-even needs a kernel to save more than that, and our small ops are 15-30x short. That
-is worth his read. "Your granularity model is wrong for us" was not.
+- **v1** told Samir the Kernel Hub's per-layer granularity might be structurally wrong for Neuron, on
+  the strength of a 208x slowdown. That diagnosis was wrong and the cause was ours — an uncached
+  `neuron-ls` subprocess in NKI's dispatch path. Sending it would have handed the HF team a false
+  problem statement about their own design.
+- **v2** corrected that, and narrowed the ask to our residual ~0.59 ms/call dispatch cost, framed as
+  "probably also ours to fix."
+- **v3 (this one)** has the finding that is actually worth his time, and it *does* concern the
+  mechanism — but for a properly established reason rather than a guessed one. With dispatch excluded
+  entirely, our kernels are still 2.5-2.7x slower on device, because a NKI custom call is opaque to
+  the Neuron compiler and each swap costs a fusion the compiler was already performing. Our kernels
+  are provably optimal (marginal traffic exactly at the unfused floor), so this is a property of
+  per-layer swapping on a backend with a fusing compiler, not of our code.
 
-Item 5 is rewritten around that, and now includes an explicit retraction of the graph-mode framing.
+The difference between v1 and v3 matters: v1 asserted the granularity was wrong, v3 demonstrates a
+specific mechanism, quantifies it, shows it isn't our kernels' fault, and asks whether it is a known
+shape of problem. Same broad topic, opposite epistemic standing.
 
 Judgement calls I made, change them if you disagree:
 - Leads with the performance finding, framed as information for him rather than a complaint.
@@ -41,14 +48,18 @@ Judgement calls I made, change them if you disagree:
 >
 > **Leading with the awkward part, because it's the most useful thing I can tell you:** the swap
 > initially made the model *208x slower* — MFU 0.02% vs a 5.06% baseline. I spent a while writing
-> that up as a granularity mismatch between the Kernel Hub's per-layer model and our kernel
-> library's design. **That was wrong, and the real cause was on our side.** Every `@nki.jit`
-> invocation was forking a subprocess to detect the hardware (`neuron-ls`), ~52 ms a call, outside
-> its own compile cache. One `lru_cache` takes it to 0.49 ms — 102x — and the model from 208x
-> slower to 3.4x slower. So: nothing for you to fix, and I'd rather you hear the corrected version
-> from me than the original from someone else.
+> that up as a granularity mismatch with the Kernel Hub's per-layer model. **That diagnosis was wrong
+> and the cause was on our side:** every `@nki.jit` invocation was forking a subprocess to detect the
+> hardware (`neuron-ls`), ~52 ms a call, outside its own compile cache. One `lru_cache` takes it to
+> 0.49 ms — 102x — and the model from 208x slower to 3.4x slower. Nothing for you to fix there, and
+> I'd rather you hear the corrected version from me than the original from someone else.
 >
-> The residual 3.4x is more interesting and is where your read would genuinely help — see item 5.
+> **The residual is where it gets interesting, and it does turn out to involve the mechanism — but
+> for a reason I can now actually demonstrate.** With dispatch excluded entirely, our kernels are
+> still 2.5-2.7x slower on device than the torch ops they replace, because a NKI kernel arrives as an
+> opaque custom call and the Neuron compiler can't fuse across it. Our kernels are provably optimal
+> (marginal HBM traffic exactly at the unfused floor); the loss is the fusion we're preventing. Item 5
+> has the numbers. That's the part where your read would genuinely help.
 >
 > Five things I'd like your read on, roughly in order of how much they block us:
 >
@@ -87,32 +98,53 @@ Judgement calls I made, change them if you disagree:
 > want, or is the expectation that backend kernels absorb the layout difference internally?
 > This blocks any fused-kernel work for us, so I'd rather ask than guess.
 >
-> **5. What's left after the big fix: ~0.59 ms of dispatch per kernel call.** With the subprocess
-> cached, each NKI call still costs ~0.59 ms on the host against 0.02 ms of actual device time. A
-> plain torch op in the same position costs 0.02-0.03 ms, so our dispatch is 15-20x a torch op's.
-> cProfile puts it in `create_computation` rebuilding the XLA computation and its HLO protobufs on
-> every invocation — the same class of caching bug as the first one, two orders of magnitude
-> smaller. Probably also ours to fix; I've handed it to our NKI team to scope.
+> **5. The thing I think is genuinely worth your time: each kernel swap costs us a compiler fusion.**
 >
-> The reason I'm mentioning it rather than just fixing it quietly is the arithmetic it implies for
-> the Kernel Hub's model. Break-even needs a swapped kernel to save more than ~0.59 ms of torch
-> time per call. RMSNorm / RoPE / SiLU at these shapes are 15-30x short of that, so per-layer
-> swapping of *small* ops can't win on arithmetic here however good the kernel is. It does
-> amortise — 4x the sequence length nearly halves the penalty (3.36x → 2.06x), since the cost is
-> near-fixed per call — but that only gets us toward parity at large shapes, not to a speedup.
+> After fixing our dispatch bug I profiled *device* time, comparing each NKI kernel against the torch
+> op it replaces on identical work (28 chained applications, same shape and dtype):
 >
-> Two questions where your experience would help more than more measurement on my side:
-> - **Have you seen this on other non-CUDA backends?** A per-call dispatch floor well above a
->   torch op's, where the win only appears once the replaced op is big enough. I'd like to know
->   whether this is a known shape of problem with a known answer.
-> - **Is per-layer granularity a deliberate design boundary?** Our production kernels are large
->   fused megakernels spanning a whole transformer block, which is the opposite shape to a
->   per-layer forward swap. I hit that mismatch from two other directions too: fused kernels want
->   weights in a layout `kernelize()` can't produce (item 4), and our fused MLP won't compile
->   single-core at realistic widths because it assumes multi-core sharding. I'm not asking you to
->   change anything — I'm trying to work out whether coarse-grained backends are simply outside
->   the model's intended scope, which would be a perfectly good answer and worth stating in the
->   docs so the next backend author doesn't rediscover it.
+> ```
+>                  device ms   HBM traffic   marginal traffic per call
+>   NKI SiLU          0.607     188.7 MB     6.29 MB = 1.00x the unfused floor
+>   torch SiLU        0.224       6.3 MB     ~0.00 MB
+>   NKI RMSNorm       1.625     188.8 MB     6.29 MB = 1.00x the floor
+>   torch RMSNorm     0.637       6.4 MB     ~0.00 MB
+> ```
+>
+> Our kernels are 2.5-2.7x slower on device, and it isn't kernel quality — marginal traffic is
+> *exactly* the theoretical minimum for an op that can't fuse (one read in, one write out). Torch's
+> traffic is independent of call count, which is only possible because the Neuron compiler fuses the
+> whole chain into a single pass.
+>
+> So a NKI kernel arrives as an opaque custom call, the compiler can't fuse across it, and every
+> swapped op is forced to round-trip through HBM where the data used to stay resident. For
+> memory-bound ops — activations, normalisations — fusion *is* the optimisation, so the kernel is
+> competing against not touching memory at all and can't win however well written.
+>
+> The uncomfortable consequence for the mechanism, and the reason I think this is useful to you
+> rather than just to us: **the layers the Kernel Hub is best at intercepting are the layers that
+> lose most from being intercepted.** RMSNorm has 115 registrations upstream, RoPE covers 95 model
+> files, one decoration covers every `ACT2FN` activation — and all three are small, memory-bound and
+> already being fused by the backend compiler. Reach and benefit are inversely correlated, at least
+> on a backend with a fusing compiler.
+>
+> Three questions where your experience would help more than further measurement on my side:
+> - **Do other non-CUDA backends hit this?** Anywhere the backend compiler does whole-graph fusion,
+>   I'd expect a per-layer opaque-kernel swap to have the same problem. CUDA is different because
+>   there isn't an equivalent fusing compiler pass to lose. If this is a known shape, I'd rather
+>   learn the known answer than rediscover it.
+> - **Is there a way to declare a kernel fusable, or to swap a fused *region* rather than a layer?**
+>   Something like registering against a matched subgraph instead of a single `nn.Module`. That is
+>   probably a large ask and possibly outside the library's intent, but it is the shape the fix would
+>   take.
+> - **Is per-layer granularity a deliberate design boundary?** Our production kernels are large fused
+>   megakernels spanning a whole transformer block, which is the opposite shape to a per-layer forward
+>   swap. I hit that mismatch from two other directions too: fused kernels want weights in a layout
+>   `kernelize()` can't produce (item 4), and our fused MLP won't compile single-core at realistic
+>   widths because it assumes multi-core sharding. I'm not asking you to change anything — I'm trying
+>   to establish whether coarse-grained backends are simply outside the intended scope, which would be
+>   a perfectly good answer and worth a line in the docs so the next backend author doesn't spend six
+>   weeks finding out.
 >
 > One thing I should retract explicitly: I'd previously concluded that graph mode was the decisive
 > question here and that we needed `torch.compile` to answer it. It isn't. torch-xla is already a
