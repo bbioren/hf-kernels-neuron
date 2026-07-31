@@ -49,7 +49,8 @@ def reference_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torc
     return weight * x.to(dtype)
 
 
-def run_case(mod, device, hidden_size, seq_len, batch_size, dtype=torch.float32, eps=1e-6):
+def run_case(mod, device, hidden_size, seq_len, batch_size, dtype=torch.float32, eps=1e-6,
+             expect_bit_identical=False):
     """Run one shape through the NKI kernel on hardware and score it."""
     label = f"({batch_size}, {seq_len}, {hidden_size}) {str(dtype).replace('torch.', '')}"
 
@@ -75,7 +76,8 @@ def run_case(mod, device, hidden_size, seq_len, batch_size, dtype=torch.float32,
         sync()
         out_cpu = out.cpu()
 
-    return assert_nki_accuracy(label, golden, out_cpu, counts, max_diff_tol=tol)
+    return assert_nki_accuracy(label, golden, out_cpu, counts, max_diff_tol=tol,
+                               expect_bit_identical=expect_bit_identical)
 
 
 def test_fallback_is_loud(mod, device):
@@ -176,9 +178,19 @@ def main():
                 )
             )
 
-    # bf16 pass at a Qwen3 shape — the dtype real training/inference uses
+    # bf16 at a Qwen3 shape — the dtype real training/inference uses.
+    #
+    # expect_bit_identical=True only for bf16, and only since the NKI 0.5.0 migration.
+    # The kernel now computes the reduction and reciprocal in float32, exactly as
+    # PyTorch's RMSNorm does, so the bf16 result rounds identically to the reference.
+    # The fp32 cases above deliberately keep the check ON — they still show a non-zero
+    # diff (~1e-6), which is the corroborating signal that a real reduction ran.
+    # The authoritative execution proof in both cases is the call counter.
     try:
-        results.append(run_case(mod, device, 896, 128, 1, dtype=torch.bfloat16))
+        results.append(
+            run_case(mod, device, 896, 128, 1, dtype=torch.bfloat16,
+                     expect_bit_identical=True)
+        )
     except Exception as e:
         print(f"  bf16 case failed: {type(e).__name__}: {e}")
 

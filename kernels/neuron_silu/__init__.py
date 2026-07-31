@@ -35,31 +35,25 @@ mechanism coverage — not because it is expected to be a speedup on its own. Do
 claim a win for it without measuring.
 """
 
-import math
-
 import torch
 import torch.nn as nn
 
-# IMPORT PATH MATTERS, AND THIS KERNEL REQUIRES `neuronxcc.nki`.
+# NKI 0.5.0 (top-level `nki`) is the going-forward surface; `neuronxcc.nki` is the older API
+# bundled inside neuronx-cc, kept only as a fallback.
 #
-# Both `nki` and `neuronxcc.nki` import successfully but are NOT interchangeable at
-# kernel-compile time, and neither is a superset. The top-level `nki` package fails to
-# resolve `nl.arange` —
-#     error: failed to resolve name 'nki.language.arange'
-# — even though `hasattr(nl, "arange")` is True. This kernel uses the arange-based
-# index-tensor idiom to mask partial tiles, so it needs `neuronxcc.nki`. Conversely our
-# RoPE kernel needs top-level `nki`, because `neuronxcc.nki` treats shape values as
-# symbolic scalars and rejects `//` on them. See docs/sticking-points.md.
+# This kernel originally used `nl.arange` index tensors plus `mask=` for ragged tails, which
+# pinned it to the older API. Both are gone in 0.5.0 — `nl.arange` was removed in favour of
+# `nl.ds`, and `nl.load`/`nl.store` no longer take `mask`. See Finding #14.
 _HAS_NKI = False
 try:
-    import neuronxcc.nki as nki
-    import neuronxcc.nki.language as nl
+    import nki
+    import nki.language as nl
 
     _HAS_NKI = True
 except ImportError:
     try:
-        import nki
-        import nki.language as nl
+        import neuronxcc.nki as nki
+        import neuronxcc.nki.language as nl
 
         _HAS_NKI = True
     except ImportError:
@@ -79,26 +73,31 @@ if _HAS_NKI:
 
     @nki.jit
     def _nki_silu_kernel(a_tensor):
-        """out = silu(a) = a * sigmoid(a), computed 128 rows at a time.
+        """out = silu(a) = a * sigmoid(a), tiled 128 rows at a time.
+
+        `nl.silu` is a native NKI primitive, so there is no math to port here — the kernel
+        is a tiled load / activate / store. The ragged tail is a separate static-size
+        `nl.ds` tile because `nl.load` has no `mask` in NKI 0.5.0.
 
         Args:
             a_tensor: 2D input [rows, cols]
         """
         out_tensor = nl.ndarray(a_tensor.shape, dtype=a_tensor.dtype, buffer=nl.shared_hbm)
 
-        num_rows, num_cols = a_tensor.shape
+        num_rows, _ = a_tensor.shape
 
-        ix = nl.arange(PARTITION_MAX)[:, None]
-        iy = nl.arange(num_cols)[None, :]
+        num_full = num_rows // PARTITION_MAX
+        rem = num_rows % PARTITION_MAX
 
-        for i in nl.affine_range(math.ceil(num_rows / PARTITION_MAX)):
-            row_mask = i * PARTITION_MAX + ix < num_rows
-            tile = nl.load(a_tensor[i * PARTITION_MAX + ix, iy], mask=row_mask)
-            nl.store(
-                out_tensor[i * PARTITION_MAX + ix, iy],
-                value=nl.silu(tile),
-                mask=row_mask,
-            )
+        for i in nl.affine_range(num_full):
+            start = i * PARTITION_MAX
+            tile = nl.load(a_tensor[nl.ds(start, PARTITION_MAX), :])
+            nl.store(out_tensor[nl.ds(start, PARTITION_MAX), :], value=nl.silu(tile))
+
+        if rem > 0:
+            start = num_full * PARTITION_MAX
+            tile = nl.load(a_tensor[nl.ds(start, rem), :])
+            nl.store(out_tensor[nl.ds(start, rem), :], value=nl.silu(tile))
 
         return out_tensor
 
