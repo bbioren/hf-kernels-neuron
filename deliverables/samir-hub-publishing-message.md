@@ -3,10 +3,17 @@
 **Status: DRAFT, NOT SENT.** Review before sending. Slack is probably the right channel; the
 long version below works as a doc or email if he wants detail.
 
-**UPDATED after the Week 4 MFU measurement.** The draft now leads with the ~53 ms
-per-invocation finding rather than the repo-home question, because it is the most useful thing we
-can tell the HF team and because it may change what they'd advise us to do. Items 1-4 are
-unchanged; items 5 and 6 are new.
+**UPDATED TWICE — the second time matters.** The previous version told Samir the Kernel Hub's
+per-layer granularity might be structurally wrong for Neuron, on the strength of a 208x slowdown.
+**That diagnosis was wrong and the cause was on our side** (an uncached `neuron-ls` subprocess in
+NKI's dispatch path, ~52 ms per kernel call, fixed by one `lru_cache`). Sending the earlier draft
+would have handed the HF team a false problem statement about their own design.
+
+What survives is smaller and better posed: after the fix there is still ~0.59 ms/call of dispatch
+overhead, break-even needs a kernel to save more than that, and our small ops are 15-30x short. That
+is worth his read. "Your granularity model is wrong for us" was not.
+
+Item 5 is rewritten around that, and now includes an explicit retraction of the graph-mode framing.
 
 Judgement calls I made, change them if you disagree:
 - Leads with the performance finding, framed as information for him rather than a complaint.
@@ -32,13 +39,16 @@ Judgement calls I made, change them if you disagree:
 > changes between the two model families. RoPE is a real port of our production kernel library,
 > going in as a `FuncRepository` against the existing `rotary_pos_emb` name.
 >
-> **Leading with the awkward part, because it's the most useful thing I can tell you:** on
-> Neuron in eager mode the swap makes the model *208x slower*. MFU 0.02% vs a 5.06% baseline.
-> The cause isn't kernel quality — every NKI kernel invocation from eager PyTorch/XLA costs
-> ~53 ms of fixed overhead independent of problem size, which is more than an entire baseline
-> forward pass. At 169 kernel calls per step that dominates everything. Detail in item 5 below;
-> I'd genuinely value your read on whether this is a shape of problem you've seen with other
-> non-CUDA backends.
+> **Leading with the awkward part, because it's the most useful thing I can tell you:** the swap
+> initially made the model *208x slower* — MFU 0.02% vs a 5.06% baseline. I spent a while writing
+> that up as a granularity mismatch between the Kernel Hub's per-layer model and our kernel
+> library's design. **That was wrong, and the real cause was on our side.** Every `@nki.jit`
+> invocation was forking a subprocess to detect the hardware (`neuron-ls`), ~52 ms a call, outside
+> its own compile cache. One `lru_cache` takes it to 0.49 ms — 102x — and the model from 208x
+> slower to 3.4x slower. So: nothing for you to fix, and I'd rather you hear the corrected version
+> from me than the original from someone else.
+>
+> The residual 3.4x is more interesting and is where your read would genuinely help — see item 5.
 >
 > Five things I'd like your read on, roughly in order of how much they block us:
 >
@@ -77,30 +87,39 @@ Judgement calls I made, change them if you disagree:
 > want, or is the expectation that backend kernels absorb the layout difference internally?
 > This blocks any fused-kernel work for us, so I'd rather ask than guess.
 >
-> **5. The per-invocation cost, and a question about the mechanism's granularity.** As above:
-> ~53 ms fixed per NKI kernel call from eager PyTorch/XLA. Flat across a 112x range in input
-> size, reproduced four times within 1%. I ruled out interleaving (28 adjacent calls cost the
-> same as 28 separated by framework ops), host-side dispatch (0.36 ms/call, 1/145 of it), my own
-> kernels (our production RoPE kernel shows the same figure), and recompilation.
+> **5. What's left after the big fix: ~0.59 ms of dispatch per kernel call.** With the subprocess
+> cached, each NKI call still costs ~0.59 ms on the host against 0.02 ms of actual device time. A
+> plain torch op in the same position costs 0.02-0.03 ms, so our dispatch is 15-20x a torch op's.
+> cProfile puts it in `create_computation` rebuilding the XLA computation and its HLO protobufs on
+> every invocation — the same class of caching bug as the first one, two orders of magnitude
+> smaller. Probably also ours to fix; I've handed it to our NKI team to scope.
 >
-> What makes this interesting rather than just bad news: our kernel library is built around
-> large *fused* megakernels that amortize invocation cost across a whole transformer block,
-> whereas the Kernel Hub's per-layer forward swap maximizes invocation count. Those are opposite
-> designs, and I hit the same mismatch from two other directions too — fused kernels want weights
-> in a layout `kernelize()` can't produce, and our fused MLP won't even compile single-core at
-> realistic widths because it assumes multi-core sharding.
+> The reason I'm mentioning it rather than just fixing it quietly is the arithmetic it implies for
+> the Kernel Hub's model. Break-even needs a swapped kernel to save more than ~0.59 ms of torch
+> time per call. RMSNorm / RoPE / SiLU at these shapes are 15-30x short of that, so per-layer
+> swapping of *small* ops can't win on arithmetic here however good the kernel is. It does
+> amortise — 4x the sequence length nearly halves the penalty (3.36x → 2.06x), since the cost is
+> near-fixed per call — but that only gets us toward parity at large shapes, not to a speedup.
 >
-> So three questions, and I suspect you've thought about at least the first:
-> - Have you seen this shape of per-invocation cost on other non-CUDA backends, and is there a
->   batching or persistence mechanism I've missed?
-> - Is the intended answer "use graph mode"? If NKI kernels can live inside a compiled graph with
->   the cost paid once, the whole picture changes. I couldn't test it — `torch.compile` doesn't
->   work on our current stack even for plain `F.silu` — but if the Kernel Hub's expectation is
->   that non-CUDA backends declare `can_torch_compile=True` and only get selected in
->   TORCH_COMPILE modes, that's a useful thing for me to know before I write the recommendation.
-> - Is the per-layer granularity a deliberate design boundary? I'm not asking you to change it —
->   I'm trying to work out whether backends whose kernels are coarse-grained are simply outside
->   the model, which would be a fine answer and worth stating in the docs.
+> Two questions where your experience would help more than more measurement on my side:
+> - **Have you seen this on other non-CUDA backends?** A per-call dispatch floor well above a
+>   torch op's, where the win only appears once the replaced op is big enough. I'd like to know
+>   whether this is a known shape of problem with a known answer.
+> - **Is per-layer granularity a deliberate design boundary?** Our production kernels are large
+>   fused megakernels spanning a whole transformer block, which is the opposite shape to a
+>   per-layer forward swap. I hit that mismatch from two other directions too: fused kernels want
+>   weights in a layout `kernelize()` can't produce (item 4), and our fused MLP won't compile
+>   single-core at realistic widths because it assumes multi-core sharding. I'm not asking you to
+>   change anything — I'm trying to work out whether coarse-grained backends are simply outside
+>   the model's intended scope, which would be a perfectly good answer and worth stating in the
+>   docs so the next backend author doesn't rediscover it.
+>
+> One thing I should retract explicitly: I'd previously concluded that graph mode was the decisive
+> question here and that we needed `torch.compile` to answer it. It isn't. torch-xla is already a
+> graph runtime, and I confirmed with its execution counters that 28 NKI calls fuse into **one**
+> HLO graph and **one** device execution — and still cost 28x, because the cost was on the host
+> before the graph was even submitted. So this is not a "does it fuse" problem. It fuses fine, at
+> 43% memory-bandwidth utilisation.
 >
 > **6. One suggestion, take it or leave it.** Would `kernels` consider exposing which
 > implementation is live per layer — something like `model.get_kernel_report()`? The issue isn't
