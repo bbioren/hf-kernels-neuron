@@ -47,6 +47,7 @@ These are the primary references we used. Critically, they describe different la
 | 18 | **Fused MLP kernel cannot run single-core when `intermediate_size > 4096` — excludes every real model** | **High** | Open (nki-library bug; no wrapper workaround) |
 | 19 | Eager NKI *host* dispatch costs ~0.36 ms/call; per-layer microbenchmarking can't resolve kernel quality | Medium | Superseded in magnitude by #20 |
 | 20 | **Every `@nki.jit` invocation from eager PyTorch/XLA costs ~53 ms, independent of problem size. MFU 5.06% → 0.02%** | **Critical** | Open — decides the PoC; graph mode is the open question |
+| 21 | The decisive graph-mode question can't be answered here: `torch.compile` fails on this stack for plain PyTorch | High | Open — needs a stack where compile works |
 
 ---
 
@@ -1147,3 +1148,69 @@ Worth stating clearly, because the correctness work stands independently:
 The PoC's question was "should Neuron invest in first-class HF Kernel Hub support?" This finding
 does not answer no. It relocates the answer: **the eager per-layer path is not the one to
 invest in, and the compile path is now the question that matters.**
+
+## 21. The decisive graph-mode question cannot be answered on this stack — `torch.compile` is broken here for plain PyTorch [HIGH]
+
+Finding #20 makes one question decisive: does graph mode amortize the ~53 ms per-invocation NKI
+cost? If yes, the recommendation is "build on the compile path". If no, per-layer NKI swapping
+is not viable in any mode.
+
+**We could not answer it, and the reason is not NKI.**
+
+`scripts/experiment_torch_compile_nki.py` runs a control before the experiment: compile a module
+containing plain `torch.nn.functional.silu` — no NKI anywhere. Every configuration fails:
+
+| backend | dtype | result |
+|---------|-------|--------|
+| `openxla` | bf16 | `TorchRuntimeError: Dynamo failed to run FX node with fake tensors: call_function silu` |
+| `openxla` | fp32 | same |
+| `inductor` | bf16 / fp32 | same |
+| `eager` (dynamo backend) | bf16 / fp32 | same |
+
+So `torch.compile` does not work on this environment at all for this workload. A NKI failure
+under compilation would therefore be indistinguishable from compilation being broken generally,
+and **must not be recorded as "NKI is incompatible with torch.compile"**.
+
+The experiment is written to enforce that: it sweeps backends and dtypes for a plain-PyTorch
+control first, and *skips* the NKI case entirely if no working configuration is found, rather
+than producing a failure that would read as a NKI result.
+
+### A harness bug worth recording, because it would have produced a false finding
+
+The first version of this experiment *did* report a NKI-specific failure:
+
+```
+torch._dynamo.exc.InternalTorchDynamoError: ModuleNotFoundError: No module named 'neuron_silu'
+```
+
+That is entirely an artifact of our own test harness. `load_kernel_module()` loads kernels via
+`importlib.util.spec_from_file_location` (necessary because our `kernels/` directory shadows the
+`kernels` pip package) but never registered the result in `sys.modules`. Dynamo re-imports a
+traced function's defining module by name, so it could not find it.
+
+Read naively, that error says "NKI kernels don't survive torch.compile". It says nothing of the
+kind. Fixed by registering the module in `sys.modules` in `load_kernel_module()`.
+
+This is the third time in this project that a plausible-looking measurement turned out to be an
+artifact of the measurement itself (Findings #8, #19, and now this). The pattern is consistent
+enough to be worth stating as a conclusion rather than an anecdote — see the Week 6 document.
+
+### Eager cost reproduced a fourth time
+
+Incidental but useful: the eager NKI per-call cost reproduced again at **52.09 ms/call**
+(8 calls, 416.71 ms). Across four independent measurements — SiLU-only in a model (51.9),
+all three kernels in a model (51.6), the back-to-back experiment (51.85), and this control
+(52.09) — the figure is stable to within 1%. Finding #20 is not a fluke.
+
+### What to do
+
+1. **Re-run this experiment on a stack where `torch.compile` works on Neuron.** The Native
+   PyTorch beta has a torch.compile path under active development; that is the right environment
+   for this question, not the inference DLAMI venv we have been using. This is the single
+   highest-value remaining experiment in the project.
+2. **Ask the NKI / torch-neuronx teams the direct question:** what is the supported way to call a
+   NKI kernel from inside a compiled graph, and is the per-invocation cost paid once at compile
+   time or per call? They may simply know, which would be faster than measuring.
+3. **Do not soften Finding #20 on the hope that compile fixes it.** As measured, on the stack a
+   customer would actually use today, eager per-layer NKI swapping is not performance-viable.
+   Whether a future path fixes it is a separate claim and should be labelled as one.

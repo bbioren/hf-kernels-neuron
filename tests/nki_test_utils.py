@@ -65,13 +65,28 @@ def load_kernel_module(package_name: str):
 
     Our `kernels/` directory shadows the `kernels` pip package, so a normal
     import would resolve to the wrong thing. Load by explicit file location.
+
+    The module is registered in `sys.modules` under its own name. That matters for more
+    than tidiness: `torch.compile`/Dynamo re-imports a function's defining module by name
+    while tracing, and without the registration it fails with
+    `ModuleNotFoundError: No module named 'neuron_silu'` — which looks like a NKI/compile
+    incompatibility but is purely an artifact of loading by path.
     """
+    import sys
+
     kernel_path = PROJECT_ROOT / "kernels" / package_name / "__init__.py"
     if not kernel_path.exists():
         raise FileNotFoundError(f"No kernel package at {kernel_path}")
+    if package_name in sys.modules:
+        return sys.modules[package_name]
     spec = importlib.util.spec_from_file_location(package_name, kernel_path)
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    sys.modules[package_name] = mod          # register before exec, so self-refs resolve
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:
+        sys.modules.pop(package_name, None)
+        raise
     return mod
 
 
