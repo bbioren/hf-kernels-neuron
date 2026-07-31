@@ -1028,7 +1028,15 @@ check for performance. Neither is standard practice, and both cost us a cycle.
 - Worth asking the HF kernels team whether per-call dispatch cost is a known concern for
   non-CUDA backends, and whether there is a batching or persistence mechanism.
 
-## 20. Every `@nki.jit` invocation from eager PyTorch/XLA costs ~53 ms, independent of problem size [CRITICAL — decides the PoC]
+## 20. Every `@nki.jit` invocation from eager PyTorch/XLA costs ~53 ms, independent of problem size [MEASUREMENT STANDS — mechanism SUPERSEDED by #24]
+
+> **Read #24 first.** The measurements below are correct and reproduced five times. The
+> *explanation* is wrong. The cost is an uncached `neuron-ls` subprocess forked on every
+> invocation inside NKI's dispatch path, not a graph-transition or NEFF-switching cost. Caching
+> the target detection removes 102x of it with no accuracy change, which takes the model-level
+> regression from 208x slower to 3.4x slower. Everything below about *ruling out* problem size,
+> interleaving, recompilation, and our-kernels-vs-production remains valid and is what eventually
+> made #24 findable. The section "Why this happens, and the structural point" is superseded.
 
 **This is the finding the recommendation turns on.** The mechanism works and the kernels are
 correct, but in eager mode a per-layer NKI swap cannot be performance-competitive on this
@@ -1104,6 +1112,13 @@ Worth recording as evidence the guard earns its keep, not just as a process note
 
 ### Why this happens, and the structural point
 
+> **SUPERSEDED by #24.** The paragraph immediately below guessed at NEFF setup and HBM
+> round-tripping, and explicitly flagged that it had not been profiled. Profiling showed the
+> device executes a 28-call NEFF in 0.609 ms at 43% memory-bandwidth utilisation, so the device
+> side was never the problem. The real cause is a per-call `neuron-ls` subprocess on the host.
+> Kept here unedited because the reasoning that follows it — the amortisation argument — turns out
+> to be *right for the wrong reason*, and #24 re-derives it from the corrected mechanism.
+
 The cost behaves like a fixed per-invocation charge for entering and leaving a NKI custom call
 from the framework graph — plausibly NEFF setup plus HBM round-tripping of inputs and outputs,
 though we have not profiled to attribute it precisely.
@@ -1150,7 +1165,15 @@ The PoC's question was "should Neuron invest in first-class HF Kernel Hub suppor
 does not answer no. It relocates the answer: **the eager per-layer path is not the one to
 invest in, and the compile path is now the question that matters.**
 
-## 21. ANSWERED: graph batching already happens, and it does not help. The ~52 ms is inside the compiled NEFF [CRITICAL — closes the decisive question]
+## 21. ANSWERED: graph batching already happens, and it does not help [CRITICAL — conclusion stands, one sub-claim corrected by #24]
+
+> **One correction.** The original title of this section ended "...the ~52 ms is inside the
+> compiled NEFF." That last part is wrong: the device executes the whole 28-call NEFF in 0.609 ms.
+> The cost is on the host, before `mark_step`. See #24. The section's main conclusion — that graph
+> batching is already happening and cannot recover the cost — is unaffected and is in fact
+> *strengthened*: host-side per-call work is exactly the kind of thing graph batching cannot touch.
+> The reasoning below is left intact, since walking from "it must be in the NEFF" to "it is a
+> subprocess on the host" is the useful part.
 
 Finding #20 makes one question decisive: does graph mode amortize the ~53 ms per-invocation NKI
 cost? If yes, the recommendation is "build on the compile path". If no, per-layer NKI swapping
@@ -1216,9 +1239,9 @@ Graph mode is *already applied*. The calls are already in one HLO module and one
 and the cost is still paid per call. `torch.compile` cannot recover it, because there is no
 batching left to do at the framework level — it already happened.
 
-That relocates the problem. The ~52 ms is **inside the compiled NEFF**, paid per NKI custom call,
-independent of tile size (Finding #20 variant D: 28x the data in one call costs 1.02x). Candidate
-explanations, in descending plausibility:
+That relocates the problem. The ~52 ms is paid per NKI custom call, independent of tile size
+(Finding #20 variant D: 28x the data in one call costs 1.02x). Candidate explanations, in
+descending plausibility *as they stood at this point*:
 
 1. Each NKI custom call is lowered as its own schedulable unit the runtime switches between —
    pipeline drain, HBM round-trip for inputs and outputs, possibly a NEFF-region switch.
@@ -1227,8 +1250,18 @@ explanations, in descending plausibility:
    ~3 MB, order microseconds at HBM bandwidth, and the cost is flat across a 112x range of
    problem sizes.
 
-Distinguishing 1 from 2 needs a device profile, not another framework-level experiment. Either
-way the owner is the compiler/runtime, not the Kernel Hub integration and not the kernels.
+> **All three were wrong, and the list itself was the mistake.** Every candidate is device-side,
+> because the conclusion "one device execution still costs 28x" had been read as "therefore the
+> cost is in that execution." The unexamined alternative was that the cost never reached the
+> device at all. Profiling the NEFF (0.609 ms device time against 1459 ms wall) ruled out all
+> three at once and pointed at the host. See #24.
+>
+> This is worth keeping visible: the error was not picking the wrong item from the list, it was
+> not noticing the list was missing an option. Enumerating candidates within one framing feels
+> like rigour and is not.
+
+Distinguishing these needs a device profile, not another framework-level experiment. Either way
+the owner is the compiler/runtime, not the Kernel Hub integration and not the kernels.
 
 ### Consequence for the recommendation
 
@@ -1428,3 +1461,162 @@ It is not a Kernel Hub issue, not a NKI issue, and fixing it would not change an
 result in this PoC (Finding #21 shows graph batching already happens and does not help). It is
 filed here so it can be routed to whoever owns `torch_neuronx`, with the reproducer in
 `scripts/diagnose_torch_compile.py`.
+
+---
+
+## 24. The 208x regression was an uncached `neuron-ls` subprocess per kernel invocation [CRITICAL — supersedes the mechanism in #20 and #21]
+
+Findings #20 and #21 correctly measured a fixed ~52 ms cost per `@nki.jit` invocation and
+correctly ruled out problem size, interleaving, recompilation, our kernels, and graph batching.
+They attributed it to the wrong thing. This finding has the actual cause, a verified fix, and the
+re-measurement.
+
+### Root cause
+
+`nki/framework/compiled.py::_compile_opts()` calls `resolve_target()` on **every** invocation:
+
+```python
+def _compile_opts(self):
+    opts = CompileOptions(
+        target=resolve_target(self.func, self.target),   # <-- every call
+        lnc=self.lnc,
+        ...
+```
+
+With `NEURON_PLATFORM_TARGET_OVERRIDE` unset and no explicit target, `resolve_target()` falls
+through to `nki/compiler/target.py::_detect_target()`:
+
+```python
+def _detect_target() -> str:
+    if shutil.which("neuron-ls") is None:
+        return "trn3"
+    out = subprocess.check_output(["neuron-ls"], text=True, timeout=10, stderr=subprocess.PIPE)
+    for line in out.splitlines():
+        if line.startswith("instance-type:"):
+            ...
+```
+
+It forks a process and runs `neuron-ls` to ask the hardware what it is. That costs ~52 ms.
+
+**The compile cache cannot help.** NKI does maintain `self.func._nki_compile_cache`, but
+`CompileOptions` is what identifies a compiled kernel, so target resolution happens while
+*building the cache key*. A cache **hit** still pays the subprocess in full.
+
+That explains every previously puzzling property at once: the cost is fixed because forking
+`neuron-ls` does not depend on tensor size (flat across a 112x sweep); it is per call because
+nothing caches it; it is invisible to graph batching because it happens on the host before
+anything reaches the graph; and it is identical for our kernels and production `nkilib` ones
+because it is in the shared dispatch path.
+
+### How it was localised
+
+Each step is a separate script, and each one narrows the search:
+
+| step | script | result |
+|------|--------|--------|
+| are N calls one graph? | `probe_neff_count.py` | 28 calls -> **1** graph, **1** device execution, 196-node graph, `execs(pre-sync) = 0` |
+| what does the device do? | `profile_nki_call_cost.py` + neuron-explorer | NEFF `total_time` **0.609 ms**, 43% MBU, 95% active, `activate_instruction_count = 112` (28x4) |
+| host or device? | `probe_where_is_the_time.py` | wall 1459 ms, **99.9% before `mark_step`**; ExecuteTime 0.92 ms, LazyTracing 0.28 ms, TransferToDevice 0, CompileTime 0 |
+| which function? | `probe_inside_one_call.py` | cProfile: 51 of 52 ms in `select.poll` under `subprocess.check_output` under `_detect_target` |
+
+The decisive step was the third: a 2400x gap between device time and wall time eliminates every
+device-side explanation simultaneously, regardless of which one you favour.
+
+The arithmetic closes independently: 169 NKI calls/step x 51.8 ms = 8754 ms, against 8753.65
+ms/step measured by `measure_mfu.py`.
+
+### The fix, verified two ways
+
+`scripts/probe_target_override_fix.py` tests both in one process, re-runs the baseline last as a
+control, and checks accuracy on every variant:
+
+| variant | per call | speedup | cos_sim |
+|---------|----------|---------|---------|
+| baseline (no override) | 51.74 ms | — | 0.999938 |
+| Fix A: `NEURON_PLATFORM_TARGET_OVERRIDE=trn2` | 0.50 ms | **102.8x** | 0.999938 |
+| Fix B: `lru_cache(_detect_target)` | 0.49 ms | **105.5x** | 0.999938 |
+| baseline again (control) | 51.43 ms | — | 0.999938 |
+
+Two deliberate design choices in that test. The override is set to whatever `_detect_target()`
+returns *on this host*, never a hardcoded string — a wrong target would compile for the wrong
+hardware, which could be silently wrong rather than an error. And accuracy is asserted on every
+variant, because a faster wrong answer is a bug, not a fix. Cosine similarity is identical to six
+decimal places across all four, so neither fix changes what gets compiled.
+
+Fix A is a customer-side workaround available today. Fix B is what an upstream fix plausibly looks
+like: one decorator, no user action, no API change.
+
+### Re-measured MFU
+
+`measure_mfu.py --fix-target-detection`. Qwen3-0.6B, 28 layers, seq 512, batch 1, forward only,
+single logical core, denominator 632/2 = 316 TFLOPS:
+
+| | step time | MFU | vs baseline |
+|---|---|---|---|
+| baseline | 42.04 ms | 5.05% | — |
+| kernelized, before fix | 8753.65 ms | 0.02% | 208x slower |
+| kernelized, after fix | **141.43 ms** | **1.50%** | **3.4x slower** |
+
+169 NKI launches, zero fallbacks, IQRs non-overlapping.
+
+**The fix recovers 62x, and the kernels are still a 3.4x net loss.** The headline is not
+"it was just a bug."
+
+### What remains: a second, smaller instance of the same class of bug
+
+Remaining added cost is `141.43 - 42.04 = 99.4 ms` over 169 calls = **0.588 ms/call**, against
+0.02 ms/call of device time. `probe_inside_one_call.py --fix-target-detection` profiles it:
+
+```
+nki/framework/_torch_xla.py:138        __call__
+torch_xla/core/xla_op_registry.py:24   __call__
+torch_xla/core/xla_builder.py:817      create_computation
+torch_neuronx/pyhlo/scribe.py:606      __init__      x56
+protobuf/internal/enum_type_wrapper    __getattr__   x168
+```
+
+Every invocation rebuilds the XLA computation and its HLO protobufs from scratch, on a warm path
+where the kernel has already run several times. Same shape of problem as the subprocess — per-call
+work that is cacheable per `(kernel, shape, dtype)` — two orders of magnitude smaller. A plain
+torch op in the same conditions costs 0.02–0.03 ms, so **NKI eager dispatch is still ~15–20x a
+torch op's**, and it is dominated by protobuf construction rather than anything architectural.
+
+Whether *this* is also fixable was not tested. It is a larger intervention than one decorator and
+sits inside `torch_xla`'s op-registry path, so it is filed as a question for the NKI team, not a
+claim.
+
+### This reconciles Finding #19
+
+Finding #19 recorded ~0.36 ms of host dispatch per call, which appeared to contradict 52 ms. Both
+are real and they measure different things: **0.36–0.59 ms is the dispatch floor, and the 52 ms was
+the subprocess stacked on top of it.** #19 was measuring the residual all along. Neither figure
+needs retracting; #19's *conclusion* (that per-layer microbenchmarking mispredicts in-model cost)
+also still holds, for the reason given there.
+
+### Break-even, from measured numbers
+
+A swapped kernel is a net win only if it saves more than ~0.59 ms of torch time per call. Torch
+SiLU on `[512, 3072]` bf16 costs 0.02–0.04 ms. These ops are **15–30x underwater**. Winning
+requires either dispatch cost at torch-op levels, or kernels that replace far more work per call.
+
+The second option means fused kernels — which is exactly what `nkilib` ships, and exactly what
+Findings #17 (weight layout) and #18 (single-core width limit) say the Kernel Hub cannot currently
+express. So the PoC's central thesis survives with a corrected and much sharper mechanism: the
+mismatch is not that NKI cannot fuse into the XLA graph (it demonstrably does — one graph, one
+execution, 43% MBU), it is that **NKI's eager per-call dispatch cost is too high to amortise over
+one small layer, so the granularity that wins is the granularity the Kernel Hub cannot express.**
+
+### The methodological point, which is the most transferable output here
+
+The graph-transition hypothesis in #20/#21 was wrong, and it survived four separate experiments:
+varying interleaving, varying data volume, ruling out recompilation, and swapping our kernels for
+production ones. Every one of those came back consistent with it.
+
+It survived because **every one of those experiments measured wall-clock time at the framework
+level, and none of them could see inside the 52 ms.** More variants of the same instrument would
+never have falsified it. What falsified it was changing instrument: a device profile, then a
+Python profile.
+
+A hypothesis that keeps surviving tests is not necessarily right. It may only be untestable by the
+instrument in use. When a hypothesis has survived several tests and the story still does not close,
+the next move is a different *kind* of measurement, not another variant of the same one.
