@@ -181,6 +181,8 @@ TFLOPS/device (TensorEngine) ÷ 2 for LNC2 = **316 TFLOPS**. FLOP count computed
 | NKI SiLU only | 1,495.54 ms | 0.14 % | 28 |
 | all three kernels | **8,753.65 ms** | **0.02 %** | 169 |
 | **all three, with `_detect_target` cached** | **141.43 ms** | **1.50 %** | 169 |
+| all three, cached, seq 2048 | 223.99 ms | 4.81 % | 169 |
+| baseline, seq 2048 (for that row) | 108.76 ms | 9.90 % | 0 |
 
 That last row is the important one and it arrived late. The rest of this section is the
 investigation that produced it, kept in order because the wrong turn in the middle is instructive.
@@ -288,6 +290,29 @@ The mismatch is therefore **not** that NKI can't fuse into the graph — it demo
 memory-bandwidth utilisation. It is that NKI's eager per-call dispatch is too expensive to amortise
 over one small layer, so the granularity that wins is the granularity the Kernel Hub cannot
 express. Findings #17 and #18 arrive at the same place from weight layout and sharding.
+
+### The residual amortises with scale, which is measured and matters for the recommendation
+
+If the residual is fixed per call, the penalty must shrink as work per call grows. NKI call count is
+set by model depth (169, fixed), so raising sequence length tests this directly:
+
+| run | baseline | kernelized | MFU kern | penalty | added per call |
+|-----|----------|------------|----------|---------|----------------|
+| seq 512 | 42.04 ms | 141.43 ms | 1.50% | 3.36x | 0.588 ms |
+| seq 2048 | 108.76 ms | 223.99 ms | **4.81%** | **2.06x** | 0.682 ms |
+
+2.59x more baseline work, but only 1.16x more cost per call. The penalty nearly halves, and
+kernelized MFU at seq 2048 is approaching baseline MFU at seq 512.
+
+Qualifications, because the trend reads more encouraging than the arithmetic supports: 1.16x is not
+1.0x, so ~16% of the residual does scale with problem size and it is *near*-fixed rather than fixed.
+And extrapolating, a step needs ~1150 ms of real work for this overhead to fall below 10% — roughly
+10x seq 2048 on a 0.6B model. Reachable at production scale, but it means per-layer swapping
+approaches parity only there, not on the models someone would try first.
+
+**Parity is also not the goal.** Reaching it means the kernels stop costing anything. A *speedup*
+additionally requires each kernel to beat the torch op it replaces, which this PoC has not
+demonstrated for any of the three.
 
 ---
 
@@ -476,9 +501,12 @@ Stated plainly so nobody inherits a false impression:
 - **No MoE-specific kernel.** Gap analysis instead — see `deliverables/week-5-moe-gap-analysis.md`.
   The best target turns out to be the routing `sort`/`histc`, not the expert matmul.
 - **MFU measured on Qwen3-0.6B, not 8B.** Full depth, so it is a real model, but not the largest
-  one. With the fix applied this caveat now cuts the *other* way: a larger model does more work per
-  kernel call, so a fixed ~0.59 ms of dispatch amortises better and the 3.4x gap should narrow.
-  We did not measure how much. Before the fix, a larger model would only have looked worse.
+  one. With the fix applied this caveat cuts the *other* way, and we measured it via sequence length
+  rather than model size: 4x the sequence narrows the penalty from 3.36x to 2.06x. An 8B model would
+  narrow it further. We did not run 8B at full depth.
+- **No demonstration that any kernel beats the torch op it replaces.** Every performance result here
+  is about dispatch overhead. Whether NKI RMSNorm is intrinsically faster than torch RMSNorm at a
+  given shape is unmeasured, and it is a separate question from all of the above.
 - **Single core only.** Eager per-layer swap doesn't manage multi-core; SPMD was stripped from
   the RoPE port.
 
@@ -514,6 +542,12 @@ shapes are 15–30x short. So per-layer swapping of *small* ops cannot win on ar
 good the kernel is. Winning requires replacing more work per call — fused kernels — which is what
 `nki-library` actually ships and what the Kernel Hub's per-layer contract cannot currently express.
 Findings #17 and #18 reach the same conclusion from weight layout and from sharding.
+
+There is a third route, and it is the one the data actually points at: **more work per call without
+changing the kernels at all.** The residual is near-fixed per call, so 4x the sequence length halves
+the penalty (3.36x → 2.06x). That direction is free — it needs no engineering, only larger models
+and longer sequences than a 0.6B at seq 512. It does not reach a speedup on its own, but it means
+the gap we measured is the *worst* case rather than the representative one.
 
 Note what this is *not* evidence of. The kernels are fine: a 28-call NEFF executes in 0.609 ms at
 43% memory-bandwidth utilisation and 95% engine active time. The Kernel Hub mechanism is fine: it

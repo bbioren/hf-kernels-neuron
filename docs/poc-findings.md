@@ -1585,6 +1585,32 @@ Whether *this* is also fixable was not tested. It is a larger intervention than 
 sits inside `torch_xla`'s op-registry path, so it is filed as a question for the NKI team, not a
 claim.
 
+### The residual is near-fixed per call, so it amortises — measured, not assumed
+
+If the residual is fixed per call, the relative penalty must shrink as work per call grows. That is
+testable without changing anything: NKI call count is set by model depth (169 for Qwen3-0.6B), so
+raising sequence length adds work per call while holding call count constant.
+`scripts/compare_mfu_runs.py` compares the two runs:
+
+| run | baseline | kernelized | MFU base | MFU kern | penalty | added/call |
+|-----|----------|------------|----------|----------|---------|------------|
+| seq 512 | 42.04 ms | 141.43 ms | 5.05% | 1.50% | 3.36x | 0.588 ms |
+| seq 2048 | 108.76 ms | 223.99 ms | 9.90% | **4.81%** | **2.06x** | 0.682 ms |
+
+Baseline work grew 2.59x; added cost per call grew only **1.16x**. So the overhead is near-fixed per
+call and the penalty nearly halves, from 3.36x to 2.06x. Kernelized MFU at seq 2048 (4.81%) is
+approaching the *baseline* MFU at seq 512 (5.05%).
+
+Two honest qualifications. The 1.16x growth is not 1.0x, so roughly 16% of the residual does scale
+with problem size — it should be described as *near*-fixed, not fixed. And extrapolating: at
+0.682 ms/call over 169 calls, a step needs ~1150 ms of real work for the overhead to fall below 10%,
+which is about 10x more than seq 2048 on a 0.6B model. Reachable with a larger model and longer
+sequences, but it means per-layer swapping only approaches parity at production scale.
+
+Parity is also not the goal. Reaching it would only mean the kernels stop *costing* anything; a
+speedup additionally requires the kernels to beat the torch ops they replace, which this PoC has
+not demonstrated for any of the three.
+
 ### This reconciles Finding #19
 
 Finding #19 recorded ~0.36 ms of host dispatch per call, which appeared to contradict 52 ms. Both

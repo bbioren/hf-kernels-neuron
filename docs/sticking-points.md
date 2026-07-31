@@ -142,3 +142,65 @@ Two categories dominate, and they are not the ones you would guess from Week 1:
 
 Neither shows up as an error message a customer could search for. That is the through-line
 of this PoC: the Neuron + HF Kernel Hub integration mostly fails *quietly*.
+
+---
+
+## 14. Chasing a performance regression to the wrong layer [~6 hours, the largest single item]
+
+**What happened.** Kernelizing Qwen3 made it 208x slower. Root-causing that consumed most of two
+sessions and the conclusion was wrong for most of it.
+
+**Time breakdown, because the shape of it is the lesson:**
+
+| activity | time | outcome |
+|---|---|---|
+| four framework-level experiments (interleaving, data volume, recompilation, our-vs-production kernels) | ~3 h | all consistent with a wrong hypothesis |
+| writing up the graph-transition explanation, twice | ~1 h | had to be corrected twice |
+| chasing `torch.compile` as the decisive test | ~1 h | wrong instrument entirely |
+| device profile + Python profile | **~35 min** | **found it** |
+| verifying the fix and re-measuring | ~30 min | 102x per call, 62x at model level |
+
+The two measurements that actually resolved it took 35 minutes. Everything before them was
+elaboration within a framing that could not be falsified by the instrument in use.
+
+**Why it was slow.** Every one of the four experiments measured wall-clock time at the framework
+level. A fixed per-call cost independent of problem size is genuinely the signature of
+graph-transition overhead, so each experiment came back consistent and increased confidence in a
+wrong answer. The hypothesis was never tested against a device profile, which would have killed it
+immediately: 0.609 ms of device time against 1459 ms of wall time.
+
+**What would have saved the time.** Measuring device time against wall time *first*. It is one
+number from `neuron-explorer` and one from `time.perf_counter()`, their ratio was 2400x, and it
+invalidates every device-side explanation at once. Total cost maybe 15 minutes, and it should be
+the first thing done on any accelerator performance question, before any hypothesis is formed.
+
+**Who else this affects.** Anyone debugging NKI performance from eager PyTorch. The `neuron-ls`
+subprocess costs ~52 ms per kernel invocation on any workload, and it presents as "NKI kernels are
+slow" rather than as anything pointing at process spawning. A customer would have no reason to
+suspect it and no easy way to find it — it took a cProfile of a single call to see.
+
+---
+
+## 15. `pgrep -af <pattern>` over SSH matches its own command line [~10 min, twice]
+
+`ssh trn2 'pgrep -af neuronx-cc || echo free'` always reports a match, because the `bash -c`
+wrapper carrying the pattern is itself a running process containing that pattern. First time it
+looked like a stale compiler process was holding the Neuron cores; second time I recognised it.
+
+Use `pgrep -af neuronx-cc | grep -v pgrep`, or check for the actual artifact (`model.neff`)
+instead of the process. Minor, but it produces a false "cores busy" reading, which on this box
+looks identical to the real and fairly common stale-lock situation.
+
+---
+
+## 16. torch-xla metric accumulators are nanoseconds, not seconds [~15 min, nearly a published error]
+
+`torch_xla.debug.metrics.metric_data(name)` returns `(count, accumulator, samples)`. The
+accumulator is in **nanoseconds**, while `metrics_report()` prints it formatted as `us`/`ms`. I
+read it as seconds and printed `ExecuteTime 919108000.00 ms` — a nine-digit millisecond figure in
+a table next to a 1459 ms wall time, which is what made it obviously wrong.
+
+Had the scale been closer to plausible it would have gone into a finding. Worth stating as a
+general rule: when a derived number is impossible, the units are the first thing to check, and a
+sanity range on any computed timing catches this class of error for free. Cross-check against
+`metrics_report()`, which formats the same values with explicit units.

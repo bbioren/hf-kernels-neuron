@@ -11,14 +11,133 @@ Versions these were verified against: `kernels 0.15.2`, `transformers 5.15.0.dev
 
 | # | Fix | Owner | Size | Verified? | Findings |
 |---|-----|-------|------|-----------|----------|
+| **0** | **Cache `_detect_target()` — it forks `neuron-ls` on every kernel invocation** | **NKI** | **one decorator** | **Yes — 102x, accuracy-neutral** | **#24** |
 | 1 | Route XLA-on-Neuron to `Device(type="neuron")` | transformers (+ kernels) | ~12 lines, 3 sites | **Yes — demonstrated sufficient** | #9 |
 | 2 | Make `_backend()` report `neuron` | `torch_neuronx` | 1 attribute | Root-caused, fix not built | #7, #12 |
 | 3 | Resolve the `nki` / `neuronxcc.nki` capability split | NKI team | needs a decision | Documented only | #14 |
 | 4 | Add `nkilib` to the `python-depends` allowlist | HF `kernels` | ~6 lines | Feasibility verified | #16 |
 | 5 | Fused MLP divides by zero single-core when `I > 4096` | nki-library | bug fix | **Boundary measured, 10 data points** | #18 |
+| 6 | Make `torch_neuronx`'s op overrides fake-tensor safe | `torch_neuronx` | small per op | Root-caused, reproducer included | #23 |
+| 7 | Scope caching the per-call XLA computation build | NKI / torch-neuronx | unknown | Attributed, not attempted | #24 |
 
-Fixes 1 and 4 are asks to HuggingFace (raise with Samir). Fix 2 is internal to Neuron.
-Fixes 3 and 5 go to the NKI / nki-library teams.
+Fixes 1 and 4 are asks to HuggingFace (raise with Samir). Fixes 2 and 6 are internal to Neuron.
+Fixes 0, 3, 5 and 7 go to the NKI / nki-library teams.
+
+**Fix 0 is the highest value in this document and is not specific to the Kernel Hub.** Any code
+invoking NKI kernels per-layer from eager PyTorch is paying ~52 ms per call today.
+
+---
+
+## Fix 0 — Cache `_detect_target()`; it forks `neuron-ls` on every kernel invocation [HIGHEST VALUE, ONE DECORATOR]
+
+### The problem
+
+`nki/framework/compiled.py::_compile_opts()` resolves the hardware target on **every** kernel
+invocation:
+
+```python
+# nki/framework/compiled.py:91
+def _compile_opts(self):
+    opts = CompileOptions(
+        target=resolve_target(self.func, self.target),   # <-- every call
+        lnc=self.lnc,
+        ...
+```
+
+With `NEURON_PLATFORM_TARGET_OVERRIDE` unset and no explicit target, `resolve_target()` falls
+through to:
+
+```python
+# nki/compiler/target.py:111
+def _detect_target() -> str:
+    """Detect hardware target from neuron-ls, falling back to latest (trn3)."""
+    import shutil
+    import subprocess
+
+    if shutil.which("neuron-ls") is None:
+        return "trn3"
+    try:
+        out = subprocess.check_output(
+            ["neuron-ls"], text=True, timeout=10, stderr=subprocess.PIPE
+        )
+        ...
+```
+
+It forks a process and runs `neuron-ls` to ask the hardware what it is. **That costs ~52 ms, and it
+happens on every call.**
+
+### Why the existing compile cache does not help
+
+`compiled.py` does maintain a cache:
+
+```python
+if not get_binary_env_var("NKI_DISABLE_COMPILE_CACHE") and not hasattr(
+    self.func, "_nki_compile_cache"
+):
+    self.func._nki_compile_cache = {}
+```
+
+But `CompileOptions` is what identifies a compiled kernel, so target resolution runs while
+*constructing the cache key*. A cache **hit** still pays the subprocess in full. The compile is
+cached; the decision about what to compile for is not.
+
+### The patch
+
+```python
+# nki/compiler/target.py
+import functools
+
+@functools.lru_cache(maxsize=1)
+def _detect_target() -> str:
+    ...   # body unchanged
+```
+
+Hardware does not change during a process lifetime, so `maxsize=1` is sufficient. `resolve_target()`
+still checks `NEURON_PLATFORM_TARGET_OVERRIDE` and the explicit-target argument first, so
+precedence is unchanged and the env var remains live-togglable.
+
+### Verification status: **measured, both fixes, with controls**
+
+`scripts/probe_target_override_fix.py`. 28 chained NKI calls, median of 3, steady state, baseline
+re-run last as a control, accuracy asserted on every variant:
+
+| variant | per call | speedup | cos_sim |
+|---------|----------|---------|---------|
+| baseline (no override) | 51.74 ms | — | 0.999938 |
+| `NEURON_PLATFORM_TARGET_OVERRIDE=trn2` | 0.50 ms | **102.8x** | 0.999938 |
+| `lru_cache(_detect_target)` | 0.49 ms | **105.5x** | 0.999938 |
+| baseline again (control) | 51.43 ms | — | 0.999938 |
+
+Model level, `scripts/measure_mfu.py --fix-target-detection`, Qwen3-0.6B seq 512:
+
+| | step time | MFU |
+|---|---|---|
+| baseline (no kernels) | 42.04 ms | 5.05% |
+| kernelized, before fix | 8753.65 ms | 0.02% |
+| kernelized, after fix | 141.43 ms | 1.50% |
+
+Accuracy is identical to six decimal places across all variants, so the fix does not change what
+gets compiled. The override in the test is set to whatever `_detect_target()` returns on the host
+rather than a hardcoded string, since a wrong target would compile for the wrong hardware and could
+be silently wrong rather than an error.
+
+### Interim workaround (available to customers today)
+
+```bash
+export NEURON_PLATFORM_TARGET_OVERRIDE=trn2   # must match the actual hardware
+```
+
+Worth confirming with the NKI team whether this is a supported customer-facing setting or internal
+only, before it goes in any documentation.
+
+### What to do
+
+1. File against NKI with `scripts/probe_target_override_fix.py` as the reproducer.
+2. Ask whether Fix 7 (the residual ~0.59 ms/call in `create_computation`) is similarly cacheable —
+   same class of problem, and it is what stands between this integration and parity.
+3. Ask whether `_detect_target`'s fallback is right in the first place: on a host with no
+   `neuron-ls` it silently returns `"trn3"`, which would compile for the wrong generation rather
+   than fail loudly.
 
 ---
 
