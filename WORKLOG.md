@@ -69,16 +69,37 @@ So a NKI custom call is an **optimisation barrier**. The compiler cannot fuse ac
 forces a HBM round-trip where the data previously stayed resident. For memory-bound ops fusion *is*
 the optimisation, so the kernel is competing against not touching memory at all and cannot win.
 
-**Break-even is unreachable for these ops, not distant.** That is a stronger claim than the previous
-"15–30x short on dispatch arithmetic", and it is the one conclusion no plumbing work changes.
+### And then the in-situ measurement moderated that, which is the sixth correction
 
-The corollary explains the whole project: **the ops the Kernel Hub is best at intercepting are the ops
-that lose most from being intercepted.** RMSNorm has 115 upstream registrations, RoPE covers 95 model
-files, one decoration covers every `ACT2FN` activation — all small, memory-bound, already fused. Reach
-and usefulness are inversely correlated, which is why this looked promising for four weeks.
+The 2.5–2.7x above is from a **chained** microbenchmark — 28 identical ops back to back — which is
+simultaneously the compiler's best case and NKI's worst. I wrote that caveat into the finding and then
+drafted the recommendation as if it weren't there, demoting the dispatch fix on the microbenchmark's
+strength. Measuring it in a real forward pass reversed the ranking:
 
-Four findings now converge from independent directions: #17 (weight layout), #18 (sharding), #24
-(dispatch cost) and #25 (compiler fusion). Only #25 says the approach is *wrong* rather than expensive.
+| term | value | share of the 100 ms wall gap |
+|---|---|---|
+| device gap (14.329 → 22.722 ms) | 8.392 ms | **8.4%** |
+| dispatch gap | 91.608 ms | **91.6%** |
+
+Per NKI call: device 0.0497 ms, dispatch 0.5421 ms — dispatch is ~11x larger. The fusion barrier is real
+(1.59x device time, 1.42x HBM traffic) and second-order.
+
+**So caching `create_computation` is the decisive fix after all**, worth roughly 3.4x → **1.18x**, and
+the fusion question decides whether the last ~18% is recoverable. Break-even is **close but not
+reached**, not unreachable.
+
+What survives all of it: **the ops the Kernel Hub is best at intercepting have the least to gain from
+it.** RMSNorm 115 registrations, RoPE 95 model files, every `ACT2FN` activation via one decoration — all
+small, memory-bound, already fused. Reach and benefit are inversely correlated. That is a reason to point
+the mechanism at different ops, not to abandon it.
+
+Four findings converge from independent directions: #17 (weight layout), #18 (sharding), #24 (dispatch
+cost, ~92% of the regression) and #25 (compiler fusion, ~8%).
+
+**The lesson from the over-claim, stated separately because it is subtle:** a caveat written into a
+finding is not a caveat honoured in the conclusion drawn from it. The representativeness limitation was
+in the document, in writing, before the recommendation was drafted — and the recommendation reasoned past
+it. Either measure the thing the caveat is about, or let it constrain the claim.
 
 ### What else landed
 
@@ -146,14 +167,18 @@ Same class of error as #19, same fix: vary the independent variable and look at 
 
 See **BLOCKED — NEEDS INPUT** at the bottom. Short version, and it changed:
 
-1. **Can a NKI custom call participate in compiler fusion?** This is now the question that decides
-   whether the integration can ever be a performance win (B14). It is a question for the compiler
-   team, not an experiment, so it is cheap to ask and I cannot answer it from here.
+1. **Is the per-call `create_computation` rebuild cacheable?** 91.6% of the remaining regression, and
+   closing it takes 3.4x slower to ~1.18x. The largest available improvement and the top technical ask
+   (B12). Not attempted — it sits inside `torch_xla`'s op-registry path and a wrong guess there could be
+   silently incorrect rather than an error.
 2. **Who owns `nki/compiler/target.py`, and do I write the CR?** One decorator, 102x per call,
-   reproducer ready. Highest value-to-effort item, and correct regardless of B14 (B10).
-3. **Sanity-check the recommendation before it goes out** — it has now changed twice, and the current
-   version says per-layer swapping of small memory-bound ops *cannot* win rather than *doesn't yet* (B9).
-4. **Am I still in scope?** I am now two layers below the Kernel Hub — NKI's dispatch path, and the
+   reproducer ready. Highest value-to-effort item, and correct regardless of everything else (B10).
+3. **Can a NKI custom call participate in compiler fusion?** Decides whether the last ~18% is
+   recoverable — i.e. whether this becomes a win or merely approaches parity (B14).
+4. **Sanity-check the recommendation before it goes out.** The headline has been revised four times,
+   each time by measuring something the previous round assumed. Current version: one framework bug is
+   ~92% of the regression, a fusion cost is ~8%, and with both addressed the kernels land near parity (B9).
+5. **Am I still in scope?** I am now two layers below the Kernel Hub — NKI's dispatch path, and the
    compiler's fusion behaviour (B13).
 
 Both draft messages are rewritten. The previous Samir draft would have told the HF team their
@@ -946,23 +971,28 @@ it can be documented as a workaround. Related and worth raising together: with n
 PATH, `_detect_target()` silently returns `"trn3"`, so it would compile for the wrong generation
 rather than fail loudly.
 
-**B12. Is the residual `create_computation` cost cacheable?** ~0.59 ms/call, rebuilt on every
-invocation. Same class of bug as B10, 100x smaller. **Demoted** — it was the top technical ask until
-Finding #25 showed that closing it entirely still leaves a 2.5–2.7x device deficit. Worth doing, no
-longer decisive. Not attempted: it sits inside `torch_xla`'s op-registry path, and I would rather ask
-than guess.
+**B12. Is the residual `create_computation` cost cacheable? TOP TECHNICAL ASK.** ~0.59 ms/call, rebuilt
+on every invocation. Same class of bug as B10, 100x smaller. Briefly demoted when Finding #25's
+microbenchmark suggested a 2.5–2.7x device deficit would survive closing it; the in-situ measurement put
+it back — **dispatch is 91.6% of the remaining regression** and closing this takes 3.4x slower to ~1.18x.
+Not attempted: it sits inside `torch_xla`'s op-registry path, it is a much larger change than one
+decorator, and a wrong guess could produce silently incorrect results rather than an error.
 
 **B14. Can a NKI custom call participate in compiler fusion, or be made transparent to the fusion
-pass? THE TOP ASK.** Finding #25: the compiler cannot fuse across a NKI custom call, so each swapped
-op is forced to round-trip through HBM where the data previously stayed resident across a fused
-region. For memory-bound ops that is 2.5–2.7x on device, independent of dispatch cost and of kernel
-quality — our kernels move exactly the theoretical minimum traffic for an unfused op.
+pass?** Finding #25: the compiler cannot fuse across a NKI custom call, so each swapped op round-trips
+through HBM where the data previously stayed resident across a fused region. Our kernels move exactly
+the theoretical minimum traffic for an unfused op, so this is not kernel quality.
 
-If the answer is yes, #25 dissolves, break-even becomes reachable, and B12 goes back to being
-decisive. If no, per-layer swapping of small memory-bound ops is closed on merit and the only viable
-shape is a kernel spanning a whole fused region — which is what nkilib ships and what #17/#18 say the
-Kernel Hub cannot express. Either way it changes the recommendation, and it is a question rather than
-an experiment.
+Magnitude, and this is the part I initially got wrong: **2.5–2.7x on device in a chained microbenchmark,
+but 8.4% of the regression in a real forward pass.** So it decides whether the last ~18% is recoverable
+after B12 lands — whether these kernels become a win or merely approach parity — rather than whether the
+integration is viable at all. Briefly filed as the top ask on the microbenchmark's strength; the in-situ
+measurement demoted it below B12.
+
+If the answer is yes, the last 18% is recoverable. If no, per-layer swapping of small memory-bound ops
+tops out just below parity, and the only shape that wins outright is a kernel spanning a whole fused
+region — which is what nkilib ships and what #17/#18 say the Kernel Hub cannot express. A question rather
+than an experiment, and I can't answer it from here.
 
 **B13. Scope check.** I am now a layer below the Kernel Hub, inside NKI's dispatch path. In scope
 for this PoC, or hand off and return to kernels?
@@ -1117,12 +1147,24 @@ had a ready culprit in our own recent kernel change, which is exactly when a wro
 accepted. Two call counts cost one extra profile run. *Rejected:* reporting "the kernels spill an fp32
 intermediate" — it would have sent someone to optimise a kernel that is already optimal.
 
-**D30. Stated the negative more strongly rather than less.** #25 changes "these ops don't win yet" to
-"these ops cannot win", and the corollary is that the mechanism's best interception points are its
-worst performance targets. That is a harsher conclusion than the PoC started with, and it is what the
-measurement supports. *Rejected:* framing it as "needs more investigation" — the direction is not in
-doubt, only the in-situ magnitude.
+**D30. Stated the negative more strongly rather than less — and overdid it.** #25 changed "these ops
+don't win yet" to "these ops cannot win", on the strength of a chained microbenchmark. **D32 reverses
+this.** Recorded rather than deleted because the error is instructive: I noted in writing that the
+microbenchmark was an upper bound, and then drafted the recommendation from the number anyway.
 
 **D31. Kept the fusion question open rather than concluding it is fundamental.** Whether a NKI custom
-call *could* participate in fusion is a compiler-team question I cannot answer from here. It is the
-one thing that would dissolve #25, so it is filed as the top ask (B14) rather than assumed shut.
+call *could* participate in fusion is a compiler-team question I cannot answer from here, so it is filed
+(B14) rather than assumed shut.
+
+**D32. Measured the in-situ fusion penalty instead of shipping the microbenchmark figure.** The
+recommendation had been reordered around 2.5–2.7x. In a real forward pass the device gap is 8.4% of the
+regression and dispatch is 91.6%, so B12 went back above B14 and break-even went from "unreachable" to
+"~1.18x with perfect dispatch". *Rejected:* leaving the microbenchmark number as the headline with the
+caveat in a footnote — which is precisely what the previous round did, and the caveat did not stop the
+wrong conclusion being drawn.
+
+**D33. Added a confidence table to the PoC rather than levelling everything to one voice.** The document
+now separates high-confidence measurements from the two projections (the ~1.18x figure, and whether a
+region-spanning kernel beats the compiler) and says explicitly which claims a reader should push on.
+Given the headline has been revised four times, flagging the load-bearing assumptions is more useful than
+sounding uniformly certain.

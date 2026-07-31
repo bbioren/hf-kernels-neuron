@@ -24,17 +24,20 @@ full. Caching it takes per-call cost from 51.74 ms to 0.49 ms with bit-identical
 Qwen3-0.6B from **208x slower to 3.4x slower**. Not Kernel Hub specific — anything calling NKI kernels
 per-layer from eager PyTorch is paying it right now. Fix it regardless of everything else.
 
-**Two: even with dispatch removed entirely, the kernels lose on device by 2.5-2.7x.** Not because they
-are bad — their marginal HBM traffic is *exactly* the theoretical floor for an op that cannot fuse.
-Because a NKI custom call is opaque to the compiler, so nothing fuses across it, and for memory-bound
-ops fusion is the whole optimisation. That makes break-even **unreachable** for RMSNorm / RoPE / SiLU
-rather than distant, and it is the conclusion no plumbing work changes.
+**Two: a second, smaller cost sits underneath it — each swap forfeits a compiler fusion.** A NKI custom
+call is opaque to the compiler, so nothing fuses across it, and for memory-bound ops fusion is the whole
+optimisation. In a chained microbenchmark that's 2.5-2.7x on device; **in a real forward pass it's 8.4%
+of the regression against 91.6% dispatch.** So the ranking is: fix `_detect_target` (done, verified),
+then cache the per-call `create_computation` rebuild (worth 3.4x → ~1.18x), then ask whether NKI calls
+can be made fusable (the last ~18%).
 
-The recommendation therefore ends up: fix the dispatch bug, ask the compiler team whether NKI calls can
-participate in fusion, and don't port small memory-bound ops at per-layer granularity.
+The recommendation therefore ends up ordinary rather than dramatic: **the mechanism works, the kernels
+are correct and provably efficient, one framework bug accounts for ~92% of the regression, and a smaller
+structural cost keeps them just short of parity.**
 
-I have now been wrong about this three times in a row with correct measurements every time, which is
-itself the most useful thing I have to report. Detail below rather than a quiet doc edit.
+**I have now been wrong about this four times, with correct measurements every time**, which is itself
+the most useful thing I have to report — each correction came from measuring something the previous round
+had assumed. Detail below rather than a quiet doc edit.
 
 ---
 
@@ -96,18 +99,28 @@ itself the most useful thing I have to report. Detail below rather than a quiet 
 > swap forces a HBM round-trip where the data used to stay resident. For memory-bound ops fusion
 > *is* the optimisation, so the kernel is competing against not touching memory at all.
 >
-> **That makes break-even unreachable for these ops, not just distant.** No amount of dispatch work
-> or kernel-writing skill gets there. And the corollary is the sharpest thing in the PoC: the ops the
-> Kernel Hub is *best* at intercepting — RMSNorm 115 registrations, RoPE 95 model files, every
-> `ACT2FN` activation via one decoration — are precisely the ops that lose most from being
-> intercepted. Reach and usefulness are inversely correlated, which is why this looked good for four
-> weeks and then didn't.
+> **Then I checked how big that actually is in a real model, and I'd been over-reading it.** The
+> 2.5-2.7x is from 28 identical ops chained back to back, which is the compiler's best case and NKI's
+> worst. Profiling the real Qwen3 forward and summing device time across NEFFs:
 >
-> **The one question that would undo it:** can a NKI custom call participate in compiler fusion, or
-> be made transparent to the fusion pass? If yes, this dissolves. If no, per-layer swapping of small
-> memory-bound ops is closed on merit and the only viable shape is a kernel spanning a whole fused
-> region — which is what nkilib already ships. I can't answer that from here; it's a compiler-team
-> question and it's now my top ask.
+> ```
+>   device gap    8.392 ms   ( 8.4% of the 100 ms wall gap)
+>   dispatch gap 91.608 ms   (91.6%)
+>   per call:  device 0.0497 ms   dispatch 0.5421 ms
+> ```
+>
+> So the fusion cost is real (device time 1.59x, traffic 1.42x) and second-order. **Dispatch is ~92% of
+> the regression**, which means caching `create_computation` is the decisive fix after all — it takes
+> the model from 3.4x slower to roughly **1.18x**. Break-even is close but not reached, not
+> unreachable. I'd written the "this microbenchmark is an upper bound" caveat into my own findings doc
+> and then drafted the recommendation from the number anyway, which is the mistake I'd most want to
+> not repeat.
+>
+> One thing that survives all of it, and I think it's the most useful line in the PoC: **the ops the
+> Kernel Hub is best at intercepting have the least to gain from it.** RMSNorm 115 registrations, RoPE
+> 95 model files, every `ACT2FN` activation via one decoration — all small, memory-bound, and already
+> being fused by our compiler. Reach and benefit are inversely correlated. That's a reason to point the
+> mechanism at different ops, not to drop it.
 >
 > I also nearly filed a bug against my own kernels on the way to this. Dividing traffic by call count
 > said they move 3.00x more data than necessary, which reads as a spilled fp32 intermediate — and the
@@ -122,16 +135,19 @@ itself the most useful thing I have to report. Detail below rather than a quiet 
 > experts path uses `torch.sort`/`histc` → unsupported HLO; fix is
 > `experts_implementation="batched_mm"`, undocumented anywhere.
 >
-> **Questions, in order:** (1) **can a NKI custom call participate in compiler fusion?** Who do I ask.
-> This decides whether the integration can ever be a perf win. (2) Who owns `target.py` and do I write
-> the CR for the `lru_cache`? (3) Is `NEURON_PLATFORM_TARGET_OVERRIDE` customer-supported or
-> internal-only — decides whether it can be documented as a workaround. (4) I'm now two layers below
-> the Kernel Hub — NKI's dispatch path and the compiler's fusion behaviour. Still in scope, or hand
-> off and go back to kernels?
+> **Questions, in order:** (1) **is the per-call `create_computation` rebuild cacheable?** It's 92% of
+> the remaining regression and worth 3.4x → 1.18x. I didn't attempt it — it's inside `torch_xla`'s
+> op-registry path and a wrong guess there could be silently incorrect rather than error, so I'd rather
+> ask. (2) Who owns `target.py` and do I write the CR for the `lru_cache`? (3) Can a NKI custom call
+> participate in compiler fusion — who do I ask? That's the last ~18%. (4) Is
+> `NEURON_PLATFORM_TARGET_OVERRIDE` customer-supported or internal-only, i.e. can it be documented as a
+> workaround? (5) I'm now two layers below the Kernel Hub — NKI's dispatch path and the compiler's
+> fusion behaviour. Still in scope, or hand off and go back to kernels?
 >
-> `deliverables/poc-document.md` has the full thing. Recommendation: fix the one-line dispatch bug
-> regardless, ask the fusion question, and **don't** port small memory-bound ops at per-layer
-> granularity — not "defer", they can't win.
+> `deliverables/poc-document.md` has the full thing, including a table of what's measured at what
+> confidence, since the headline has moved four times. Recommendation: fix the one-line dispatch bug
+> regardless, scope the `create_computation` cache, ask the fusion question, and treat RMSNorm / RoPE /
+> activations as mechanism demonstrations rather than performance targets.
 
 ---
 

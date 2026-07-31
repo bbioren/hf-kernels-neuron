@@ -55,11 +55,13 @@ Judgement calls I made, change them if you disagree:
 > I'd rather you hear the corrected version from me than the original from someone else.
 >
 > **The residual is where it gets interesting, and it does turn out to involve the mechanism — but
-> for a reason I can now actually demonstrate.** With dispatch excluded entirely, our kernels are
-> still 2.5-2.7x slower on device than the torch ops they replace, because a NKI kernel arrives as an
-> opaque custom call and the Neuron compiler can't fuse across it. Our kernels are provably optimal
-> (marginal HBM traffic exactly at the unfused floor); the loss is the fusion we're preventing. Item 5
-> has the numbers. That's the part where your read would genuinely help.
+> for a reason I can now demonstrate rather than assert.** A NKI kernel arrives as an opaque custom
+> call, so the Neuron compiler can't fuse across it, and every swapped op round-trips through HBM where
+> the data used to stay resident. Our kernels are provably optimal (marginal HBM traffic exactly at the
+> unfused floor), so the loss is the fusion we're preventing, not the code we wrote. It's 8.4% of our
+> remaining regression — the rest is still our own dispatch overhead — so it's second-order, but it's
+> the part that would keep us short of parity even after we fix our side. Item 5 has the numbers.
+> That's where your read would genuinely help.
 >
 > Five things I'd like your read on, roughly in order of how much they block us:
 >
@@ -121,12 +123,19 @@ Judgement calls I made, change them if you disagree:
 > memory-bound ops — activations, normalisations — fusion *is* the optimisation, so the kernel is
 > competing against not touching memory at all and can't win however well written.
 >
-> The uncomfortable consequence for the mechanism, and the reason I think this is useful to you
-> rather than just to us: **the layers the Kernel Hub is best at intercepting are the layers that
-> lose most from being intercepted.** RMSNorm has 115 registrations upstream, RoPE covers 95 model
-> files, one decoration covers every `ACT2FN` activation — and all three are small, memory-bound and
-> already being fused by the backend compiler. Reach and benefit are inversely correlated, at least
-> on a backend with a fusing compiler.
+> **Sizing it honestly, because I initially over-read it:** those numbers are from 28 identical ops
+> chained back to back, which is the compiler's best case and our worst. In a real Qwen3 forward the
+> device gap is only 8.4% of the total regression — the other 91.6% is our own dispatch overhead. So
+> the fusion cost is real and second-order: with dispatch fixed we'd land around 1.18x slower rather
+> than at parity. I'd rather give you the calibrated version than the dramatic one.
+>
+> The consequence for the mechanism is still worth raising, and it's the reason I think this is useful
+> to you rather than just to us: **the layers the Kernel Hub is best at intercepting are the layers
+> with the least to gain from it.** RMSNorm has 115 registrations upstream, RoPE covers 95 model files,
+> one decoration covers every `ACT2FN` activation — and all three are small, memory-bound and already
+> being fused by the backend compiler. Reach and benefit are inversely correlated, at least on a
+> backend with a fusing compiler. That reads to me as an argument for pointing the mechanism at
+> coarser ops, not against the mechanism.
 >
 > Three questions where your experience would help more than further measurement on my side:
 > - **Do other non-CUDA backends hit this?** Anywhere the backend compiler does whole-graph fusion,

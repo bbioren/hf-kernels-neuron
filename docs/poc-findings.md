@@ -45,10 +45,13 @@ These are the primary references we used. Critically, they describe different la
 | 16 | **`nkilib` is already installed and its kernels are directly callable — thin-wrapper porting is feasible today** | **High** | Open (policy blocker only) |
 | 17 | Fused MLP: `kernelize()` has no weight-transformation hook | High | Open (design decision) — **premise partly corrected, see #17** |
 | 18 | **Fused MLP kernel cannot run single-core when `intermediate_size > 4096` — excludes every real model** | **High** | Open (nki-library bug; no wrapper workaround) |
-| 19 | Eager NKI *host* dispatch costs ~0.36 ms/call; per-layer microbenchmarking can't resolve kernel quality | Medium | Superseded in magnitude by #20 |
-| 20 | **Every `@nki.jit` invocation from eager PyTorch/XLA costs ~53 ms, independent of problem size. MFU 5.06% → 0.02%** | **Critical** | Open — decides the PoC; graph mode is the open question |
-| 21 | The decisive graph-mode question can't be answered here: `torch.compile` fails on this stack for plain PyTorch | High | Open — needs a stack where compile works |
+| 19 | Eager NKI *host* dispatch costs ~0.36 ms/call; per-layer microbenchmarking can't resolve kernel quality | Medium | **Reconciled by #24** — 0.36–0.59 ms is the dispatch floor; #20's 52 ms sat on top of it |
+| 20 | Every `@nki.jit` invocation from eager PyTorch/XLA costs ~53 ms, independent of problem size. MFU 5.06% → 0.02% | Critical | **Measurement stands; mechanism superseded by #24** |
+| 21 | ~~The decisive graph-mode question can't be answered here~~ → **answered: 28 NKI calls already share one HLO graph and one device execution and still cost 28x. Graph batching was never the lever** | High | **Resolved** — conclusion stands, one sub-claim corrected by #24 |
 | 22 | Qwen3-MoE won't run on Neuron with transformers' default experts impl (`sort` unsupported); `batched_mm` fixes it. All 3 kernels then transfer unchanged | High | Workaround found; doc gap open |
+| 23 | `torch_neuronx`'s op overrides aren't fake-tensor safe, breaking `torch.compile` on nearly every transformer (`Embedding`, `Softmax`, `CrossEntropyLoss`, …) | High | Open — outside this project's scope, reproducer included |
+| 24 | **THE ROOT CAUSE: `_detect_target()` forks `neuron-ls` on every kernel invocation, ~52 ms, outside the compile cache. One `lru_cache` = 102x/call, MFU 0.02% → 1.50%** | **Critical** | **Fix verified, accuracy-neutral. Residual ~0.59 ms/call in `create_computation` is 91.6% of what's left** |
+| 25 | Each NKI call is an optimisation barrier — the compiler can't fuse across it. Kernels are provably optimal (marginal traffic 1.00x the unfused floor); the loss is the forfeited fusion | Critical | **2.5–2.7x in a chained microbenchmark, but 8.4% of the regression in situ.** Decides the last ~18% after #24's residual |
 
 ---
 
@@ -1716,20 +1719,22 @@ to HBM and re-read it, where before it stayed resident across a fused region.
 For memory-bound operations — elementwise activations, normalisations — fusion *is* the optimisation.
 There is no arithmetic to speed up; the only thing that matters is how many times the data crosses
 the HBM boundary. A NKI kernel for such an op is therefore competing against "not touching HBM at
-all", and it cannot win, however well written it is.
+all", and cannot beat it outright on that axis however well written it is.
 
 The MBU column makes this visible from the other side: NKI runs at 43.2% memory-bandwidth
 utilisation (it is bandwidth-bound, moving 188 MB), torch at 3.9% (it barely touches memory).
 
-### Why this is the most consequential finding in the project
+### Why this matters, and how much — the second part was initially overstated
 
-It changes the recommendation, and it is a stronger claim than anything preceding it.
+Findings #20 and #24 said per-layer swapping is *expensive*. This says something different in kind:
+swapping a small memory-bound op **forfeits a compiler optimisation**, so the kernel starts behind
+regardless of dispatch cost. Fixing dispatch is necessary but not sufficient.
 
-Findings #20 and #24 said per-layer swapping is *expensive*. This says it is the *wrong operation to
-perform* on this class of op. Fixing dispatch is necessary but **not sufficient**: even at zero
-dispatch cost, NKI SiLU and RMSNorm stay 2.5–2.7x slower on device than what they replace. So
-break-even is **unreachable** for these ops, not merely distant — which is different from #24's
-"15–30x short of break-even", and worse.
+> **The magnitude claim originally made in this section was wrong, and is corrected below.** It said
+> break-even is "unreachable, not merely distant", on the strength of the chained microbenchmark. In a
+> real forward pass the device gap is **8.4%** of the regression against **91.6%** dispatch, so with
+> dispatch fixed these kernels land near **1.18x** slower, not 2.5–2.7x. Break-even is close but not
+> reached. See "MEASURED IN SITU" below, and do not quote the 2.5–2.7x figure without it.
 
 It also explains the shape of the entire project. The ops the Kernel Hub is *best* at intercepting —
 RMSNorm (115 upstream registrations), RoPE (95 model files), activations (one decoration covering all

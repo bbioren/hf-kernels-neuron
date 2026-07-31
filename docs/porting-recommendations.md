@@ -344,7 +344,7 @@ The MoE routing kernel is the exception that does not need break-even arithmetic
 Qwen3-MoE does not run on Neuron at all with transformers' default experts implementation. Enabling
 a model beats speeding one up, and it is blocked by neither #17 nor #18.
 
-### 2b. Break-even is unreachable for memory-bound ops, not just distant — and that changes the table above
+### 2b. A second cost underneath dispatch: each swap forfeits a compiler fusion
 
 Finding #25 supersedes the break-even framing in section 2. That section derived a threshold from
 dispatch cost (~0.59 ms/call) and concluded these ops are 15–30x short of it. Measured on device with
@@ -362,16 +362,25 @@ nothing, because the compiler fuses the chain into one pass. **A NKI custom call
 barrier** — the compiler cannot fuse across it, so each swap forces a HBM round-trip where the data
 previously stayed resident.
 
-Consequence for porting: for memory-bound ops, **no amount of dispatch work reaches break-even**, and
-no amount of kernel-writing skill does either. The kernel is competing against not touching memory,
-which it cannot do. So the "no" rows in the table above are not "not yet" — they are "not ever, at this
-granularity."
+**But size that effect correctly before acting on it.** Those figures are from a chained microbenchmark,
+which is simultaneously the compiler's best case and NKI's worst. In a real Qwen3 forward the split is:
+
+| term | value | share of the 100 ms wall gap |
+|---|---|---|
+| device gap (14.329 → 22.722 ms) | 8.392 ms | **8.4%** |
+| dispatch gap | 91.608 ms | **91.6%** |
+
+Per NKI call: device 0.0497 ms vs dispatch 0.5421 ms. So the fusion cost is real and second-order.
+Consequence for porting: **fixing dispatch takes these kernels from 3.4x slower to roughly 1.18x**, and
+the forfeited fusion is what keeps the last ~18%. The "no" rows in the table above are "still ~18%
+underwater with perfect plumbing" rather than "not ever" — a weaker claim than an earlier version of this
+section made, and the correct one.
 
 The practical rule this yields, and it is the one to put in a porting checklist:
 
 > **Only port an op if the NKI kernel spans a region the compiler would otherwise fuse, and does that
-> fusion at least as well.** Replacing a single op inside a fusable region is a guaranteed regression
-> on memory-bound work, however good the kernel.
+> fusion at least as well.** Replacing a single op inside a fusable region forfeits that fusion, so on
+> memory-bound work the kernel starts behind and has to make the difference up on merit.
 
 That is also why the fused MLP and fused attention candidates are the *only* interesting ones: they
 span the region rather than interrupting it.

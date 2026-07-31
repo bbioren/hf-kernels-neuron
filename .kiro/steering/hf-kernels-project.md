@@ -155,13 +155,13 @@ blocker 1 lands. Use `kernelize_for_neuron(model)` from
 `device="neuron"` and handles the `_hidden_kernels` attach/detach that function kernels need.
 
 | 5 | Fused MLP divides by zero single-core when `intermediate_size > 4096` | nki-library | bug fix | **boundary measured, 10 data points**; no wrapper workaround |
-| **11** | **Can a NKI custom call participate in compiler fusion? Today it is opaque, so each swap forces a HBM round-trip the compiler would otherwise elide** | **NKI / compiler** | **a question** | **THE BINDING CONSTRAINT (#25). 2.5–2.7x on device, independent of dispatch and of kernel quality** |
+| 11 | Can a NKI custom call participate in compiler fusion? Today it is opaque, so each swap forces a HBM round-trip the compiler would otherwise elide | NKI / compiler | a question | #25. **8.4% of the regression in situ** (2.5–2.7x in a chained microbenchmark, which is an upper bound). Decides whether the last ~18% after blocker 10 is recoverable |
 | ~~6~~ | ~~Can a NKI kernel be invoked from a compiled graph with invocation cost paid once?~~ | — | — | **ANSWERED — see blocker 0** |
 | ~~7~~ | ~~`torch.compile` doesn't work on this stack even for plain PyTorch~~ | — | — | **WRONG — it works for ops `torch_neuronx` hasn't overridden; see blocker 9** |
 | 8 | Qwen3-MoE needs `experts_implementation="batched_mm"` on Neuron; undocumented | Neuron docs | doc | customer-facing |
 | **0** | **`_detect_target()` forks `neuron-ls` on every `@nki.jit` invocation, ~52 ms/call, outside the compile cache** | **NKI** | **one decorator** | **fix verified: 102x/call, 208x → 3.4x at model level, accuracy-neutral** |
 | 9 | `torch_neuronx` op overrides aren't fake-tensor safe (`Embedding`, `Softmax`, `CrossEntropyLoss`, `silu`, `gelu`, `topk`, `argmax`, `Dropout`) | `torch_neuronx` | small per op | root-caused, reproducer in `scripts/diagnose_torch_compile.py`; unrelated to this integration |
-| 10 | `create_computation` + HLO protobufs rebuilt on every invocation, ~0.59 ms/call | NKI / torch-neuronx | unknown | attributed, not attempted. **Now the top technical ask** |
+| **10** | **`create_computation` + HLO protobufs rebuilt on every invocation, ~0.59 ms/call** | **NKI / torch-neuronx** | **unknown** | **91.6% of the remaining regression. Closing it takes 3.4x slower → ~1.18x. Attributed, not attempted. THE TOP TECHNICAL ASK** |
 
 **Blocker 0 is the most important item in the project, and blockers 6 and 7 were both wrong.**
 
@@ -179,25 +179,30 @@ Why the two retracted blockers were wrong, because the pattern is worth not repe
 - **Blocker 7 was concluded from one error message.** `torch.compile` works fine here for
   `add`/`mul`/`relu` on XLA tensors. Only `torch_neuronx`-overridden ops fail (blocker 9).
 
-**What survives, and it got worse rather than better (Finding #25).** Even with dispatch removed
-entirely, NKI SiLU is 2.71x slower on device than torch SiLU and NKI RMSNorm 2.55x. The kernels are
-*optimal* — marginal HBM traffic is exactly 1.00x the unfused floor, one read in and one write out,
-nothing spilled. Torch's traffic is independent of call count, which is only possible by fusing the
-chain into a single pass.
+**What survives (Finding #25), with the magnitude corrected.** A NKI custom call is opaque to the
+compiler, so nothing fuses across it and each swap forces a HBM round-trip where the data previously
+stayed resident. The kernels are *optimal* — marginal HBM traffic is exactly 1.00x the unfused floor,
+one read in and one write out, nothing spilled. Torch's traffic is independent of call count, which is
+only possible by fusing the chain into one pass.
 
-So the compiler cannot fuse across a NKI custom call, and each swap forces a HBM round-trip where the
-data previously stayed resident. For memory-bound ops fusion *is* the optimisation, so these kernels
-compete against not touching memory at all. **Break-even is unreachable for them, not distant** —
-a stronger claim than "15–30x short on dispatch arithmetic".
+**Magnitude, and the first version of this got it wrong.** In a chained microbenchmark (28 identical ops
+back to back) the gap is 2.5–2.7x on device. In a real forward pass it is **8.4% of the regression,
+against 91.6% dispatch** — device time 14.329 → 22.722 ms, per call 0.0497 ms device vs 0.5421 ms
+dispatch. The microbenchmark is simultaneously the compiler's best case and NKI's worst, so it is an
+upper bound rather than an estimate.
 
-The corollary is the project's sharpest result: **the ops the Kernel Hub is best at intercepting are
-the ops that lose most from being intercepted.** RMSNorm (115 registrations), RoPE (95 model files),
-all of `ACT2FN` via one decoration — small, memory-bound, already fused. Reach and usefulness are
-inversely correlated.
+So **blocker 10 (dispatch) is the decisive fix**, worth roughly 3.4x slower → **1.18x**, and blocker 11
+(fusion) decides whether the last ~18% is recoverable. Break-even is **close but not reached**, not
+unreachable.
 
-**Blocker 11, not blocker 10, is now what gates whether this can change.** If a NKI custom call could
-participate in fusion, #25 dissolves. If not, the only viable shape is a kernel spanning a whole fused
-region — what nkilib ships, and what blockers 4 and 5 say the Kernel Hub can't express.
+The corollary survives regardless and is the project's sharpest result: **the ops the Kernel Hub is best
+at intercepting have the least to gain from it.** RMSNorm (115 registrations), RoPE (95 model files), all
+of `ACT2FN` via one decoration — small, memory-bound, already fused. Reach and benefit are inversely
+correlated. A reason to point the mechanism at different ops, not to abandon it.
+
+**Methodological note worth carrying forward:** the representativeness caveat on the microbenchmark was
+written into the finding *before* the recommendation was drafted, and the recommendation reasoned past it
+anyway. A caveat in the text is not a caveat in the conclusion.
 
 **Fused-kernel work is blocked, not merely expensive.** Two independent gates, found by the
 Week 4 derisking spike (`scripts/spike_nkilib_mlp.py`), which was worth running precisely
