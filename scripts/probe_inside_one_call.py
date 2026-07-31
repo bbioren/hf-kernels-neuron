@@ -24,7 +24,9 @@ Run on trn2:
     python scripts/probe_inside_one_call.py
 """
 
+import argparse
 import cProfile
+import functools
 import io
 import pstats
 import sys
@@ -41,8 +43,23 @@ SEP = "=" * 84
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--fix-target-detection", action="store_true",
+        help="apply the Finding #24 fix first, to profile what remains once the ~52 ms "
+             "neuron-ls subprocess is gone. With the fix, per-call cost is ~0.59 ms and the "
+             "kernels are still a 3.4x net loss, so what remains is worth naming.",
+    )
+    args = ap.parse_args()
+
     require_neuron()
     import torch_xla.core.xla_model as xm
+
+    if args.fix_target_detection:
+        import nki.compiler.target as nki_target
+
+        nki_target._detect_target = functools.lru_cache(maxsize=1)(nki_target._detect_target)
+        print(f"FIX APPLIED: _detect_target lru_cached -> {nki_target._detect_target()!r}")
 
     dev = xm.xla_device()
     mod = load_kernel_module("neuron_silu")

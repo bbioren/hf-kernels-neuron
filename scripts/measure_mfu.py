@@ -198,9 +198,30 @@ def main():
                     help="reuse a known baseline step time instead of re-measuring")
     ap.add_argument("--baseline-ms", type=float, default=None,
                     help="baseline step time in ms, for use with --skip-baseline")
+    ap.add_argument(
+        "--fix-target-detection", action="store_true",
+        help="cache nki.compiler.target._detect_target, which otherwise forks `neuron-ls` on "
+             "EVERY kernel invocation at ~52 ms a time (Finding #24). Without this flag the "
+             "measurement reproduces the original 208x regression; with it, the measurement "
+             "reflects what a customer would see once the upstream bug is fixed. Verified "
+             "accuracy-neutral by scripts/probe_target_override_fix.py.",
+    )
     args = ap.parse_args()
 
     only = [s.strip() for s in args.only.split(",")] if args.only else None
+
+    # Applied before any kernel runs. Patching the module attribute works regardless of how
+    # resolve_target imported it, because resolve_target resolves _detect_target from its own
+    # module globals at call time.
+    if args.fix_target_detection:
+        import functools
+
+        import nki.compiler.target as nki_target
+
+        _orig_detect = nki_target._detect_target
+        nki_target._detect_target = functools.lru_cache(maxsize=1)(_orig_detect)
+        print("  FIX APPLIED: nki.compiler.target._detect_target is now lru_cached "
+              f"(detected target: {nki_target._detect_target()!r})")
 
     device = require_neuron()
     cfg = PRESETS[args.preset]
