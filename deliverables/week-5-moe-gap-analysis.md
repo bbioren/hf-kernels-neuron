@@ -13,19 +13,50 @@ reimplementation of routing logic that already exists on the framework side.
 
 ---
 
-## What transfers for free
+## What transfers for free — now MEASURED, not assumed
 
-Qwen3-MoE reuses the same decorated interception points as Qwen3 dense:
+Verified on trn2 (`tests/test_qwen3_moe_e2e.py`), Qwen3-MoE, 2 layers, 4 experts, top-k 2,
+seq 128:
 
-| Kernel | Interception point | Works on Qwen3-MoE? |
-|--------|-------------------|---------------------|
-| RMSNorm | `@use_kernel_forward_from_hub("RMSNorm")` | **yes** — same `Qwen3MoeRMSNorm` decoration, same layer count per block |
-| RoPE | `@use_kernel_func_from_hub("rotary_pos_emb")` | **yes** — `qwen3_moe/modeling_qwen3_moe.py` is in the 95-file list |
-| SiLU | `@use_kernel_forward_from_hub("SiLU")` | **yes** — the decoration is in `activations.py`, so it covers any model using `ACT2FN["silu"]` |
+| Kernel | Interception point | Dispatch | Result |
+|--------|-------------------|----------|--------|
+| RMSNorm | `@use_kernel_forward_from_hub("RMSNorm")` on `Qwen3MoeRMSNorm` | `nki=9 fallback=0` | transfers |
+| RoPE | `@use_kernel_func_from_hub("rotary_pos_emb")` | `nki=2 fallback=0` | transfers |
+| SiLU | decorated once in `activations.py` | `nki=2 fallback=0` | transfers |
 
-So the dense work already delivers most of what a MoE model can currently get from this
-mechanism. That is a genuinely positive result and worth stating plainly: **the per-kernel
-investment thesis holds across dense and MoE for the non-expert layers.**
+Logits `cos_sim = 1.000002` against the unkernelized model. **Zero code changes to the
+kernels.** Week 5's "reuse RMSNorm/RoPE/SiLU" goal is met.
+
+This is the load-bearing evidence for the "per-kernel, not per-model" thesis: the same three
+kernels now work across two model architectures with no modification, because the interception
+points are shared.
+
+### But first you have to make Qwen3-MoE run on Neuron at all
+
+**The default experts implementation does not work on Neuron.** With no kernelization
+whatsoever, a plain forward fails:
+
+```
+[NCC_EVRF029] Operation sort is not supported on trn2. Use supported equivalent operation
+like TopK or replace it with an alternate implementation via Neuron Kernel Interface (NKI).
+```
+
+`grouped_mm_experts_forward` (the default) calls `torch.sort` and `torch.histc`; `histc`
+lowers to an unsupported `sort` HLO. Fix:
+
+```python
+config = Qwen3MoeConfig(..., experts_implementation="batched_mm")
+```
+
+`batched_mm` has no `sort`/`histc`/`nonzero`/`unique`/`bincount` in its path and runs fine.
+Nothing documents this, and the error names an HLO op with no hint that a config flag resolves
+it. See Finding #22.
+
+**This changes the recommendation below about which MoE kernel to write.** The thing actually
+blocking Qwen3-MoE on Neuron is a routing histogram, not the expert matmul — and the compiler
+error itself points at NKI as the remedy. A small NKI kernel for the `sort`/`histc` step (or
+wiring up `nkilib/core/router_topk` and `core/topk`) would unblock the *default* MoE path
+entirely, and unlike the expert matmul it is not blocked by Findings #17 or #18.
 
 What it does *not* cover is the part that makes MoE expensive — expert routing and the
 blockwise grouped matmul.
@@ -186,19 +217,38 @@ it internally.*
 
 ---
 
-## Cheap next steps that would sharpen this
+## Revised recommendation: write the routing kernel, not the expert matmul
 
-None of these need the blockers resolved, and each is under a day:
+Finding #22 changes the priority order. The highest-value MoE NKI work is no longer the
+blockwise expert matmul:
 
-- **Confirm the width hypothesis.** Call `moe_cte` single-core at a realistic expert width and
-  see whether it hits the same `floordiv` divide-by-zero as the dense MLP. Turns "likely the
-  same wall" into a measured fact. Highest value of the three.
-- **Validate the dense three on Qwen3-MoE.** Run the existing e2e test against
-  `Qwen3MoeForCausalLM` instead of `Qwen3ForCausalLM` and confirm RMSNorm/RoPE/SiLU engage with
-  the expected call counts. Cheap, and it converts "should transfer for free" into evidence.
-- **Wrap `router_topk` standalone** and check it against `Qwen3MoeTopKRouter`. It is the one MoE
-  kernel with a clean interface, needs only an allocation wrapper, and would establish whether
-  *any* MoE-specific NKI kernel can be driven from PyTorch/XLA.
+1. **A NKI kernel for the routing histogram / sort step.** This is the one that unblocks the
+   *default* Qwen3-MoE path on Neuron, the compiler explicitly recommends NKI for it, and it is
+   small. Critically, it is **not** blocked by Findings #17 (weight layout — a histogram has no
+   weights) or #18 (single-core width limits — it is not a fused matmul). Of everything surveyed
+   in this project, this is the MoE work most likely to succeed.
+   - Building blocks exist: `nkilib/core/topk/` and `nkilib/core/router_topk/`.
+   - Interception is the open question: there is no decorated hook for it, so it may need a
+     transformers-side change or the fusion API.
+2. **`router_topk` wrapped standalone**, validated against `Qwen3MoeTopKRouter`. Clean
+   interface, needs only an allocation wrapper (it writes into caller-allocated mutable
+   outputs). Would establish whether any MoE-specific NKI kernel can be driven from
+   PyTorch/XLA.
+3. **The expert matmul (`moe_cte`)** drops to last. It is gated on #17 and #18, needs the
+   routing metadata reimplemented, and per Finding #20 would not be a speedup in eager mode
+   anyway.
 
-The second of these is worth doing regardless, since it is a direct Week 5 goal ("reuse
-RMSNorm/RoPE/SiLU") and costs almost nothing.
+### Still-cheap diagnostics
+
+- **Confirm the width hypothesis for `moe_cte`.** Call it single-core at a realistic expert
+  width and see whether it hits the same `floordiv` divide-by-zero as the dense MLP. Turns
+  "likely the same wall" into a measured fact.
+- ~~Validate the dense three on Qwen3-MoE~~ — **done**, see above.
+
+### And the Finding #20 caveat over all of it
+
+Per-invocation cost is ~53 ms in eager mode, so **no** MoE NKI kernel will be a speedup on the
+eager per-layer path. That does not make the routing kernel pointless — it would make
+Qwen3-MoE *run* on Neuron with the default configuration, which is a correctness/coverage win
+independent of performance. But it should be pitched as unblocking, not accelerating, until the
+graph-mode question (Finding #21) is settled.

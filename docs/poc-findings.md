@@ -48,6 +48,7 @@ These are the primary references we used. Critically, they describe different la
 | 19 | Eager NKI *host* dispatch costs ~0.36 ms/call; per-layer microbenchmarking can't resolve kernel quality | Medium | Superseded in magnitude by #20 |
 | 20 | **Every `@nki.jit` invocation from eager PyTorch/XLA costs ~53 ms, independent of problem size. MFU 5.06% → 0.02%** | **Critical** | Open — decides the PoC; graph mode is the open question |
 | 21 | The decisive graph-mode question can't be answered here: `torch.compile` fails on this stack for plain PyTorch | High | Open — needs a stack where compile works |
+| 22 | Qwen3-MoE won't run on Neuron with transformers' default experts impl (`sort` unsupported); `batched_mm` fixes it. All 3 kernels then transfer unchanged | High | Workaround found; doc gap open |
 
 ---
 
@@ -1214,3 +1215,73 @@ all three kernels in a model (51.6), the back-to-back experiment (51.85), and th
 3. **Do not soften Finding #20 on the hope that compile fixes it.** As measured, on the stack a
    customer would actually use today, eager per-layer NKI swapping is not performance-viable.
    Whether a future path fixes it is a separate claim and should be labelled as one.
+
+## 22. Qwen3-MoE does not run on Neuron with transformers' default experts implementation [HIGH — customer-facing]
+
+Unrelated to NKI kernels, and it blocks the model entirely.
+
+`Qwen3MoeExperts.forward` dispatches through `transformers/integrations/moe.py`, and the
+default implementation `grouped_mm_experts_forward` calls `torch.sort` and `torch.histc`.
+`histc` lowers to a `sort` HLO, which the Neuron compiler rejects:
+
+```
+RuntimeError: RunNeuronCCImpl: [ERROR] [NCC_EVRF029]
+  Operation sort is not supported on trn2. Use supported equivalent operation like TopK
+  or replace it with an alternate implementation via Neuron Kernel Interface (NKI).
+  %sort.0 = u32[256]{0} sort(%reshape.371), dimensions={0}, ...
+```
+
+This fires on a **plain forward pass with no kernelization at all**, so it is a property of
+stock transformers on Neuron.
+
+### The workaround, and it is a one-liner
+
+transformers exposes four experts implementations via `config._experts_implementation`.
+Probed on trn2 (`tests/test_qwen3_moe_e2e.py`):
+
+| `experts_implementation` | Runs on Neuron? | Why |
+|---|---|---|
+| default (`grouped_mm`) | **no** | `torch.sort` + `torch.histc` → unsupported `sort` HLO |
+| `batched_mm` | **yes** | no `sort`/`histc`/`nonzero`/`unique`/`bincount` in its path |
+| `deepgemm` | not reached | probe short-circuits on first success |
+| `sonicmoe` | not reached | " |
+
+So on Neuron:
+
+```python
+config = Qwen3MoeConfig(..., experts_implementation="batched_mm")
+```
+
+Nothing documents this. A customer trying Qwen3-MoE on Trainium gets a compiler error naming
+an HLO op, with no indication that a config flag fixes it. Worth surfacing in Neuron's
+model-support docs regardless of what happens with the Kernel Hub.
+
+### With that set, all three dense kernels transfer to MoE unchanged
+
+Week 5's "reuse RMSNorm/RoPE/SiLU" goal, measured rather than assumed. Qwen3-MoE, 2 layers,
+4 experts, top-k 2, seq 128:
+
+| Kernel | Dispatch | Expected |
+|--------|----------|----------|
+| RMSNorm | `nki=9 fallback=0` | 9 = 4/layer + final norm — same structure as dense |
+| RoPE | `nki=2 fallback=0` | 2 = 1/layer |
+| SiLU | `nki=2 fallback=0` | discovered, not predicted |
+
+Logits `cos_sim = 1.000002` against the unkernelized model. **Zero code changes to the
+kernels.** The interception points are shared with the dense model, so the per-kernel
+investment does carry across model families — which is the load-bearing claim behind the
+"per-kernel, not per-model" thesis, now demonstrated on a second architecture.
+
+### It also reframes which MoE kernel is worth writing
+
+The gap analysis assumed the valuable MoE NKI kernel was the blockwise expert matmul
+(`nkilib/core/moe/moe_cte`). This finding suggests otherwise: the thing actually blocking
+Qwen3-MoE on Neuron is a **routing histogram**, and the compiler error itself recommends NKI
+as the remedy ("replace it with an alternate implementation via NKI").
+
+So a small NKI kernel for the `sort`/`histc` step — or wiring up `nkilib/core/router_topk` and
+`core/topk` — would unblock the default MoE path on Neuron entirely. That is a much smaller,
+better-scoped piece of work than porting the expert matmul, and unlike the expert matmul it is
+not blocked by Findings #17 or #18.
+
+Best MoE-related next step, and it is a genuinely new recommendation from this session.
