@@ -155,15 +155,33 @@ blocker 1 lands. Use `kernelize_for_neuron(model)` from
 `device="neuron"` and handles the `_hidden_kernels` attach/detach that function kernels need.
 
 | 5 | Fused MLP divides by zero single-core when `intermediate_size > 4096` | nki-library | bug fix | **boundary measured, 10 data points**; no wrapper workaround |
-| 6 | **Can a NKI kernel be invoked from a compiled graph with invocation cost paid once?** | NKI / torch-neuronx | a question | **DECISIVE — gates everything else** |
-| 7 | `torch.compile` doesn't work on this stack even for plain PyTorch | torch-neuronx | — | blocks answering #6 here |
+| ~~6~~ | ~~Can a NKI kernel be invoked from a compiled graph with invocation cost paid once?~~ | — | — | **ANSWERED — see blocker 0** |
+| ~~7~~ | ~~`torch.compile` doesn't work on this stack even for plain PyTorch~~ | — | — | **WRONG — it works for ops `torch_neuronx` hasn't overridden; see blocker 9** |
 | 8 | Qwen3-MoE needs `experts_implementation="batched_mm"` on Neuron; undocumented | Neuron docs | doc | customer-facing |
+| **0** | **`_detect_target()` forks `neuron-ls` on every `@nki.jit` invocation, ~52 ms/call, outside the compile cache** | **NKI** | **one decorator** | **fix verified: 102x/call, 208x → 3.4x at model level, accuracy-neutral** |
+| 9 | `torch_neuronx` op overrides aren't fake-tensor safe (`Embedding`, `Softmax`, `CrossEntropyLoss`, `silu`, `gelu`, `topk`, `argmax`, `Dropout`) | `torch_neuronx` | small per op | root-caused, reproducer in `scripts/diagnose_torch_compile.py`; unrelated to this integration |
+| 10 | `create_computation` + HLO protobufs rebuilt on every invocation, ~0.59 ms/call | NKI / torch-neuronx | unknown | attributed, not attempted. **Now the top technical ask** |
 
-**Blocker 6 is now the most important item in the project.** Finding #20 measured ~53 ms of
-fixed cost per `@nki.jit` invocation from eager PyTorch/XLA — more than an entire baseline
-forward pass. If graph mode amortizes that, the Kernel Hub becomes a good bet for Neuron. If it
-doesn't, the per-layer model cannot host nki-library's fused kernels and further investment
-isn't warranted. Cheap to answer, and it gates whether blockers 4 and 5 are worth anyone's time.
+**Blocker 0 is the most important item in the project, and blockers 6 and 7 were both wrong.**
+
+Finding #24: the ~53 ms per `@nki.jit` invocation is an uncached `neuron-ls` subprocess.
+`_compile_opts()` calls `resolve_target()` → `_detect_target()` on every call, and it sits outside
+`_nki_compile_cache` because its result is part of the cache *key*, so a cache hit still pays it.
+One `lru_cache` takes per-call cost from 51.74 ms to 0.49 ms with bit-identical accuracy, and the
+model from 208x slower to 3.4x slower (2.06x at seq 2048). Not Kernel Hub specific.
+
+Why the two retracted blockers were wrong, because the pattern is worth not repeating:
+
+- **Blocker 6 (graph mode) was the wrong question.** torch-xla is already a lazy graph runtime. 28
+  NKI calls fuse into one HLO graph and one device execution (196 nodes, confirmed via torch-xla's
+  `ExecuteTime` counter) and still cost 28x, because the cost was on the host before `mark_step`.
+- **Blocker 7 was concluded from one error message.** `torch.compile` works fine here for
+  `add`/`mul`/`relu` on XLA tensors. Only `torch_neuronx`-overridden ops fail (blocker 9).
+
+**What survives:** even fixed, per-layer swapping is a net loss at small shapes. Break-even needs a
+kernel to save >0.59 ms/call and RMSNorm/RoPE/SiLU are 15–30x short. So the structural argument holds
+with a corrected mechanism — the granularity that wins is the one the Kernel Hub can't express
+(blockers 4, 5) — but it is now blocker 10, not graph mode, that gates whether that can change.
 
 **Fused-kernel work is blocked, not merely expensive.** Two independent gates, found by the
 Week 4 derisking spike (`scripts/spike_nkilib_mlp.py`), which was worth running precisely
@@ -240,11 +258,26 @@ forward that is ~76 ms of host-side overhead per step. Two consequences:
   | baseline | **41.95 ms** | **5.06 %** | 0 |
   | NKI SiLU only | 1,495.54 ms | 0.14 % | 28 |
   | all three kernels | **8,753.65 ms** | **0.02 %** | 169 |
+  | **all three, after the Finding #24 fix** | **141.43 ms** | **1.50 %** | 169 |
+  | **all three, after the fix, seq 2048** | **223.99 ms** | **4.81 %** | 169 |
 
-- **Root cause (Finding #20, Critical): every `@nki.jit` invocation from eager PyTorch/XLA
-  costs ~53 ms of fixed overhead, independent of problem size** — more than the entire 42 ms
-  baseline forward pass. Flat across a 112x range in problem size. Reproduced 4x within 1%.
-  Ruled out interleaving, host dispatch, our kernels, recompilation, and sync artifacts.
+- **Cost per invocation measured (Finding #20): ~53 ms, independent of problem size** — more than
+  the entire 42 ms baseline forward pass. Flat across a 112x range. Reproduced 5x within 1%. Ruled
+  out interleaving, host dispatch, our kernels, recompilation, and sync artifacts.
+- **Root cause found later (Finding #24, and it supersedes #20's explanation): an uncached
+  `neuron-ls` subprocess.** `_compile_opts()` → `resolve_target()` → `_detect_target()` runs on
+  every invocation and forks a process; it is outside `_nki_compile_cache` because its result is
+  part of the cache key. `lru_cache` on it is worth 102x per call, verified accuracy-neutral, and
+  takes the model from 208x slower to 3.4x slower (2.06x at seq 2048).
+- **#20's attribution to graph-transition / NEFF-switching cost was wrong,** and it survived four
+  framework-level experiments because none of them could see inside the 52 ms. What settled it: the
+  device profile (a 28-call NEFF executes in **0.609 ms** at 43% MBU and 95% active, against 1459 ms
+  wall) and then a cProfile, which named the function. Total ~35 min after ~5 h of the wrong
+  approach. **Lesson: when a hypothesis keeps surviving and the story still doesn't close, change
+  instrument rather than adding a variant. Measure device time against wall time first.**
+- Residual after the fix is ~0.59 ms/call against 0.02 ms of device time, in `create_computation`
+  rebuilding the XLA computation and HLO protobufs per call — same class of bug, 100x smaller
+  (blocker 10). Break-even needs a kernel to save >0.59 ms/call; all three of ours are 15–30x short.
 - RoPE confirmed engaged at seq 512 (28/28, zero fallbacks), so the `% 128` guard is not
   silently disabling it.
 - **The Week 3 prediction about SiLU was right on the conclusion and wrong on the reasoning.**
@@ -284,16 +317,23 @@ forward that is ~76 ms of host-side overhead per step. Two consequences:
   device guard. Do not bury it.
 - Porting strategy recommendation: hand-port vs thin wrapper over `nkilib` (#16), with the
   15-lines-vs-7,249-lines scale argument and the version-coupling tradeoff stated honestly
-- What is not done: backward kernels, torch.compile, Hub upload, MoE gaps, fused MLP
-- **Drafted: `deliverables/poc-document.md`.** Recommendation after the Week 4 measurement:
-  **yes, but not the eager per-layer path.** Invest in (1) answering the graph-mode question,
-  which is decisive and cheap, (2) four small upstream fixes, (3) a NKI routing kernel for MoE.
-  **Defer kernel porting** — no kernel is a speedup in eager mode.
-- If graph mode does *not* amortize the ~53 ms per-invocation cost, the honest answer becomes
-  "the Kernel Hub's per-layer model cannot host nki-library's fused-megakernel design, don't
-  invest further." That is a valuable answer too and it is cheap to obtain.
-- Also includes the methodological section — three times a plausible measurement turned out to
-  be measuring nothing, none of which produced an error. Probably the most transferable output.
+- What is not done: backward kernels, Hub upload, MoE gaps, fused MLP, and no demonstration that
+  any kernel beats the torch op it replaces (every perf number here is about dispatch overhead)
+- **`deliverables/poc-document.md` — REWRITTEN after Finding #24.** Recommendation is now
+  **yes, fix two caching bugs in NKI's dispatch path first**: (1) cache `_detect_target()` — one
+  decorator, 102x/call, verified; (2) scope caching the per-call `create_computation` rebuild —
+  the ~0.59 ms residual, and the difference between 3.4x slower and plausibly near parity. Then
+  the upstream fixes and the MoE routing kernel. **Defer per-layer kernel porting** until (2)
+  resolves, since small-op swaps lose on arithmetic below the break-even threshold.
+- **The previous recommendation was "answer the graph-mode question first" and it was withdrawn.**
+  That question is answered and was the wrong one: 28 NKI calls already fuse into one HLO graph and
+  one device execution and still cost 28x, so graph batching was never the lever.
+- Methodological section now has **four** instances, and the fourth is a different failure mode.
+  The first three are harness bugs — invalid measurements, and a guard catches them. The fourth had
+  *valid* measurements and an invalid conclusion, which no guard catches because nothing is broken.
+  Two practices came out of it: change instrument rather than adding a variant when a hypothesis
+  keeps surviving; and measure device time against wall time early, since it is two numbers and
+  their ratio invalidates whole classes of explanation at once.
 
 ## Definition of done
 
@@ -303,9 +343,11 @@ forward that is ~76 ms of host-side overhead per step. Two consequences:
   fix identified and verified sufficient)
 - ✓ NKI RMSNorm **and** RoPE **and** SiLU packaged and validated e2e on Qwen3 dense
   (execution asserted, logits `cos_sim 1.000001`) — and on Qwen3-MoE (`cos_sim 1.000002`)
-- ✓ **Measured MFU delta with denominator stated** — 5.06% → 0.02%, denominator 316 TFLOPS
-  (632/device TensorEngine ÷ 2 for LNC2), FLOP count auditable. `deliverables/week-4.md`
-- ✓ **PoC document drafted** — `deliverables/poc-document.md`. Not yet reviewed or delivered.
+- ✓ **Measured MFU delta with denominator stated** — 5.05% → 1.50% after the Finding #24 fix
+  (5.06% → 0.02% before it; → 4.81% at seq 2048). Denominator 316 TFLOPS (632/device TensorEngine
+  ÷ 2 for LNC2), FLOP count auditable. `deliverables/week-4.md`
+- ✓ **PoC document drafted** — `deliverables/poc-document.md`, rewritten after Finding #24. Not yet
+  reviewed or delivered.
 
 **Ceiling:**
 - ✓ SiLU activation kernel added (Week 3, early)
@@ -317,10 +359,17 @@ forward that is ~76 ms of host-side overhead per step. Two consequences:
   on the repo-home decision (Samir) and blocker 4 for an honest dependency declaration.
 
 **Added, not in the original definition of done but arguably the most valuable:**
-- ✓ Root-caused *why* the kernels don't help (Finding #20), rather than just reporting a
-  slowdown. That is what turns the MFU number into a recommendation.
+- ✓ Root-caused *why* the kernels don't help — twice. First attribution (#20, graph-transition cost)
+  was wrong; the real cause (#24, an uncached `neuron-ls` subprocess per invocation) came with a
+  verified one-decorator fix worth 102x per call. That is what turns the MFU number into a
+  recommendation, and the fix benefits every eager NKI user, not just this integration.
+- ✓ **Two upstream bugs found that are outside this project's scope** and would not have surfaced
+  otherwise: #24 (the dispatch subprocess) and #23 (`torch_neuronx`'s op overrides not being
+  fake-tensor safe, which breaks `torch.compile` on nearly any transformer).
 - ✓ A methodology for measuring kernels on a lazy-execution backend without fooling yourself
-  (`tests/nki_test_utils.py` plus the scaling gate in `scripts/benchmark_kernels.py`).
+  (`tests/nki_test_utils.py` plus the scaling gate in `scripts/benchmark_kernels.py`) — **and** the
+  harder lesson that guards only catch invalid *measurements*, not invalid *conclusions* drawn from
+  valid ones. For the latter: change instrument, and compare device time to wall time early.
 
 ## Environment (re-verified 2026-07-29)
 

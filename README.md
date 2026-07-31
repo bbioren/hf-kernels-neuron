@@ -65,27 +65,46 @@ End-to-end: all three execute on **Qwen3 dense** (logits `cos_sim 1.000001`) and
 
 ### The headline result
 
-**The kernels are correct and 208x slower.** MFU 5.06% → 0.02%.
+**Every `@nki.jit` invocation forks a subprocess. Caching it is one decorator and worth 102x.**
 
-Every `@nki.jit` invocation from eager PyTorch/XLA costs **~53 ms of fixed overhead regardless of
-problem size** — more than the entire 42 ms baseline forward pass. At 169 kernel calls per step
-that dominates everything. It is an integration-model result, not a kernel-quality one: the
-Kernel Hub wants many small invocations, NKI charges ~53 ms each, and nki-library's kernels are
-built as a few large fused megakernels. See Finding #20.
+`nki/framework/compiled.py::_compile_opts()` calls `resolve_target()` on every invocation, which
+falls through to `_detect_target()`, which runs `neuron-ls` to ask the hardware what it is — ~52 ms
+per kernel call. It sits *outside* `_nki_compile_cache` because its result is part of the cache key,
+so a cache **hit** still pays it in full. Finding #24.
 
-The decisive follow-up — does graph mode amortize the cost? — **could not be answered here**,
-because `torch.compile` doesn't work on this stack even for plain PyTorch (Finding #21). That is
-the single most valuable remaining experiment.
+| Qwen3-0.6B, 28 layers, forward only, 1 logical core | step time | MFU | penalty |
+|---|---|---|---|
+| baseline, seq 512 | 42.04 ms | 5.05% | — |
+| kernelized, before the fix | 8753.65 ms | 0.02% | 208x |
+| kernelized, after the fix | 141.43 ms | 1.50% | 3.36x |
+| kernelized, after the fix, seq 2048 | 223.99 ms | 4.81% | **2.06x** |
+
+Denominator: 632 TFLOPS/device TensorEngine ÷ 2 for LNC2 = 316 TFLOPS. Verified two ways
+(`NEURON_PLATFORM_TARGET_OVERRIDE` and `lru_cache`), baseline re-run last as a control, cosine
+similarity identical to six decimals across all variants. **Not Kernel Hub specific** — any eager
+per-layer NKI use pays this today.
+
+**The kernels are still a net loss**, and that is the honest headline. ~0.59 ms/call of host dispatch
+remains against 0.02 ms of device time, spent rebuilding the XLA computation and its HLO protobufs
+on every call. Break-even needs a kernel to save >0.59 ms/call; RMSNorm, RoPE and SiLU at these
+shapes are 15–30x short. The device side is fine: a 28-call NEFF executes in 0.609 ms at 43%
+memory-bandwidth utilisation.
 
 ### Known blockers
 
 | Blocker | Effect |
 |---|---|
+| **`_detect_target()` forks `neuron-ls` per invocation (#24)** | **~52 ms/call. One decorator fixes it; 102x verified. Highest-value item in the project.** |
+| `create_computation` rebuilt per invocation (#24) | ~0.59 ms/call residual. The gap between 3.4x slower and plausibly near parity. Attributed, not fixed. |
 | `use_kernels=True` can't reach `"neuron"` (#9) | silent no-op. Use `kernelize_for_neuron()`; a verified ~3-line upstream fix is in `scripts/neuron_kernel_registration.py` |
-| ~53 ms per NKI invocation (#20) | eager per-layer swap is not performance-viable |
-| `torch.compile` broken on this stack (#21) | blocks the decisive experiment |
+| `torch_neuronx` op overrides aren't fake-tensor safe (#23) | breaks `torch.compile` on nearly any transformer (`Embedding`, `Softmax`, `CrossEntropyLoss`, …). `torch_xla.compile()` works around it. Unrelated to this integration. |
 | Fused MLP won't compile single-core above `intermediate_size` 4096 (#18) | excludes every real model |
 | Qwen3-MoE needs `experts_implementation="batched_mm"` (#22) | undocumented; default fails with an unsupported `sort` HLO |
+
+Retracted, so it doesn't get quoted: an earlier version of this README said `torch.compile` is
+broken on this stack and that the decisive open question was whether graph mode amortises the cost.
+`torch.compile` works for ops `torch_neuronx` hasn't overridden, and graph mode was never the lever —
+28 NKI calls already fuse into one HLO graph and one device execution and still cost 28x.
 
 All findings with severity: [`docs/poc-findings.md`](docs/poc-findings.md).
 Upstream asks with patches: [`docs/upstream-fixes.md`](docs/upstream-fixes.md).
