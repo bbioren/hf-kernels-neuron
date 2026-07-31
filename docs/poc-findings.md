@@ -1150,31 +1150,92 @@ The PoC's question was "should Neuron invest in first-class HF Kernel Hub suppor
 does not answer no. It relocates the answer: **the eager per-layer path is not the one to
 invest in, and the compile path is now the question that matters.**
 
-## 21. The decisive graph-mode question cannot be answered on this stack — `torch.compile` is broken here for plain PyTorch [HIGH]
+## 21. ANSWERED: graph batching already happens, and it does not help. The ~52 ms is inside the compiled NEFF [CRITICAL — closes the decisive question]
 
 Finding #20 makes one question decisive: does graph mode amortize the ~53 ms per-invocation NKI
 cost? If yes, the recommendation is "build on the compile path". If no, per-layer NKI swapping
 is not viable in any mode.
 
-**We could not answer it, and the reason is not NKI.**
+**Answered: no. And answering it did not require `torch.compile` at all.**
 
-`scripts/experiment_torch_compile_nki.py` runs a control before the experiment: compile a module
-containing plain `torch.nn.functional.silu` — no NKI anywhere. Every configuration fails:
+### The framing was wrong, and that is why it looked blocked
 
-| backend | dtype | result |
-|---------|-------|--------|
-| `openxla` | bf16 | `TorchRuntimeError: Dynamo failed to run FX node with fake tensors: call_function silu` |
-| `openxla` | fp32 | same |
-| `inductor` | bf16 / fp32 | same |
-| `eager` (dynamo backend) | bf16 / fp32 | same |
+This finding originally read "the decisive question cannot be answered on this stack, because
+`torch.compile` is broken here." That was wrong twice over, and both errors are the kind a
+reviewer would catch, so they are recorded rather than quietly overwritten.
 
-So `torch.compile` does not work on this environment at all for this workload. A NKI failure
-under compilation would therefore be indistinguishable from compilation being broken generally,
-and **must not be recorded as "NKI is incompatible with torch.compile"**.
+First, **`torch.compile` was never the right instrument.** torch-xla is *already* a lazy graph
+runtime: operations accumulate into an HLO graph and compile/execute at `mark_step()`. Asking
+"would graph mode help" while running on torch-xla asks a question the runtime already answers.
+`torch.compile` would change *when* tracing happens, not whether the NKI calls land in one graph.
 
-The experiment is written to enforce that: it sweeps backends and dtypes for a plain-PyTorch
-control first, and *skips* the NKI case entirely if no working configuration is found, rather
-than producing a failure that would read as a NKI result.
+Second, **`torch.compile` is not broken here.** `scripts/diagnose_torch_compile.py` shows `torch`
+2.9.1 and `torch_xla` 2.9.0 are a matched pair, `openxla` is registered, and `add` / `mul` /
+`relu` all compile and run correctly on XLA tensors. Only specific ops fail, for a specific and
+fixable reason — see Finding #23. The original conclusion stopped one level short of a real bug.
+
+### The measurement that answers it
+
+`scripts/probe_neff_count.py` counts real device executions using torch-xla's own counters
+(`ExecuteTime` gets one sample per graph launch), so batching is directly observed rather than
+inferred. 28 NKI calls issued before a single `mark_step`; steady state, `compiles = 0` on every
+variant, three samples each agreeing within 0.1%:
+
+| variant | wall | device executions | per call |
+|---------|------|-------------------|----------|
+| A. 28 NKI calls, 1 `mark_step` | 1446.37 ms | **1** | 51.66 ms |
+| B. 1 NKI call, 1 `mark_step` | 52.80 ms | 1 | 52.80 ms |
+| C. 28 torch ops, 1 `mark_step` | 1.23 ms | 1 | 0.04 ms |
+| D. 1 torch op, 1 `mark_step` | 0.25 ms | 1 | 0.25 ms |
+
+Three things follow, all directly observed rather than argued:
+
+1. **The 28 NKI calls DID share one graph and one device execution.** `execs(total) = 1`, and
+   `TensorsGraphSize` reports a 196-node graph (28 x 7 nodes). This validates the inference drawn
+   from variant A of `experiment_nki_graph_break.py`, which had been asserted, not checked.
+2. **NKI calls do not self-synchronise.** `execs(pre-sync) = 0` on every variant: the counter had
+   not advanced before `mark_step`. No `@nki.jit` call is secretly flushing the lazy graph. This
+   was the one hole that could have invalidated the entire line of reasoning.
+3. **Cost is linear in the number of NKI custom calls, inside a single execution.** A/B is
+   **27.39x for 28x the calls**. The control is sublinear (C/D = 4.9x for 28x), which proves the
+   harness can see batching when batching works.
+
+### The control turned out stronger than it was designed to be
+
+Variant C uses `F.silu`, which on Neuron is *itself* lowered to an XLA user computation by
+`torch_neuronx` (visible in the traceback in Finding #23: `Silu.forward_impl` ->
+`_xla_user_computation`). So C is 28 XLA custom calls plus 28 multiplies, and it costs 1.23 ms.
+
+**28 XLA custom calls: 1.23 ms. 28 NKI custom calls: 1446 ms.** So the cost is not "custom calls
+don't fuse" and not "XLA can't batch opaque nodes". It is specific to how NKI kernels are lowered
+and scheduled inside a NEFF.
+
+### What this means
+
+Graph mode is *already applied*. The calls are already in one HLO module and one device execution,
+and the cost is still paid per call. `torch.compile` cannot recover it, because there is no
+batching left to do at the framework level — it already happened.
+
+That relocates the problem. The ~52 ms is **inside the compiled NEFF**, paid per NKI custom call,
+independent of tile size (Finding #20 variant D: 28x the data in one call costs 1.02x). Candidate
+explanations, in descending plausibility:
+
+1. Each NKI custom call is lowered as its own schedulable unit the runtime switches between —
+   pipeline drain, HBM round-trip for inputs and outputs, possibly a NEFF-region switch.
+2. A fixed synchronisation or barrier is emitted per custom call.
+3. Real device compute time. Implausible at this magnitude: SiLU on `[512, 3072]` bf16 touches
+   ~3 MB, order microseconds at HBM bandwidth, and the cost is flat across a 112x range of
+   problem sizes.
+
+Distinguishing 1 from 2 needs a device profile, not another framework-level experiment. Either
+way the owner is the compiler/runtime, not the Kernel Hub integration and not the kernels.
+
+### Consequence for the recommendation
+
+The PoC's previous top ask — "get us onto a stack where `torch.compile` works, then re-run" — is
+**withdrawn**. It would not have told us anything, because the batching it would have produced is
+already being produced. The replacement ask is narrower and answerable by the NKI/compiler team:
+*why does each NKI custom call inside a single NEFF cost ~52 ms, and is that reducible?*
 
 ### A harness bug worth recording, because it would have produced a false finding
 
@@ -1205,16 +1266,19 @@ all three kernels in a model (51.6), the back-to-back experiment (51.85), and th
 
 ### What to do
 
-1. **Re-run this experiment on a stack where `torch.compile` works on Neuron.** The Native
-   PyTorch beta has a torch.compile path under active development; that is the right environment
-   for this question, not the inference DLAMI venv we have been using. This is the single
-   highest-value remaining experiment in the project.
-2. **Ask the NKI / torch-neuronx teams the direct question:** what is the supported way to call a
-   NKI kernel from inside a compiled graph, and is the per-invocation cost paid once at compile
-   time or per call? They may simply know, which would be faster than measuring.
-3. **Do not soften Finding #20 on the hope that compile fixes it.** As measured, on the stack a
-   customer would actually use today, eager per-layer NKI swapping is not performance-viable.
-   Whether a future path fixes it is a separate claim and should be labelled as one.
+1. **Do not spend effort on getting `torch.compile` working for this question.** Answered above:
+   the graph batching it would provide is already happening. (`torch.compile` is still worth
+   fixing for its own sake — see Finding #23 — just not as the route to this answer.)
+2. **Ask the NKI / compiler team the narrowed question:** why does each NKI custom call inside a
+   single NEFF cost ~52 ms independent of tile size, and is it reducible? Include the differential
+   that makes it sharp: 28 `torch_neuronx` XLA user computations in the same position cost 1.23 ms
+   total, while 28 NKI custom calls cost 1446 ms.
+3. **Profile one NEFF containing N NKI calls** to separate "per-custom-call scheduling overhead"
+   from "emitted barrier" from "real device time". This is now the only open technical question
+   behind Finding #20.
+4. **Do not soften Finding #20.** On the stack a customer would use today, eager per-layer NKI
+   swapping is not performance-viable, and the most plausible escape hatch has now been measured
+   and ruled out rather than left as an open hope.
 
 ## 22. Qwen3-MoE does not run on Neuron with transformers' default experts implementation [HIGH — customer-facing]
 
@@ -1285,3 +1349,82 @@ better-scoped piece of work than porting the expert matmul, and unlike the exper
 not blocked by Findings #17 or #18.
 
 Best MoE-related next step, and it is a genuinely new recommendation from this session.
+
+---
+
+## 23. `torch_neuronx`'s op overrides are not fake-tensor safe, which breaks `torch.compile` on essentially every transformer [HIGH — outside this project's scope, clear owner]
+
+Found while dismantling the original Finding #21. It is unrelated to NKI and to the Kernel Hub,
+but it is a concrete upstream bug with a one-line root cause and a large blast radius, so it is
+recorded here for routing rather than dropped.
+
+### The symptom
+
+```
+torch._dynamo.exc.TorchRuntimeError: Dynamo failed to run FX node with fake tensors:
+call_function <function silu ...>(*(FakeTensor(..., device='xla:0', size=(64, 64)),), **{}):
+got RuntimeError('Expected all tensors in the given list to be XLA tensors.
+Element at index 0 is not an XLA tensor. Got: XLAFloatType')
+```
+
+### It is not what it looks like
+
+`torch.compile` works fine on this stack. Measured with `scripts/diagnose_torch_compile.py`:
+
+| case | CPU tensors | XLA tensors |
+|------|-------------|-------------|
+| `add` | OK | OK |
+| `mul` | OK | OK |
+| `relu` | OK | OK |
+| `silu` | OK | **fails** |
+
+`torch` 2.9.1 / `torch_xla` 2.9.0 are a matched pair, and `openxla` is present in
+`torch._dynamo.list_backends()`. So this is per-op, not per-stack.
+
+### Root cause
+
+`torch_neuronx` replaces a set of ATen ops with hand-written XLA user computations. The dispatch
+predicate is in `torch_neuronx/xla_impl/base.py`:
+
+```python
+def wrapper(*args, **kwargs):
+    if any(is_xla_tensor(it) or is_xla_device(it)
+           for it in chain(args, kwargs.values())):
+        return custom_call_cls.apply(*args, **kwargs)   # -> _xla_user_computation
+    return func(*args, **kwargs)
+```
+
+A `FakeTensor` carrying `device='xla:0'` satisfies that predicate. It is routed into
+`torch_xla._XLAC._xla_user_computation`, which requires *real* XLA tensors and rejects it. There is
+no meta/abstract implementation for these overrides, so Dynamo cannot trace through them at all.
+
+The predicate needs to exclude fake/meta tensors (and the overrides need abstract impls) for these
+ops to be traceable.
+
+### Blast radius
+
+The overridden ops, from `torch_neuronx/xla_impl/ops.py`:
+
+`gelu`, `silu`, `randn`, `CrossEntropyLoss`, `Dropout`, `Embedding`, `clip_grad_norm_`, `argmax`,
+`Softmax`, `topk`, `upsample_nearest2d`
+
+That list contains `Embedding`, `Softmax` and `CrossEntropyLoss`. Every transformer forward
+contains an embedding and a softmax; every training step contains a loss. So `torch.compile` on a
+transformer on this stack will hit this on essentially any model, not as an edge case.
+
+This is consistent with, and may partly explain, the TTFI and torch.compile-coverage difficulties
+reported by other teams — though that connection is inference, not something measured here.
+
+### Workaround that does work
+
+`torch_xla.compile()` succeeds where `torch.compile(backend="openxla")` fails, because it wraps
+lazy-tensor execution with explicit graph boundaries instead of routing through Dynamo and fake
+tensors. Verified: `torch_xla.compile(f)` on `F.silu` returned the same value as eager
+(`sum = 902.0360` both ways).
+
+### Why it is in this document but not in the recommendation
+
+It is not a Kernel Hub issue, not a NKI issue, and fixing it would not change any performance
+result in this PoC (Finding #21 shows graph batching already happens and does not help). It is
+filed here so it can be routed to whoever owns `torch_neuronx`, with the reproducer in
+`scripts/diagnose_torch_compile.py`.
