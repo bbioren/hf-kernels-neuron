@@ -45,7 +45,8 @@ These are the primary references we used. Critically, they describe different la
 | 16 | **`nkilib` is already installed and its kernels are directly callable — thin-wrapper porting is feasible today** | **High** | Open (policy blocker only) |
 | 17 | Fused MLP: `kernelize()` has no weight-transformation hook | High | Open (design decision) — **premise partly corrected, see #17** |
 | 18 | **Fused MLP kernel cannot run single-core when `intermediate_size > 4096` — excludes every real model** | **High** | Open (nki-library bug; no wrapper workaround) |
-| 19 | Eager NKI dispatch costs ~0.36 ms host time per call (~25x eager); per-layer microbenchmarking can't resolve kernel quality | High | Open — Week 4 MFU is the right instrument |
+| 19 | Eager NKI *host* dispatch costs ~0.36 ms/call; per-layer microbenchmarking can't resolve kernel quality | Medium | Superseded in magnitude by #20 |
+| 20 | **Every `@nki.jit` invocation from eager PyTorch/XLA costs ~53 ms, independent of problem size. MFU 5.06% → 0.02%** | **Critical** | Open — decides the PoC; graph mode is the open question |
 
 ---
 
@@ -1024,3 +1025,125 @@ check for performance. Neither is standard practice, and both cost us a cycle.
   look like a kernel-quality problem when it is an integration-model problem.
 - Worth asking the HF kernels team whether per-call dispatch cost is a known concern for
   non-CUDA backends, and whether there is a batching or persistence mechanism.
+
+## 20. Every `@nki.jit` invocation from eager PyTorch/XLA costs ~53 ms, independent of problem size [CRITICAL — decides the PoC]
+
+**This is the finding the recommendation turns on.** The mechanism works and the kernels are
+correct, but in eager mode a per-layer NKI swap cannot be performance-competitive on this
+stack — not because of kernel quality, but because each invocation carries a fixed cost larger
+than an entire baseline forward pass.
+
+### The measurement
+
+Qwen3-0.6B (28 layers, full depth), seq 512, bf16, forward only, single logical NeuronCore:
+
+| Configuration | Step time | MFU (per logical core) | NKI calls/step |
+|---|---|---|---|
+| baseline, no kernels | **41.95 ms** | **5.06 %** | 0 |
+| NKI SiLU only | 1,495.54 ms | 0.14 % | 28 |
+| NKI RMSNorm + RoPE + SiLU | **8,753.65 ms** | **0.02 %** | 169 |
+
+Steady state, not a compile artifact: zero compilations during the timed loop, and step time
+stable to within 0.2% (IQR 8746–8764 ms).
+
+Per-call added cost: **51.9 ms** (SiLU only) and **51.6 ms** (all three). Uniform.
+
+### It is a fixed cost per call, not per unit of work
+
+`scripts/experiment_nki_graph_break.py`, single NKI SiLU call, output consumed:
+
+| rows | tiles | NKI | torch `F.silu` | ratio |
+|------|-------|-----|----------------|-------|
+| 128 | 1 | 54.57 ms | 0.250 ms | 218x |
+| 256 | 2 | 53.38 ms | 0.250 ms | 213x |
+| 512 | 4 | 52.72 ms | 0.269 ms | 196x |
+| 1024 | 8 | 53.52 ms | 0.588 ms | 91x |
+| 4096 | 32 | 53.86 ms | 0.304 ms | 177x |
+| 14336 | 112 | 53.75 ms | 0.501 ms | 107x |
+
+**52.7 – 54.6 ms across a 112x range in problem size.** Flat. The compute is negligible against
+the fixed cost — 14336×3072 bf16 in and out is ~176 MB of traffic, which at Trn2 HBM bandwidth
+is well under a millisecond.
+
+Additional structure, same script:
+
+| Variant | Result | Reading |
+|---|---|---|
+| A: 28 NKI calls back to back | 1451.8 ms (51.9 /call) | cost is per call |
+| B: 28 NKI calls, torch op between each | 1451–1478 ms (51.6 /call) | **interleaving is NOT the cause** — A ≈ B |
+| C: 28 torch `F.silu` calls | 0.76 ms (0.03 /call) | control |
+| D: 1 NKI call on 28x the data | 52.97 ms | one big call ≈ one small call |
+| E: 1 NKI call, base shape | 52.03 ms | **D/E = 1.02x for 28x the data** |
+
+A and B being equal rules out the graph-break-from-interleaving hypothesis: adjacent NKI calls
+are just as expensive as ones separated by framework ops. And note A contains a single
+`mark_step`, so the 28 × 52 ms is incurred *inside one graph execution* — it is device-side, not
+host-side synchronization.
+
+### It is not our kernels, and it is not host dispatch
+
+- **Not our kernels.** nki-library's production `rope_hf` shows the same ~52 ms per call in the
+  same run. All three kernels — two hand-written, one a production port — land on the same
+  number.
+- **Not host dispatch.** Finding #19 measured host-side enqueue at ~0.36 ms/call. That is 1/145
+  of this. Finding #19's conclusion was directionally right (eager NKI is invocation-bound) but
+  understated the magnitude by two orders of magnitude, because it measured only the host side.
+- **Not compilation.** Zero compiles during the timed loop.
+
+### This retroactively vindicates the validity gate
+
+`scripts/benchmark_kernels.py` earlier measured a single SiLU NKI call at ~0.78 ms and its
+validity gate **suppressed the result** because latency did not scale with problem size. That
+suppression was correct: the true figure is ~53 ms, and 0.78 ms was measuring an
+eliminated computation. Had the gate not been there, the PoC would have carried a number that
+was wrong by 68x — in the flattering direction.
+
+Worth recording as evidence the guard earns its keep, not just as a process note.
+
+### Why this happens, and the structural point
+
+The cost behaves like a fixed per-invocation charge for entering and leaving a NKI custom call
+from the framework graph — plausibly NEFF setup plus HBM round-tripping of inputs and outputs,
+though we have not profiled to attribute it precisely.
+
+The structural consequence matters more than the mechanism:
+
+**nki-library's kernels are designed as large fused megakernels, and the HF Kernel Hub's
+per-layer forward swap is the exact opposite shape.** A fused kernel amortizes the invocation
+cost across a whole transformer block; a per-layer swap pays it 6 times per layer. This is the
+same mismatch Findings #17 and #18 found from the weight-layout and sharding directions,
+now visible from the cost direction — and it is the most quantitative form of it.
+
+Arithmetic that makes the point: at ~53 ms per invocation, the *entire* 42 ms baseline forward
+pass is cheaper than one NKI call. So in eager mode, on this stack, **any** per-layer NKI swap
+loses, and swapping more layers loses harder. Even a perfectly fused one-call-per-layer kernel
+would cost 28 × 53 ms = 1.5 s/step against a 42 ms baseline.
+
+### What would change the answer
+
+1. **Graph mode / `torch.compile`.** All three kernels declare `can_torch_compile = False`. If
+   NKI kernels can be embedded in a compiled graph so the per-invocation cost is paid at compile
+   time rather than per call, the entire picture changes. **This is now the most important open
+   question in the project**, and it is more important than any remaining kernel work.
+2. **Confirmation that ~53 ms is not expected.** It is large enough to look like a
+   misconfiguration rather than a design point. Worth asking the NKI team directly: is this the
+   expected cost of invoking a NKI kernel from eager torch-xla on SDK 2.31 / NKI 0.5.0, or a
+   known issue? If it is expected, that is a strong statement about eager NKI in general, well
+   beyond this PoC.
+3. **One kernel per model, not per layer.** A single NKI call covering the whole forward would
+   amortize the cost — but that is a megakernel, i.e. not the Kernel Hub model at all.
+
+### What this does not invalidate
+
+Worth stating clearly, because the correctness work stands independently:
+
+- All three kernels are numerically correct, execution-verified, with negative controls.
+- The Kernel Hub interception mechanism works on Neuron: layer swap, function swap, graceful
+  fallback, 115 + 95 upstream registration points reachable.
+- Findings #9, #12, #14, #16 (device routing, dependency allowlist, version skew, thin-wrapper
+  feasibility) are all unaffected — they are about whether the mechanism can be *reached*, not
+  how fast it runs.
+
+The PoC's question was "should Neuron invest in first-class HF Kernel Hub support?" This finding
+does not answer no. It relocates the answer: **the eager per-layer path is not the one to
+invest in, and the compile path is now the question that matters.**
