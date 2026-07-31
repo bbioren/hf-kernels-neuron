@@ -66,10 +66,23 @@ Five findings, in order of how much they should change your plans:
    is opaque to the compiler, and each swap forces a HBM round-trip where the data previously stayed
    resident across a fused region. Finding #25.
 
-**Break-even is therefore unreachable for these ops, not merely distant.** The earlier version of
-this document derived break-even from dispatch cost alone — a kernel must save >0.59 ms/call, and
-these are 15–30x short. That understated it. Even at *zero* dispatch cost the device time is 2.5–2.7x
-worse, so no amount of plumbing work gets there.
+**But that 2.5–2.7x is a chained-microbenchmark upper bound, and in situ it is second-order.**
+Profiling the real Qwen3 forward and summing device time across the emitted NEFFs decomposes the
+100 ms wall gap:
+
+| term | value | share |
+|---|---|---|
+| device gap (14.329 → 22.722 ms) | 8.392 ms | **8.4%** |
+| dispatch gap | 91.608 ms | **91.6%** |
+
+Per NKI call: device 0.0497 ms, dispatch 0.5421 ms — dispatch is ~11x larger. So the fusion penalty is
+real (1.59x device time, 1.42x HBM traffic) and it is not what dominates. With dispatch removed the
+model would run at roughly 55 ms against a 46.65 ms baseline: **~1.18x slower, not 3.4x.**
+
+**Break-even is therefore close but not reached**, rather than unreachable. An earlier version of this
+document said these ops "cannot win" on the strength of the microbenchmark. That over-claimed. What is
+true: with perfect dispatch they are ~18% underwater, and closing that last 18% needs the kernels to
+beat torch on device, which the fusion barrier prevents.
 
 The uncomfortable corollary: **the ops the Kernel Hub is best at intercepting are the ops that lose
 most from being intercepted.** RMSNorm has 115 upstream registrations, RoPE covers 95 model files, one
@@ -85,11 +98,11 @@ So the recommended investment is:
 | Priority | Investment | Cost | Why |
 |---|---|---|---|
 | 1 | **Cache `_detect_target()`** in `nki/compiler/target.py` | one decorator | 102x per call, verified accuracy-neutral. Benefits all eager NKI usage, not just this integration. Correct regardless of everything below. |
-| 2 | **Ask the compiler team whether fusion across a NKI custom call is achievable** | a question | Finding #25 is the binding constraint. If a NKI kernel could be made transparent to the fusion pass, or could declare itself fusable, the whole picture changes. Worth asking before treating it as fundamental. |
-| 3 | **A NKI kernel for MoE routing** (`sort`/`histc`) | small | Unblocks Qwen3-MoE on Neuron *entirely* — it does not run at all today with the default experts implementation. Blocked by none of our findings, and enabling a model beats speeding one up. |
-| 4 | **Four small upstream fixes** (device routing, `_backend()`, `nkilib` allowlist, weight-layout contract) | ~a week, three teams | Each smaller than one kernel port. Together they make the mechanism reachable and honest. Worth doing for correctness even if performance never arrives. |
-| 5 | **Scope caching the per-call XLA computation build** (`create_computation` + pyhlo scribe) | unknown | The remaining 0.59 ms/call. Demoted from item 2 in the previous version: #25 shows it is no longer decisive, because closing it still leaves a 2.5–2.7x device deficit. |
-| 6 | Kernel porting at per-layer granularity for small memory-bound ops | — | **Don't.** Not "defer" — these cannot win. Re-scope the queue around fusion span rather than op popularity. |
+| 2 | **Cache the per-call XLA computation build** (`create_computation` + pyhlo scribe) | unknown, needs scoping | **91.6% of the remaining model-level regression is dispatch**, and this is it. Closing it takes the kernels from 3.4x slower to ~1.18x. The largest available improvement. |
+| 3 | **Ask the compiler team whether fusion across a NKI custom call is achievable** | a question | What stands between ~1.18x and a genuine win. Second question, not the first — the fusion penalty is 8.4% of the regression in situ, not the 2.5–2.7x a chained microbenchmark suggests. |
+| 4 | **A NKI kernel for MoE routing** (`sort`/`histc`) | small | Unblocks Qwen3-MoE on Neuron *entirely* — it does not run at all today with the default experts implementation. Blocked by none of our findings, and enabling a model beats speeding one up. |
+| 5 | **Four small upstream fixes** (device routing, `_backend()`, `nkilib` allowlist, weight-layout contract) | ~a week, three teams | Each smaller than one kernel port. Together they make the mechanism reachable and honest. Worth doing for correctness even if performance never arrives. |
+| 6 | Kernel porting at per-layer granularity for small memory-bound ops | — | **Defer** until item 2 lands, then re-evaluate. Even with perfect dispatch these are ~18% underwater, so they are not wins — but that is a different statement from the "cannot win" an earlier version of this table made. Re-scope the queue around fusion span rather than op popularity. |
 
 The previous version of this document made item 1 "answer the graph-mode question — can a NKI kernel
 live in a compiled graph with invocation cost paid once?" **That question is now answered, and it
@@ -99,26 +112,33 @@ because the cost was on the host before `mark_step`. That ask is withdrawn.
 
 ### What would change this recommendation
 
-**One thing, and it is item 2.** If NKI custom calls could participate in compiler fusion — made
-transparent to the fusion pass, or able to declare themselves fusable — then Finding #25 dissolves,
-break-even becomes reachable, and item 5 goes back to being decisive. That is the single question
-worth asking before accepting the negative half of this recommendation.
+**Item 2 changes the magnitude; item 2b changes the sign.** Caching `create_computation` takes the
+kernels from 3.4x slower to roughly 1.18x — a large improvement that still leaves them behind. Making
+NKI custom calls fusable would close the remaining ~18% and could make them a win. Item 2 is worth
+doing on its own; item 2b decides whether "worth doing" ever becomes "worth adopting".
 
-Two things that would *not* change it, stated because they were previously believed to:
+One thing that would *not* change it, stated because it was previously believed to:
 
 - **Graph mode.** Answered and withdrawn. 28 NKI calls already fuse into one HLO graph and one device
   execution and still cost 28x, because the cost was on the host before `mark_step`.
-- **Fixing all the dispatch overhead.** Necessary, and insufficient. The device deficit survives it.
 
-### One thing this PoC did not measure, and should have
+### What is measured, and at what confidence
 
-The 2.5–2.7x device figures come from a **chained** microbenchmark — 28 identical ops back to back —
-which is the best possible case for the compiler's fusion and therefore the worst case for NKI. In a
-real model these ops are separated by matmuls, so less fusion is available and the in-situ penalty is
-smaller. It is not zero: Qwen3's SiLU sits between the `gate * up` elementwise multiply and the down
-projection, exactly the neighbour it would otherwise fuse with. But the magnitude in a real forward
-pass was not isolated, and it should be before anyone acts on the size of the number rather than its
-direction.
+Worth separating, because this document has revised its headline three times and the revisions all came
+from measuring something previously assumed:
+
+| claim | basis | confidence |
+|---|---|---|
+| ~52 ms/call from an uncached `neuron-ls` subprocess | source read + cProfile + two verified fixes with controls | **high** |
+| Fix takes MFU 0.02% → 1.50% | direct measurement, IQRs non-overlapping | **high** |
+| Residual ~0.59 ms/call is dispatch, in `create_computation` | cProfile attribution | **high** — but *whether it is cacheable* is unknown |
+| Dispatch is 91.6% of the remaining regression; fusion 8.4% | in-situ device profile, summed across NEFFs | **high** |
+| Kernels are optimal (marginal traffic 1.00x the unfused floor) | two-point traffic regression | **high** |
+| NKI 2.5–2.7x slower on device | chained microbenchmark | **narrow** — upper bound, not representative |
+| With perfect dispatch the model lands ~1.18x slower | arithmetic on the decomposition above | **projection**, not measured |
+| Whether a kernel spanning a fused region beats the compiler | — | **unmeasured**, blocked by #17/#18 |
+
+The last two are the ones a reader should push on.
 
 ---
 
@@ -530,8 +550,8 @@ built after the previous one fired.
 | # | Ask | Owner | Size | Status |
 |---|-----|-------|------|--------|
 | 1 | **Cache `_detect_target()`** — it forks `neuron-ls` on every kernel invocation, ~52 ms, outside the compile cache | NKI | one decorator | **102x verified, accuracy-neutral** |
-| 2 | **Can a NKI custom call participate in compiler fusion?** Today it is opaque, so each swap costs a HBM round-trip the compiler would otherwise elide | NKI / compiler | a question | **now the binding constraint (#25)** |
-| 2b | Scope caching the per-call XLA computation build (`create_computation` + pyhlo scribe, ~0.59 ms/call) | NKI / torch-neuronx | unknown | demoted: closing it still leaves a 2.5–2.7x device deficit |
+| 2 | **Cache the per-call XLA computation build** (`create_computation` + pyhlo scribe, ~0.59 ms/call) | NKI / torch-neuronx | unknown | **91.6% of the remaining regression. Takes 3.4x slower to ~1.18x** |
+| 2b | Can a NKI custom call participate in compiler fusion? Today it is opaque, so each swap costs a HBM round-trip the compiler would otherwise elide | NKI / compiler | a question | what stands between ~1.18x and a genuine win. 8.4% of the regression in situ (#25) |
 | 3 | Route XLA-on-Neuron to `Device(type="neuron")` (3 sites) | transformers + `kernels` | ~12 lines | **fix verified sufficient** |
 | 4 | Set `torch.neuron` so `_backend()` reports neuron | `torch_neuronx` | 1 line | unblocks two things |
 | 5 | Add `nkilib` to `python_depends.json` under `neuron` | HF `kernels` | ~6 lines | `nki` is precedent |
@@ -545,21 +565,25 @@ Full detail with exact code locations and ready-to-paste patches in `docs/upstre
 
 **Sequencing matters.** Item 1 is the highest ratio of value to effort in this document and is
 independent of everything else — it benefits any eager NKI usage, not just the Kernel Hub. **Item 2 is
-now the question that decides whether this integration can ever be a performance win**, and it is a
-question rather than an experiment, so it is cheap. Items 3, 4, 5, 9 and 10 are worth doing regardless,
-because they concern correctness, reachability and documentation rather than performance. Item 6 is
-unrelated to this integration and is filed because we found it.
+the largest available improvement**: 91.6% of the remaining model-level regression is dispatch, and
+closing it takes the kernels from 3.4x slower to ~1.18x. **Item 2b is the question that decides whether
+this can become a genuine win** rather than approach parity, and it is a question rather than an
+experiment, so it is cheap. Items 3, 4, 5, 9 and 10 are worth doing regardless — correctness,
+reachability and documentation rather than performance. Item 6 is unrelated to this integration and is
+filed because we found it.
 
-Items 7 and 8 (the fused-kernel enablers) are gated on item 2 in one direction only: if fusion across
+Items 7 and 8 (the fused-kernel enablers) are gated on item 2b in one direction only: if fusion across
 custom calls is impossible, then a fused kernel spanning a whole region becomes *more* important, not
-less, because it is the only way to get the fusion done at all. So item 2 changes the shape of the
+less, because it is the only way to get the fusion done at all. So item 2b changes the shape of the
 answer rather than whether to act.
 
-**Two asks from earlier versions of this table have been withdrawn.** "Answer the graph-mode
-question" — answered and wrong; 28 NKI calls already share one HLO graph and one device execution and
-still cost 28x. And item 2's predecessor, "cache the XLA computation build", was listed as the
-difference between 3.4x slower and near parity; Finding #25 shows that closing it still leaves a
-2.5–2.7x device deficit, so it is no longer decisive.
+**This table has been reordered twice and the history is instructive.** The original top ask was
+"answer the graph-mode question" — withdrawn, because 28 NKI calls already share one HLO graph and one
+device execution and still cost 28x. Then item 2 was demoted below the fusion question on the strength
+of Finding #25's 2.5–2.7x device gap. Measuring that gap *in situ* rather than in a chained
+microbenchmark put it back: the fusion penalty is 8.4% of the regression, dispatch is 91.6%. The
+lesson, recorded in the methodological section, is that a caveat written into a finding is not the same
+as a caveat honoured in the conclusion drawn from it.
 
 ---
 
@@ -649,42 +673,61 @@ swapped three kernels into two model architectures with matching logits and no m
 Neither the kernel quality nor the integration design caused the regression we spent most of this
 project measuring.
 
-The third answer, and where it rests: **even with dispatch free, these kernels lose on device.** NKI
-SiLU is 2.71x slower than torch SiLU and NKI RMSNorm 2.55x, measured with dispatch excluded. The
-kernels are not at fault — their marginal memory traffic is exactly the theoretical floor for an op
-that cannot fuse. The compiler simply cannot fuse across a NKI custom call, so each swap forces a HBM
-round-trip where the data previously stayed resident across a fused region. For memory-bound ops,
-fusion is the whole optimisation, so the swap is competing against not touching memory at all.
+The third answer is that **there is a second, smaller structural cost underneath the dispatch cost, and
+it does not go away.** A NKI kernel arrives as an opaque custom call, so the compiler cannot fuse across
+it. Each swap forces a HBM round-trip where the data previously stayed resident across a fused region.
+The kernels themselves are blameless — their marginal memory traffic is *exactly* the theoretical floor
+for an op that cannot fuse — but for memory-bound ops fusion is the whole optimisation, so a swapped
+kernel is competing against not touching memory at all.
 
-That makes break-even **unreachable** for these ops rather than distant, and it is the one conclusion
-in this document that no amount of plumbing work changes.
+**In a chained microbenchmark that is 2.5–2.7x. In a real forward pass it is 8.4% of the regression,
+against 91.6% dispatch.** Both numbers are correct and they measure different things; quoting the first
+without the second would misrepresent the result, and an earlier version of this document did exactly
+that. With dispatch fixed, these kernels land around **1.18x slower** than the ops they replace — close
+to parity, not at it, and the remaining gap is the fusion cost.
 
-It also explains the shape of the project in a way none of the earlier framings did. **The ops the
-Kernel Hub is best at intercepting are the ops that lose most from being intercepted.** RMSNorm has
-115 upstream registrations, RoPE covers 95 model files, one decoration covers every `ACT2FN`
-activation — and all three are small, memory-bound, and already fused. Reach and usefulness are
-inversely correlated here, which is why the mechanism looked so promising for four weeks and then
-didn't.
+So the honest summary is: **the mechanism works, the kernels are correct and efficient, one framework
+bug accounts for most of the regression, and a smaller structural cost keeps them just short of parity.**
+That is a much more ordinary answer than either "208x slower, structurally" or "these ops cannot win",
+and it is what the measurements support.
 
-**The single most valuable next step is still item 1 — cache `_detect_target()`.** One decorator,
-verified, 102x per call for every eager NKI user on the platform, and correct regardless of everything
-else. **The most valuable next question is item 2:** can a NKI custom call participate in compiler
-fusion? If yes, Finding #25 dissolves and this integration becomes a good bet. If no, then per-layer
-swapping of small ops is closed, and the only viable shape is a kernel spanning a whole fused region —
-which is what `nki-library` already ships, and what Findings #17 and #18 say the Kernel Hub cannot yet
-express.
+One thing that survives all three revisions, and is worth stating on its own: **the ops the Kernel Hub
+is best at intercepting are the ops with the least to gain from it.** RMSNorm has 115 upstream
+registrations, RoPE covers 95 model files, one decoration covers every `ACT2FN` activation — and all
+three are small, memory-bound, and already being fused by the backend compiler. Reach and benefit are
+inversely correlated here. That is not a reason to abandon the mechanism; it is a reason to point it at
+different ops.
+
+**The single most valuable next step is item 1 — cache `_detect_target()`.** One decorator, verified,
+102x per call for every eager NKI user on the platform, and correct regardless of everything else.
+**The largest remaining improvement is item 2**, caching the per-call XLA computation build, worth
+roughly 3.4x → 1.18x. **The question that decides whether this becomes a win rather than approaching
+parity is item 2b:** can a NKI custom call participate in compiler fusion? If yes, the last 18% is
+recoverable. If no, per-layer swapping of small memory-bound ops tops out just below parity, and the
+only shape that wins is a kernel spanning a whole fused region — which is what `nki-library` already
+ships, and what Findings #17 and #18 say the Kernel Hub cannot yet express.
 
 One closing note on process, since it changed the answer more than any single measurement did. This
-document has stated three different explanations for the same slowdown, and the measurements behind
-all three were correct every time. The framing was what kept being wrong.
+document has stated **four** different headlines for the same slowdown, and the measurements behind all
+four were correct every time. The framing was what kept being wrong.
 
-First it was "graph-transition cost, structurally unavoidable" — overturned by asking how much of the
-wall time was actually on the device (0.04%). Then it was "an uncached subprocess, and fixing it plus
-the residual gets us to parity" — overturned by asking whether the kernels beat the ops they replace
-on device (they don't, by 2.5–2.7x). Each correction came from a question the previous round of
-experiments structurally could not answer, not from a better version of the same experiment.
+1. "Graph-transition cost, structurally unavoidable." Overturned by asking how much of the wall time was
+   actually on the device: 0.04%.
+2. "An uncached subprocess; fixing it plus the residual gets us to parity." Overturned by asking whether
+   the kernels beat the ops they replace on device: they don't.
+3. "The fusion barrier makes these ops unwinnable." Overturned by asking how large the fusion penalty is
+   *in situ* rather than in a chained microbenchmark: 8.4% of the regression, not the whole story.
+4. Current: one framework bug accounts for ~92% of the regression, a fusion cost accounts for ~8%, and
+   with both addressed the kernels land near parity.
 
-The practice worth taking from this: when a performance story doesn't close, the next move is a
-different *kind* of measurement, not another variant of the current one. And the specific instrument
-that resolved two of the three rounds is cheap enough to make routine — compare device time against
-wall time, and vary N before dividing by N.
+Each correction came from a question the previous round of experiments structurally could not answer,
+not from a better version of the same experiment. Two practices are worth taking from that, and one
+warning:
+
+- **When a performance story doesn't close, change the kind of measurement, not the variant.**
+- **Compare device time against wall time early, and vary N before dividing by N.** Both are cheap and
+  each resolved one of the four rounds.
+- **A caveat written into a finding is not a caveat honoured in the conclusion.** Round 3's
+  representativeness limitation was written down explicitly, in the same document, before the
+  recommendation was drafted — and the recommendation was then written as though it did not exist.
+  Either measure the thing the caveat is about, or let it constrain the claim.

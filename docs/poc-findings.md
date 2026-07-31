@@ -1749,13 +1749,64 @@ directions:
 | #24 | dispatch cost | per-call overhead, ~0.59 ms after the big fix |
 | **#25** | **compiler fusion** | **per-layer swap destroys the fusion that makes small ops fast** |
 
+### MEASURED IN SITU — the penalty is real but second-order, and this section's framing over-claimed
+
+The limitation flagged below ("the magnitude in situ was not measured") has since been measured, and
+it changes how much weight this finding should carry. `scripts/profile_model_device_time.py` profiles
+the real Qwen3-0.6B forward with `NEURON_RT_INSPECT`, and `scripts/sum_model_device_time.py` sums
+device time across the emitted NEFFs to decompose the wall-clock gap:
+
+```
+wall_k - wall_b  =  (device_k - device_b)  +  (dispatch_k - dispatch_b)
+```
+
+| | NEFFs | device time | HBM traffic | activates |
+|---|---|---|---|---|
+| baseline | 1 | 14.329 ms | 2662.4 MB | 8,038 |
+| kernelized | 1 | 22.722 ms | 3779.9 MB | 16,468 |
+
+| term | value | share of wall gap |
+|------|-------|-------------------|
+| wall gap (46.65 → 146.65 ms, profiled run) | 100.00 ms | 100% |
+| **device gap** | **8.392 ms** | **8.4%** |
+| **dispatch gap** | **91.608 ms** | **91.6%** |
+
+Per NKI call, at 169 calls/step: **device 0.0497 ms, dispatch 0.5421 ms.** Dispatch is ~11x larger.
+
+So the fusion barrier is real in situ — device time rises 1.59x and HBM traffic 1.42x — but it is
+**second-order**. The 2.5–2.7x figure holds only where 28 identical ops sit back to back, which is
+simultaneously the compiler's best case and NKI's worst. In a real model these ops are separated by
+matmuls, and most of the device work is matmul regardless.
+
+**This reverses the ranking in "What to do" below and in the PoC recommendation.** With dispatch
+removed, the model would run at roughly `46.65 + 8.39 = 55 ms` against a 46.65 ms baseline — about
+**1.18x slower, not 3.4x**. So caching `create_computation` is decisive after all, and the fusion
+question is important but not the binding constraint at model scale.
+
+Break-even is therefore **close but not reached**, rather than unreachable: ~1.18x with perfect
+dispatch, and closing the last 18% would require the kernels to beat torch on device, which the fusion
+barrier prevents. That is a materially weaker claim than "these ops cannot win", and it is the correct
+one.
+
+**The methodological failure here is worth naming, because it is subtle.** The caveat immediately below
+was written *before* the recommendation was drafted, and the recommendation was then written as though
+it did not exist — treating the microbenchmark number as the operative one and demoting the dispatch fix
+on its strength. **A caveat in the text is not a caveat in the conclusion.** Either measure the thing
+the caveat is about, or let the caveat constrain what you claim.
+
+Caveats on the in-situ numbers themselves: HBM traffic in the model includes weights, so the 1.42x
+ratio dilutes the activation-only effect and should not be read as the fusion penalty directly. And
+wall times here (46.65 / 146.65) come from the profiled run rather than `measure_mfu` (42.04 / 141.43),
+since `NEURON_RT_INSPECT` adds a few ms; the decomposition uses one consistent pair throughout.
+
 ### Honest limits of this measurement
 
 - **The chained microbenchmark maximises the fusion advantage.** 28 identical ops back to back is the
   best possible case for the compiler. In a real model these ops are separated by matmuls, so less
   fusion is available and the real penalty is smaller than 2.7x. It is not zero — Qwen3's SiLU sits
   between the `gate * up` elementwise multiply and the down projection, which is exactly the kind of
-  neighbour it would otherwise fuse with — but the magnitude in situ was not measured.
+  neighbour it would otherwise fuse with — but the magnitude in situ was not measured. **(Now measured;
+  see above. It is 8.4% of the regression.)**
 - **N=1 numbers are unreliable for traffic attribution**, since fixed NEFF traffic dominates. The
   regression above is the right instrument; the raw N=1 per-call division is the wrong one, and it is
   what produced the false spilled-intermediate reading.
@@ -1766,16 +1817,22 @@ directions:
   That is the experiment that would confirm the positive half of the recommendation, and it is
   blocked by #17 and #18.
 
-### What to do
+### What to do — reordered after the in-situ measurement
 
-1. **Stop treating RMSNorm, RoPE and activations as performance targets on this mechanism.** They are
-   excellent *mechanism* demonstrations — small, single-op, no weight-layout issues, no sharding — and
-   they cannot be wins. Those are different goals and the PoC conflated them for weeks.
-2. **Re-scope the porting queue around fusion span, not op popularity.** The question for a candidate
-   kernel is "does this replace a region the compiler would otherwise fuse, and does it do that
-   fusion better?" — not "how many models call this op?"
-3. **Ask the compiler team whether fusion across NKI custom calls is achievable at all.** If a NKI
-   kernel could be made transparent to the fusion pass, or could declare itself fusable, that would
-   change this finding. Worth asking before concluding it is fundamental.
-4. **Keep Fix 0 and Fix 7 anyway.** They are correct regardless, they benefit all eager NKI usage, and
-   #25 does not depend on them.
+1. **Fix 7 (cache `create_computation`) is the decisive one.** 91.6% of the model-level regression is
+   dispatch, and closing it takes the kernels from 3.4x slower to roughly 1.18x. That is the single
+   largest available improvement, and this finding does not change that.
+2. **Ask the compiler team whether fusion across NKI custom calls is achievable.** Still worth asking —
+   it is what stands between ~1.18x and a genuine win — but it is the second question, not the first.
+   If a NKI kernel could be made transparent to the fusion pass, or could declare itself fusable, this
+   finding dissolves.
+3. **Re-scope the porting queue around fusion span, not op popularity.** The question for a candidate
+   is "does this replace a region the compiler would otherwise fuse, and does it do that fusion
+   better?" — not "how many models call this op?" This holds regardless of the magnitude above.
+4. **Keep treating RMSNorm, RoPE and activations as mechanism demonstrations rather than performance
+   targets.** They are excellent at the former — small, single-op, no weight-layout issues, no
+   sharding. Even with perfect dispatch they are ~18% underwater, so they are not wins. Those are
+   different goals and this PoC conflated them for weeks.
+5. **Do not quote the 2.5–2.7x figure without its context.** It is a chained-microbenchmark upper bound.
+   The in-situ number is 8.4% of the regression, and the two will be confused if the first is stated
+   alone.

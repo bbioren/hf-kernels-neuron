@@ -84,8 +84,9 @@ Denominator: 632 TFLOPS/device TensorEngine ÷ 2 for LNC2 = 316 TFLOPS. Verified
 similarity identical to six decimals across all variants. **Not Kernel Hub specific** — any eager
 per-layer NKI use pays this today.
 
-**But the kernels cannot win even with dispatch free**, and that is the real headline. Measured on
-device with dispatch excluded (Finding #25):
+**A second, smaller structural cost sits underneath it.** A NKI kernel arrives as an opaque custom call,
+so the compiler cannot fuse across it, and each swap forces a HBM round-trip where the data previously
+stayed resident. In a chained microbenchmark that is 2.5–2.7x on device (Finding #25):
 
 | | device ms (N=28) | HBM traffic | marginal traffic/call | MBU |
 |---|---|---|---|---|
@@ -96,40 +97,54 @@ device with dispatch excluded (Finding #25):
 
 The kernels are *optimal* — marginal traffic is exactly one read in and one write out, the minimum
 for an op that cannot fuse. Torch's traffic is independent of N, which is only possible if the chain
-fused into one pass. So the 2.5–2.7x gap is entirely the **fusion barrier**: a NKI custom call is
-opaque to the compiler, and each swap forces a HBM round-trip where the data previously stayed
-resident across a fused region.
+fused into one pass. So the gap is the fusion the swap prevents, not the kernel.
 
-For memory-bound ops, fusion *is* the optimisation, so a NKI kernel is competing against not touching
-memory at all. **Break-even is unreachable for these ops, not merely distant.** The uncomfortable
-corollary: the ops the Kernel Hub is best at intercepting — RMSNorm (115 registrations), RoPE (95
-model files), all of `ACT2FN` via one decoration — are precisely the ops that lose most from being
-intercepted.
+**But that is a chained-microbenchmark upper bound. In a real forward pass it is second-order.**
+Profiling the model and summing device time across NEFFs decomposes the 100 ms wall gap:
+
+| term | value | share |
+|---|---|---|
+| device gap (14.329 → 22.722 ms) | 8.392 ms | **8.4%** |
+| dispatch gap | 91.608 ms | **91.6%** |
+
+Per NKI call: device 0.0497 ms vs dispatch 0.5421 ms. So **caching the per-call XLA computation build is
+the largest available improvement** — it would take the kernels from 3.4x slower to roughly **1.18x** —
+and the fusion cost is what keeps the last ~18%.
+
+One thing that holds regardless: **the ops the Kernel Hub is best at intercepting have the least to gain
+from it.** RMSNorm (115 registrations), RoPE (95 model files), all of `ACT2FN` via one decoration — all
+small, memory-bound, already fused by the backend compiler. Reach and benefit are inversely correlated,
+which is a reason to point the mechanism at different ops rather than to abandon it.
 
 ### Known blockers
 
 | Blocker | Effect |
 |---|---|
-| **Compiler cannot fuse across a NKI custom call (#25)** | **2.5–2.7x on device for memory-bound ops, independent of dispatch cost and of kernel quality. The binding constraint — no plumbing work fixes it.** |
-| **`_detect_target()` forks `neuron-ls` per invocation (#24)** | **~52 ms/call. One decorator fixes it; 102x verified. Highest value-to-effort item, and correct regardless of #25.** |
-| `create_computation` rebuilt per invocation (#24) | ~0.59 ms/call residual. Attributed, not fixed. Demoted by #25 — closing it still leaves the device deficit. |
+| **`_detect_target()` forks `neuron-ls` per invocation (#24)** | **~52 ms/call. One decorator fixes it; 102x verified. Highest value-to-effort item in the project.** |
+| **`create_computation` rebuilt per invocation (#24)** | **~0.59 ms/call, and 91.6% of the remaining regression. Closing it takes 3.4x slower to ~1.18x. Attributed, not fixed — cacheability unknown.** |
+| Compiler cannot fuse across a NKI custom call (#25) | 2.5–2.7x on device in a chained microbenchmark; **8.4% of the regression in situ**. What keeps the last ~18% once dispatch is fixed. Independent of kernel quality. |
 | `use_kernels=True` can't reach `"neuron"` (#9) | silent no-op. Use `kernelize_for_neuron()`; a verified ~3-line upstream fix is in `scripts/neuron_kernel_registration.py` |
 | `torch_neuronx` op overrides aren't fake-tensor safe (#23) | breaks `torch.compile` on nearly any transformer (`Embedding`, `Softmax`, `CrossEntropyLoss`, …). `torch_xla.compile()` works around it. Unrelated to this integration. |
 | Fused MLP won't compile single-core above `intermediate_size` 4096 (#18) | excludes every real model |
 | Qwen3-MoE needs `experts_implementation="batched_mm"` (#22) | undocumented; default fails with an unsupported `sort` HLO |
 
-Retracted, so none of it gets quoted. Earlier versions of this README said, in order: that the
-slowdown was structural graph-transition cost; that `torch.compile` is broken on this stack; that the
-decisive open question was whether graph mode amortises the cost; and that fixing the dispatch
-residual was the difference between 3.4x slower and near parity. All four are wrong.
-`torch.compile` works for ops `torch_neuronx` hasn't overridden (#23). Graph mode was never the
-lever — 28 NKI calls already fuse into one HLO graph and one device execution and still cost 28x.
-And the dispatch residual is no longer decisive, because #25 shows a 2.5–2.7x device deficit survives
-closing it.
+Retracted, so none of it gets quoted. Earlier versions of this README said, in order:
 
-The one question that would change the conclusion: **can a NKI custom call participate in compiler
-fusion?** If yes, #25 dissolves. If no, per-layer swapping of small memory-bound ops is closed on
-merit.
+1. the slowdown was structural graph-transition cost — **no**, it was a subprocess on the host;
+2. `torch.compile` is broken on this stack — **no**, it works for ops `torch_neuronx` hasn't overridden
+   (#23);
+3. the decisive question was whether graph mode amortises the cost — **no**, 28 NKI calls already fuse
+   into one HLO graph and one device execution and still cost 28x;
+4. these kernels cannot win because of a 2.5–2.7x device deficit — **overstated**, that is a chained
+   microbenchmark upper bound; in situ the fusion penalty is 8.4% of the regression and dispatch is
+   91.6%.
+
+Each correction came from measuring something the previous round had assumed. Full history in
+`deliverables/poc-document.md`.
+
+The question that decides whether this becomes a win rather than approaching parity: **can a NKI custom
+call participate in compiler fusion?** If yes, the last ~18% is recoverable. If no, per-layer swapping of
+small memory-bound ops tops out just below parity.
 
 All findings with severity: [`docs/poc-findings.md`](docs/poc-findings.md).
 Upstream asks with patches: [`docs/upstream-fixes.md`](docs/upstream-fixes.md).
