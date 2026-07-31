@@ -1,77 +1,92 @@
-# Draft check-in for John (internship mentor) — end of Week 3
+# Draft check-in for John (internship mentor) — Weeks 3-6
 
 **Status: DRAFT, NOT SENT.** Review before sending.
 
-John wrote the project guide and the week-by-week schedule, so this is framed as a status
-check-in plus the places his plan needs to change — not as a list of bugs to route. The asks are
-decisions that are genuinely his: what Week 4 should be, whether Week 5 becomes a gap analysis,
-and whether I reach out to Samir directly or he introduces.
+**UPDATED after Weeks 4-6 completed.** The earlier version of this draft asked John to decide
+what Week 4 should be and whether Week 5 should become a gap analysis. Both have since been
+done, and the Week 4 MFU measurement **changed the project's conclusion**, so the message is
+rewritten around that rather than around scheduling questions.
+
+The short version now leads with the finding, because it is the kind of result a mentor needs to
+hear before it reaches the kernels team, not after.
+
+---
+
+## The one thing to read first
+
+MFU with the NKI kernels is **0.02% against a 5.06% baseline — 208x slower.** Root cause: every
+`@nki.jit` invocation from eager PyTorch/XLA costs ~53 ms of fixed overhead regardless of
+problem size, which is more than the entire 42 ms baseline forward pass. It is an
+integration-model result, not a kernel-quality one: the Kernel Hub wants many small kernel
+invocations, NKI charges ~53 ms each, and nki-library's kernels are built as few large ones.
+
+The kernels themselves are correct — verified on two model architectures. But the eager
+per-layer path cannot be made fast, and the decisive follow-up question (does graph mode
+amortize the cost?) could not be answered because `torch.compile` doesn't work on this stack.
 
 ---
 
 ## Short version (Slack)
 
-> Hi John — Week 3 wrap-up, and I need your call on a couple of schedule things.
+> Hi John — big update, and the headline isn't what I expected going in.
 >
-> **Where it stands vs your plan.** Weeks 1-3 done, and Week 4's SiLU kernel landed early, so
-> three NKI kernels (RMSNorm, RoPE, SiLU) now swap into a stock Qwen3 and run on trn2 with
-> logits matching at cos_sim 1.000001. RoPE is a real port of nki-library's production
-> `rope_hf`, not a tutorial derivative. Accuracy suites: 11/11, 20/20 (+6/6 guard cases), 9/9,
-> all with NKI execution asserted rather than assumed.
+> **The kernels work and they're 208x slower.** MFU 0.02% vs a 5.06% baseline on Qwen3-0.6B at
+> full depth. I chased the cause rather than just reporting the number: **every `@nki.jit`
+> invocation from eager PyTorch/XLA costs ~53 ms of fixed overhead, independent of problem
+> size.** Flat across a 112x range in input size, reproduced four times within 1%. That's more
+> than the entire 42 ms baseline forward pass, so at 169 kernel calls per step nothing else
+> matters. Ruled out interleaving, host dispatch, my kernels (nki-library's production `rope_hf`
+> shows the same figure), recompilation, and sync artifacts.
 >
-> **One Week 3 goal I couldn't hit, and it's not mine to fix.** "Confirm `use_kernels=True`
-> alone triggers the swaps" is impossible today — transformers derives the device from
-> `model.device.type`, which on Neuron is `"cpu"` or `"xla"`, never `"neuron"`, and because it
-> passes a `Device` object rather than a string it skips validation entirely. So it's a silent
-> no-op: `kernelize()` returns success with every layer untouched. I found the minimal fix
-> (~3 lines in transformers) and verified it's sufficient — applied in-process it takes Qwen3
-> from 0 to 9 swapped layers. So the goal is met in substance, just not through the intended
-> entry point.
+> It's an integration-model result, not a kernel-quality one. The Kernel Hub wants many small
+> kernel invocations; NKI charges ~53 ms each; nki-library's kernels are designed as a few large
+> fused megakernels. Those three facts are in direct tension and kernel quality doesn't resolve
+> them. Notably three separate findings now converge on that same mismatch — weight layout,
+> single-core width limits, and now invocation cost.
 >
-> **Three things that change your schedule, and I'd rather you decide than me:**
+> **The one escape, and I couldn't test it.** If that ~53 ms is a per-invocation framework
+> boundary cost, graph mode should amortize it — kernels become part of one compiled graph
+> entered once per step instead of 169 times. That would change the recommendation completely.
+> But `torch.compile` doesn't work on this stack *at all* — plain `F.silu` with no NKI anywhere
+> fails across openxla/inductor/eager in both dtypes. So a NKI failure would be
+> indistinguishable from compile being broken generally, and I refused to record a NKI result
+> from it.
 >
-> *1. Week 5 (Qwen3-MoE) is gated.* I ran the MLP spike early to derisk it and found the fused
-> MLP kernel can't run single-core above `intermediate_size = 4096` — sharp boundary, 10 configs,
-> fails inside its own tile arithmetic with a divide-by-zero. That excludes Qwen3-8B (12288),
-> Llama-3-8B and Mistral-7B (14336). MoE kernels are fused the same way and will likely hit
-> related issues, plus there's an unresolved design question about weight layouts that HF would
-> need to answer. **Is a gap analysis an acceptable Week 5 outcome, or do you want me to push
-> for an implementation?** I think the gap analysis is genuinely the more useful artifact here,
-> but it's your call since it changes what ships.
+> **This is the single most valuable experiment left in the project** and I can't run it here.
+> Two questions for you: is there a Neuron stack where torch.compile works that I could get onto
+> (the Native PyTorch beta compile path?), and/or do the NKI/torch-neuronx folks already *know*
+> whether NKI invocation cost is paid once at compile time or per call? Asking might be faster
+> than measuring.
 >
-> *2. Week 4 MFU — is it still the right spend?* Two complications. `use_kernels=True` can't
-> route to Neuron, so the measurement has to go through my own kernelize helper (fine, but it's
-> a caveat on a customer-facing number). And per-layer benchmarking turned out useless: NKI
-> dispatch costs ~0.36 ms of *host* time per call vs ~0.011 ms for eager, so at 217 kernel calls
-> per Qwen3-8B forward there's ~76 ms/step of host overhead that swamps any per-kernel signal.
-> Full-model MFU is the only instrument left.
+> **Also worth knowing: ~53 ms looks like a misconfiguration, not a design point.** Before I
+> write it up as a fundamental property, is that plausibly expected on SDK 2.31 / NKI 0.5.0 via
+> torch-xla eager? If it's a known issue the whole conclusion changes.
 >
-> Fair warning: given that overhead there's a real chance MFU *with* the kernels is worse than
-> without. I think that's still a valuable result — "mechanism works, kernels are correct, eager
-> per-layer swap is launch-bound until fusion lands" — but I'd rather flag it now than surprise
-> you at Week 6. **Do you want me to spend Week 4 on MFU anyway, or is something else more
-> valuable with the time?**
+> **What did land.** Weeks 3-6 are done. Three kernels (RMSNorm, RoPE, SiLU) validated on Qwen3
+> dense *and* Qwen3-MoE with zero code changes for the MoE case — logits cos_sim 1.000001 and
+> 1.000002. RoPE is a real port of nki-library's `rope_hf`. MoE gap analysis written. PoC
+> document drafted. Along the way: found that `use_kernels=True` can't reach Neuron at all
+> (silent no-op) and verified a ~3-line transformers fix takes Qwen3 from 0 to 9 swapped layers;
+> and found Qwen3-MoE won't run on Neuron by default at all because the experts path uses
+> `torch.sort`/`histc` → unsupported HLO (fix: `experts_implementation="batched_mm"`,
+> undocumented anywhere).
 >
-> *3. Do I contact Samir directly?* I have a draft for him: Hub repo home
-> (`aws-neuron/` vs `kernels-community/`, my lean is `aws-neuron/`), two small `kernels`-side
-> fixes, and the weight-layout design question. Happy to send it, but you may want to look first
-> or introduce me — your read on the right etiquette there.
+> **Three things I got wrong, all caught by measurement.** Week 2's accuracy numbers were
+> measuring the PyTorch fallback, not NKI — the kernel never ran. My first benchmark reported
+> 8-400x slower because I discarded outputs and XLA eliminated the computation. And a harness
+> bug of mine produced a convincing-looking "NKI is incompatible with torch.compile" that was
+> just a missing `sys.modules` registration. On a lazy-execution backend both correctness and
+> performance measurements fail silently by default — a fallback is numerically correct, an
+> eliminated computation is fast, a harness bug looks like a platform limit. That pattern is
+> probably the most transferable thing in the PoC and it's written up as such.
 >
-> **Two things I got wrong that you should know about**, since they affect what I'd recommend:
-> Week 2's accuracy numbers were measuring the PyTorch fallback rather than NKI (the kernel
-> never executed — `@nki.jit` needs XLA tensors and the tests fed CPU ones), and my first
-> benchmark reported every kernel 8-400x slower than eager because I discarded the outputs and
-> XLA eliminated the computation. Both are fixed and both are now documented as findings, since
-> the underlying pattern — that on a lazy backend correctness *and* performance measurements
-> fail silently by default — is probably the most transferable thing in the PoC.
+> **Two decisions I'd still like from you:** (1) do I send the Samir draft or do you want to
+> review/introduce, and (2) the nki-library MLP bug and the `torch_neuronx` `torch.neuron`
+> one-liner — file them myself or route through you?
 >
-> Also: two smaller Neuron-internal items I'd like your read on who to talk to — the nki-library
-> MLP bug above, and `torch_neuronx` not setting a `torch.neuron` attribute (one line, and it
-> unblocks two separate things in the HF `kernels` library). Happy to file both myself if you'd
-> rather I just go.
->
-> Full writeup in `deliverables/week-3.md`, findings in `docs/poc-findings.md`. Happy to walk
-> through any of it.
+> `deliverables/poc-document.md` has the full recommendation. Short version: yes invest, but in
+> answering the graph-mode question and four small upstream fixes — not in a kernel-porting
+> program.
 
 ---
 
@@ -153,21 +168,41 @@ size-scaling gate for performance. Neither is standard practice.
 
 ### Decisions I'm asking for
 
-1. **Week 5**: is a gap analysis an acceptable outcome, or push for a MoE implementation?
-2. **Week 4**: MFU as planned, or is something else a better use of the time given #19?
-3. **Samir**: do I reach out directly, or would you rather introduce / review first?
-4. **The two Neuron-internal items** (nki-library MLP bug, `torch_neuronx` attribute): file them
-   myself, or route through you?
-5. **Our own tech debt**: I'd like to spend a few hours rewriting RMSNorm and SiLU off the
-   removed `nl.arange` API before anything goes to the kernels team. Shipping PoC kernels built
-   on a removed API seems like a bad look. Agree?
+Reduced to the ones that are still open — the Week 4/5 scheduling questions resolved themselves
+by getting done.
+
+1. **Can I get onto a stack where `torch.compile` works on Neuron?** This is the blocker on the
+   most valuable remaining experiment. The Native PyTorch beta compile path seems like the
+   candidate.
+2. **Is ~53 ms per NKI invocation expected on this SDK?** If the NKI/torch-neuronx teams already
+   know the answer, asking beats measuring. And if it's a known issue rather than a design point,
+   the PoC's conclusion changes materially.
+3. **Samir**: do I reach out directly, or would you rather review/introduce first?
+4. **The two Neuron-internal items** (nki-library MLP divide-by-zero, `torch_neuronx` setting
+   `torch.neuron`): file them myself, or route through you?
+5. **Does the PoC recommendation land right?** It says invest, but in the graph-mode question
+   and four small upstream fixes rather than kernel porting — and it says that if graph mode
+   *doesn't* amortize the cost, Neuron should not invest further in this integration point. That
+   second half is a stronger negative than I'd have predicted at Week 1, so I'd like a sanity
+   check before it goes to Hanbo/Karthick.
+
+### Already done, no decision needed
+
+- Migrated RMSNorm and SiLU off the removed `nl.arange` API onto `nl.ds` / NKI 0.5.0. Turned out
+  to *improve* accuracy ~50x on fp32 (max_diff 1e-4 → 1e-6) because the fix required computing
+  the reduction in fp32, which is what PyTorch's RMSNorm does anyway.
+- Week 5 gap analysis, with a revised recommendation: the best MoE NKI target is the routing
+  `sort`/`histc` step, **not** the expert matmul. It unblocks the default MoE path on Neuron,
+  the compiler error itself recommends NKI for it, and it's blocked by neither the weight-layout
+  question nor the single-core width limit.
 
 ### What I'd do next if you just said "keep going"
 
-In this order: rewrite the two kernels onto `nl.ds` (hours), then full-size Qwen3-8B MFU with
-launch count reported alongside, then start the Week 6 document since most of its content is
-already accumulated. File the two Neuron-internal items in parallel since they have external
-latency.
+1. Get the graph-mode answer, by whatever path is fastest — a working stack or a conversation.
+2. File the upstream items (they have external latency, so earlier is better).
+3. If graph mode looks viable: the MoE routing kernel, since it's small and unblocked.
+4. If it doesn't: stop kernel work and write up the negative recommendation properly. That's a
+   real result and worth delivering cleanly rather than padding.
 
 ---
 

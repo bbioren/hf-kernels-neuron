@@ -52,18 +52,43 @@ See `docs/poc-findings.md` Finding #8.
 
 ## Current status
 
+**PoC complete.** Final deliverable: [`deliverables/poc-document.md`](deliverables/poc-document.md).
+
 | Kernel | Interception point | Registrations upstream | Accuracy (on hardware) |
 |--------|-------------------|------------------------|------------------------|
 | RMSNorm | `RMSNorm` (layer) | 115 | 11/11 pass, NKI verified |
-| RoPE | `rotary_pos_emb` (func) | 95 model files | 20/20 pass, NKI verified |
+| RoPE | `rotary_pos_emb` (func) | 95 model files | 20/20 + 6/6 guards, NKI verified |
 | SiLU | `SiLU` (layer) | 1 (covers all `ACT2FN["silu"]` users) | 9/9 pass, NKI verified |
 
-End-to-end on Qwen3: all three execute (RMSNorm 9×, RoPE 2×, SiLU 2× per forward),
-logits `cos_sim 1.000001` vs the unkernelized model.
+End-to-end: all three execute on **Qwen3 dense** (logits `cos_sim 1.000001`) and on
+**Qwen3-MoE** with zero code changes (`cos_sim 1.000002`).
 
-**Known blocker:** `use_kernels=True` cannot reach the `"neuron"` device path
-(Finding #9). Use the `kernels` library directly with `device="neuron"`, or see
-`scripts/neuron_kernel_registration.py` for the verified minimal upstream fix.
+### The headline result
+
+**The kernels are correct and 208x slower.** MFU 5.06% → 0.02%.
+
+Every `@nki.jit` invocation from eager PyTorch/XLA costs **~53 ms of fixed overhead regardless of
+problem size** — more than the entire 42 ms baseline forward pass. At 169 kernel calls per step
+that dominates everything. It is an integration-model result, not a kernel-quality one: the
+Kernel Hub wants many small invocations, NKI charges ~53 ms each, and nki-library's kernels are
+built as a few large fused megakernels. See Finding #20.
+
+The decisive follow-up — does graph mode amortize the cost? — **could not be answered here**,
+because `torch.compile` doesn't work on this stack even for plain PyTorch (Finding #21). That is
+the single most valuable remaining experiment.
+
+### Known blockers
+
+| Blocker | Effect |
+|---|---|
+| `use_kernels=True` can't reach `"neuron"` (#9) | silent no-op. Use `kernelize_for_neuron()`; a verified ~3-line upstream fix is in `scripts/neuron_kernel_registration.py` |
+| ~53 ms per NKI invocation (#20) | eager per-layer swap is not performance-viable |
+| `torch.compile` broken on this stack (#21) | blocks the decisive experiment |
+| Fused MLP won't compile single-core above `intermediate_size` 4096 (#18) | excludes every real model |
+| Qwen3-MoE needs `experts_implementation="batched_mm"` (#22) | undocumented; default fails with an unsupported `sort` HLO |
+
+All findings with severity: [`docs/poc-findings.md`](docs/poc-findings.md).
+Upstream asks with patches: [`docs/upstream-fixes.md`](docs/upstream-fixes.md).
 
 ## Versions Tested
 

@@ -155,6 +155,15 @@ blocker 1 lands. Use `kernelize_for_neuron(model)` from
 `device="neuron"` and handles the `_hidden_kernels` attach/detach that function kernels need.
 
 | 5 | Fused MLP divides by zero single-core when `intermediate_size > 4096` | nki-library | bug fix | **boundary measured, 10 data points**; no wrapper workaround |
+| 6 | **Can a NKI kernel be invoked from a compiled graph with invocation cost paid once?** | NKI / torch-neuronx | a question | **DECISIVE — gates everything else** |
+| 7 | `torch.compile` doesn't work on this stack even for plain PyTorch | torch-neuronx | — | blocks answering #6 here |
+| 8 | Qwen3-MoE needs `experts_implementation="batched_mm"` on Neuron; undocumented | Neuron docs | doc | customer-facing |
+
+**Blocker 6 is now the most important item in the project.** Finding #20 measured ~53 ms of
+fixed cost per `@nki.jit` invocation from eager PyTorch/XLA — more than an entire baseline
+forward pass. If graph mode amortizes that, the Kernel Hub becomes a good bet for Neuron. If it
+doesn't, the per-layer model cannot host nki-library's fused kernels and further investment
+isn't warranted. Cheap to answer, and it gates whether blockers 4 and 5 are worth anyone's time.
 
 **Fused-kernel work is blocked, not merely expensive.** Two independent gates, found by the
 Week 4 derisking spike (`scripts/spike_nkilib_mlp.py`), which was worth running precisely
@@ -220,40 +229,49 @@ forward that is ~76 ms of host-side overhead per step. Two consequences:
   so thin-wrapper porting works today (blocker is the `python-depends` allowlist, i.e.
   policy not code); **#17** the fused MLP is blocked by weight layout, not by the kernel.
 
-### Week 4: Full Qwen3 dense end-to-end, MFU measurement
-- ~~SiLU NKI activation kernel + registration~~ — **done in Week 3**
-- Full Qwen3 dense (full-size 8B, not the 2-layer stand-in) with NKI RMSNorm + RoPE + SiLU
-- Confirm correctness (logits parity)
-- Measure MFU with and without the kernels, **stating the denominator explicitly**
-- Expect RMSNorm and RoPE to help and SiLU **not** to — standalone elementwise activations
-  are memory-bandwidth bound. Measure; be willing to report neutral or negative.
-- Confirm the RoPE `seq_len % 128` guard doesn't silently disable the kernel at realistic
-  sequence lengths. This is the most likely way a customer gets no acceleration unnoticed.
-- 1-2 day spike: call `nkilib.core.mlp.mlp` directly and validate against its own
-  `mlp_torch_ref`, to derisk the highest-value kernel before any fusion-API work
-- Note `use_kernels=True` will still not route to neuron unless the upstream fix lands;
-  use `kernelize_for_neuron()` from `scripts/neuron_kernel_registration.py`
-- Deliberately **not** planned: more elementwise activations (GeLU family). Hours each and
-  broad coverage, but memory-bound — adds surface area without adding evidence.
+### Week 4: MFU measurement ✓ DONE — and it changed the project's conclusion
+- ~~SiLU NKI activation kernel~~ — done early in Week 3
+- **MFU measured** on Qwen3-0.6B at full 28 layers, seq 512, bf16, forward only, single
+  logical core. Denominator stated (632 TFLOPS/device TensorEngine ÷ 2 for LNC2 = **316**),
+  FLOP count computed explicitly and printed.
 
-### Week 5: Qwen3-MoE (stretch)
-- Map Qwen3-MoE forward to Kernel Hub layer names
-- Reuse RMSNorm/RoPE/SiLU from weeks 2-4 (all three already done)
-- At least one MoE-specific NKI kernel swapped and validated, or gap analysis
-- **Gated on Finding #17** — MoE kernels are fused and weight-layout-sensitive, so the
-  weight-transformation question has to be answered before implementation starts
-- Week 3 recon (see `docs/nki-library-porting-analysis.md`): `core/moe/moe_cte/moe_cte.py`
-  weight layout is a **free reshape** for `Llama4TextExperts` but needs transposes for
-  `Qwen3MoeExperts` — the reverse of the dense case. The real work is **routing metadata**
-  (`token_position_to_id`, `block_to_expert`, `expert_affinities_masked`, a `[T+1, H]`
-  hidden tensor with a padding row) which the kernel expects the *caller* to build, whereas
-  the megablocks path HF wraps builds it internally. That gap is the port, and the
-  thin-wrapper strategy does not shortcut it.
-- Naming: `"Llama4TextMoe"` is **commented out** in `_KERNEL_MAPPING` ("no longer
-  maintained"). The only live MoE layer name is `"MegaBlocksMoeMLP"`.
-- Gap analysis is a legitimate outcome here — say so rather than forcing a thin result.
+  | Configuration | Step time | MFU | NKI calls/step |
+  |---|---|---|---|
+  | baseline | **41.95 ms** | **5.06 %** | 0 |
+  | NKI SiLU only | 1,495.54 ms | 0.14 % | 28 |
+  | all three kernels | **8,753.65 ms** | **0.02 %** | 169 |
 
-### Week 6: PoC document, review, and ship
+- **Root cause (Finding #20, Critical): every `@nki.jit` invocation from eager PyTorch/XLA
+  costs ~53 ms of fixed overhead, independent of problem size** — more than the entire 42 ms
+  baseline forward pass. Flat across a 112x range in problem size. Reproduced 4x within 1%.
+  Ruled out interleaving, host dispatch, our kernels, recompilation, and sync artifacts.
+- RoPE confirmed engaged at seq 512 (28/28, zero fallbacks), so the `% 128` guard is not
+  silently disabling it.
+- **The Week 3 prediction about SiLU was right on the conclusion and wrong on the reasoning.**
+  I predicted memory-bandwidth limits; the real cause is invocation overhead that swamps both
+  compute and bandwidth. None of the three kernels help. Worth remembering: plausible
+  reasoning, wrong conclusion, which is why the measurement was necessary.
+- MLP spike done: production `nkilib.core.mlp.mlp` **is** drivable with HF weights
+  (cos_sim 0.999979-0.999995) but cannot compile single-core above `intermediate_size` 4096
+  (Finding #18), which excludes every real model.
+- See `deliverables/week-4.md`.
+
+### Week 5: Qwen3-MoE ✓ DONE (gap analysis + dense-kernel transfer verified)
+- **All three dense kernels transfer to Qwen3-MoE with zero code changes.** RMSNorm nki=9,
+  RoPE nki=2, SiLU nki=2, zero fallbacks, logits cos_sim 1.000002. This is the load-bearing
+  evidence for the per-kernel-not-per-model thesis — same kernels, second architecture.
+- **But Qwen3-MoE does not run on Neuron at all by default** (Finding #22). The default
+  `grouped_mm` experts path uses `torch.sort`/`torch.histc`, which lower to an unsupported
+  `sort` HLO. Fix: `experts_implementation="batched_mm"`. Undocumented; worth adding to
+  Neuron's model-support docs.
+- No MoE-*specific* kernel: gap analysis instead, which was the honest outcome. See
+  `deliverables/week-5-moe-gap-analysis.md`.
+- **New recommendation from that work:** the best MoE NKI target is the routing `sort`/`histc`
+  step, **not** the expert matmul. It unblocks the default MoE path, the compiler error itself
+  recommends NKI for it, and it is blocked by neither Finding #17 (no weights) nor #18 (not a
+  fused matmul). Expert matmul dropped to last priority.
+
+### Week 6: PoC document, review, and ship ✓ DRAFTED
 - Kernel Hub mechanism and why forward-swap is the correct interception point
 - **And where forward-swap runs out**: it works for weightless ops and ops reading weights
   as-is, and breaks for fused kernels wanting a different weight layout (#17). That boundary
@@ -267,30 +285,42 @@ forward that is ~76 ms of host-side overhead per step. Two consequences:
 - Porting strategy recommendation: hand-port vs thin wrapper over `nkilib` (#16), with the
   15-lines-vs-7,249-lines scale argument and the version-coupling tradeoff stated honestly
 - What is not done: backward kernels, torch.compile, Hub upload, MoE gaps, fused MLP
-- Recommendation: is first-class HF Kernel Hub support worth engineering investment?
-  Current lean, to be tested against Week 4 MFU: **yes, but the investment is 4 small
-  upstream fixes plus one design decision, not a kernel-porting program.**
+- **Drafted: `deliverables/poc-document.md`.** Recommendation after the Week 4 measurement:
+  **yes, but not the eager per-layer path.** Invest in (1) answering the graph-mode question,
+  which is decisive and cheap, (2) four small upstream fixes, (3) a NKI routing kernel for MoE.
+  **Defer kernel porting** — no kernel is a speedup in eager mode.
+- If graph mode does *not* amortize the ~53 ms per-invocation cost, the honest answer becomes
+  "the Kernel Hub's per-layer model cannot host nki-library's fused-megakernel design, don't
+  invest further." That is a valuable answer too and it is cheap to obtain.
+- Also includes the methodological section — three times a plausible measurement turned out to
+  be measuring nothing, none of which produced an error. Probably the most transferable output.
 
 ## Definition of done
 
-**Floor (must hit):**
-- ✓ `"neuron"` device support working locally with forward-swap proven on Trainium
-  (via the kernels library with `device="neuron"`; the `use_kernels=True` entry point is
-  blocked upstream — blocker 1)
-- ✓ At least NKI RMSNorm and RoPE packaged and validated e2e on Qwen3 dense
-  (both, plus SiLU; execution asserted, logits `cos_sim 1.000001`)
-- ☐ Measured MFU delta with denominator stated — **Week 4**
-- ☐ PoC document delivered to the kernels team — **Week 6**
+**Floor — all met.**
+- ✓ `"neuron"` device support with forward-swap proven on Trainium (via the kernels library
+  with `device="neuron"`; the `use_kernels=True` entry point is blocked upstream — blocker 1,
+  fix identified and verified sufficient)
+- ✓ NKI RMSNorm **and** RoPE **and** SiLU packaged and validated e2e on Qwen3 dense
+  (execution asserted, logits `cos_sim 1.000001`) — and on Qwen3-MoE (`cos_sim 1.000002`)
+- ✓ **Measured MFU delta with denominator stated** — 5.06% → 0.02%, denominator 316 TFLOPS
+  (632/device TensorEngine ÷ 2 for LNC2), FLOP count auditable. `deliverables/week-4.md`
+- ✓ **PoC document drafted** — `deliverables/poc-document.md`. Not yet reviewed or delivered.
 
-**Ceiling (stretch):**
+**Ceiling:**
 - ✓ SiLU activation kernel added (Week 3, early)
-- ☐ MLP kernel — feasible but gated on Finding #17 (weight layout). Do the standalone
-  `nkilib.mlp()` spike first; do not start the fusion integration until #17 is decided.
-- ☐ Hub publishing working for a Neuron kernel — layout validated, blocked on the repo-home
-  decision (Samir) and blocker 4 for an honest dependency declaration
-- ☐ At least one Qwen3-MoE kernel swapped and validated. Note the MoE bottleneck is
-  *routing metadata* built outside the kernel, not the matmul — the thin-wrapper strategy
-  does not help here. A gap analysis may be the honest outcome.
+- ✓ Qwen3-MoE: dense kernels transfer with zero changes; gap analysis for MoE-specific work
+- ☐ MLP kernel — spike done (kernel works, cos_sim 0.999979-0.999995) but **blocked** by
+  Finding #18 (won't compile single-core above `intermediate_size` 4096) and #17. Do not start
+  the fusion integration until #18 is fixed and #17 is decided.
+- ☐ Hub publishing — layout validated, `digest` optional, minimum repo is two files. Blocked
+  on the repo-home decision (Samir) and blocker 4 for an honest dependency declaration.
+
+**Added, not in the original definition of done but arguably the most valuable:**
+- ✓ Root-caused *why* the kernels don't help (Finding #20), rather than just reporting a
+  slowdown. That is what turns the MFU number into a recommendation.
+- ✓ A methodology for measuring kernels on a lazy-execution backend without fooling yourself
+  (`tests/nki_test_utils.py` plus the scaling gate in `scripts/benchmark_kernels.py`).
 
 ## Environment (re-verified 2026-07-29)
 

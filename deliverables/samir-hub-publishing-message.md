@@ -3,10 +3,17 @@
 **Status: DRAFT, NOT SENT.** Review before sending. Slack is probably the right channel; the
 long version below works as a doc or email if he wants detail.
 
+**UPDATED after the Week 4 MFU measurement.** The draft now leads with the ~53 ms
+per-invocation finding rather than the repo-home question, because it is the most useful thing we
+can tell the HF team and because it may change what they'd advise us to do. Items 1-4 are
+unchanged; items 5 and 6 are new.
+
 Judgement calls I made, change them if you disagree:
-- Leads with the repo-home question since that's the actual ask, then the two `kernels`-side
-  fixes, then the design question. Rationale: the first is a decision only he can make, the
-  next two are small and concrete, the last needs thinking time.
+- Leads with the performance finding, framed as information for him rather than a complaint.
+  It's the kind of thing a kernels-library maintainer would want to know about a backend, and
+  volunteering it (including that it made *our* integration look bad) is more useful than
+  burying it below the asks.
+- Then the repo-home question, then the two `kernels`-side fixes, then the design questions.
 - Recommends `aws-neuron/` for the repo home rather than leaving it open. Easier for him to
   push back on a proposal than to arbitrate an open question.
 - Does **not** ask him to fix anything himself — just to point us at the right owner and say
@@ -19,13 +26,21 @@ Judgement calls I made, change them if you disagree:
 
 ## Short version (Slack)
 
-> Hi Samir — Ben here, wrapping up week 3 of the PoC putting NKI kernels on the HF Kernel
-> Hub for Trainium. Three NKI kernels (RMSNorm, RoPE, SiLU) now swap into a stock Qwen3 and
-> run on Neuron hardware, logits matching at cos_sim 1.000001. RoPE is a real port of our
-> production kernel library, and it goes in as a `FuncRepository` against the existing
-> `rotary_pos_emb` name.
+> Hi Samir — Ben here, wrapping up a PoC putting NKI kernels on the HF Kernel Hub for
+> Trainium. Three NKI kernels (RMSNorm, RoPE, SiLU) now swap into a stock Qwen3 — and Qwen3-MoE
+> — and run on Neuron hardware, logits matching at cos_sim 1.000001 / 1.000002 with zero code
+> changes between the two model families. RoPE is a real port of our production kernel library,
+> going in as a `FuncRepository` against the existing `rotary_pos_emb` name.
 >
-> Four things I'd like your read on, roughly in order of how much they block us:
+> **Leading with the awkward part, because it's the most useful thing I can tell you:** on
+> Neuron in eager mode the swap makes the model *208x slower*. MFU 0.02% vs a 5.06% baseline.
+> The cause isn't kernel quality — every NKI kernel invocation from eager PyTorch/XLA costs
+> ~53 ms of fixed overhead independent of problem size, which is more than an entire baseline
+> forward pass. At 169 kernel calls per step that dominates everything. Detail in item 5 below;
+> I'd genuinely value your read on whether this is a shape of problem you've seen with other
+> non-CUDA backends.
+>
+> Five things I'd like your read on, roughly in order of how much they block us:
 >
 > **1. Where should Neuron kernels live on the Hub — `kernels-community/` or `aws-neuron/`?**
 > This is the one blocking us from publishing. My lean is `aws-neuron/`, so we own versioning
@@ -62,8 +77,42 @@ Judgement calls I made, change them if you disagree:
 > want, or is the expectation that backend kernels absorb the layout difference internally?
 > This blocks any fused-kernel work for us, so I'd rather ask than guess.
 >
-> Happy to write any of these up properly or jump on a call. Full findings doc is coming at
-> the end of week 6 — I can share the current draft if useful.
+> **5. The per-invocation cost, and a question about the mechanism's granularity.** As above:
+> ~53 ms fixed per NKI kernel call from eager PyTorch/XLA. Flat across a 112x range in input
+> size, reproduced four times within 1%. I ruled out interleaving (28 adjacent calls cost the
+> same as 28 separated by framework ops), host-side dispatch (0.36 ms/call, 1/145 of it), my own
+> kernels (our production RoPE kernel shows the same figure), and recompilation.
+>
+> What makes this interesting rather than just bad news: our kernel library is built around
+> large *fused* megakernels that amortize invocation cost across a whole transformer block,
+> whereas the Kernel Hub's per-layer forward swap maximizes invocation count. Those are opposite
+> designs, and I hit the same mismatch from two other directions too — fused kernels want weights
+> in a layout `kernelize()` can't produce, and our fused MLP won't even compile single-core at
+> realistic widths because it assumes multi-core sharding.
+>
+> So three questions, and I suspect you've thought about at least the first:
+> - Have you seen this shape of per-invocation cost on other non-CUDA backends, and is there a
+>   batching or persistence mechanism I've missed?
+> - Is the intended answer "use graph mode"? If NKI kernels can live inside a compiled graph with
+>   the cost paid once, the whole picture changes. I couldn't test it — `torch.compile` doesn't
+>   work on our current stack even for plain `F.silu` — but if the Kernel Hub's expectation is
+>   that non-CUDA backends declare `can_torch_compile=True` and only get selected in
+>   TORCH_COMPILE modes, that's a useful thing for me to know before I write the recommendation.
+> - Is the per-layer granularity a deliberate design boundary? I'm not asking you to change it —
+>   I'm trying to work out whether backends whose kernels are coarse-grained are simply outside
+>   the model, which would be a fine answer and worth stating in the docs.
+>
+> **6. One suggestion, take it or leave it.** Would `kernels` consider exposing which
+> implementation is live per layer — something like `model.get_kernel_report()`? The issue isn't
+> Neuron-specific but it's sharper here: a fallback is numerically correct, so a user cannot
+> distinguish "accelerated" from "no-op" by looking at outputs. I lost about a week to exactly
+> that: my accuracy tests passed while the kernel never executed, because it silently fell back
+> on host tensors and the fallback matched the reference perfectly. A `use_fallback=False` strict
+> mode exists in `kernels` but transformers doesn't expose it, and it only helps if you know to
+> ask.
+>
+> Happy to write any of these up properly or jump on a call. Full PoC doc is drafted — I can
+> share it if useful.
 
 ---
 

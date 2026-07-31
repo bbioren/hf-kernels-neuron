@@ -2,16 +2,69 @@
 
 ## SESSION SUMMARY
 
-**Read this first.** Branch `week-3`, **nothing pushed**. All four test suites verified on trn2
-(exit 0). Full writeup in `deliverables/week-3.md`; findings with severity in
-`docs/poc-findings.md` (#8-#19); upstream asks with patches in `docs/upstream-fixes.md`;
-reproduction scripts indexed at the end of the deliverable.
+**Read this first.** Branch `week-3`, **nothing pushed**. All five test suites pass on trn2.
+Weeks 3, 4, 5 and 6 are all done. Final deliverable: **`deliverables/poc-document.md`**.
 
-Two sessions. Session 1 = Week 3 proper (below). **Session 2** (at the bottom) ran the MLP
-derisking spike and a benchmark attempt, and produced three more findings — including two
-corrections to things I'd previously asserted without measuring. If you read only one extra
-thing, read Finding #18: the fused MLP cannot run single-core at any realistic
-`intermediate_size`, which blocks the fused-kernel direction outright.
+### The result that matters
+
+**MFU 5.06% → 0.02%. The kernels make the model 208x slower.**
+
+Root cause, and it took real digging: **every `@nki.jit` invocation from eager PyTorch/XLA
+costs ~53 ms of fixed overhead, independent of problem size.** That is more than the entire
+42 ms baseline forward pass, so at 169 kernel calls per step nothing else matters. Flat across a
+112x range in input size; reproduced four times within 1%. Ruled out interleaving, host dispatch,
+my kernels (nki-library's production `rope_hf` shows the same number), recompilation, and sync
+artifacts. Finding #20.
+
+It is an **integration-model** result, not a kernel-quality one. The Kernel Hub wants many small
+kernel invocations; NKI charges ~53 ms each; nki-library's kernels are built as a few large fused
+megakernels. Three separate findings now converge on that same mismatch — weight layout (#17),
+single-core width limits (#18), and invocation cost (#20).
+
+**The one escape, and I could not test it.** If that cost is a per-invocation framework-boundary
+charge, graph mode should amortize it and the whole picture changes. But `torch.compile` does not
+work on this stack *at all* — plain `F.silu` with no NKI fails across every backend and dtype — so
+a NKI failure would be indistinguishable from compile being broken generally, and I refused to
+record a NKI result from it (#21). **This is the single most valuable remaining experiment in the
+project** and it needs a different stack.
+
+### What else landed
+
+- **RMSNorm + SiLU migrated off the removed `nl.arange` API** onto `nl.ds` / NKI 0.5.0. Required
+  computing the reduction in fp32, which *improved* accuracy ~50x on fp32 (max_diff 1e-4 → 1e-6)
+  and made bf16 bit-identical, because that is what PyTorch's RMSNorm does anyway.
+- **Qwen3-MoE: all three kernels transfer with zero code changes** (logits cos_sim 1.000002).
+  Load-bearing evidence for the per-kernel-not-per-model thesis. But Qwen3-MoE **does not run on
+  Neuron at all by default** — the experts path uses `torch.sort`/`histc` → unsupported `sort`
+  HLO. Fix: `experts_implementation="batched_mm"`, documented nowhere (#22).
+- **MoE recommendation reversed:** the best NKI target is the routing `sort`/`histc` step, not the
+  expert matmul. It unblocks the default MoE path, the compiler error itself recommends NKI for
+  it, and it is blocked by neither #17 nor #18.
+- **Week 4, 5 and 6 deliverables written**, plus the MoE gap analysis.
+
+### Three times I fooled myself, all caught by measurement
+
+Worth reading as a set, because the pattern is the most transferable output of the project:
+
+| # | Looked like | Actually was |
+|---|---|---|
+| 8 | "RMSNorm validated, bit-identical" | kernel never ran; fallback compared to itself |
+| 19 | "NKI is 8-400x slower" | outputs discarded, XLA eliminated the computation — timed an empty graph |
+| 21 | "NKI is incompatible with torch.compile" | my loader didn't register the module in `sys.modules` |
+
+On a lazy-execution backend, **both correctness and performance measurements fail silently by
+default.** A fallback is numerically correct. An eliminated computation is fast. A harness bug
+looks like a platform limitation. None of them error. The guards now in place (execution call
+counters, a scaling gate, mandatory controls, negative controls) are in
+`tests/nki_test_utils.py` and `scripts/benchmark_kernels.py`, and #19 was caught *by* the guard
+built after #8.
+
+### What needs you
+
+See **BLOCKED — NEEDS INPUT** at the bottom. Short version: get onto a stack where
+`torch.compile` works (blocks the decisive experiment), find out whether ~53 ms/invocation is
+expected on this SDK, and decide whether I file the upstream items or you route them. Draft
+messages for John and Samir are both updated with the new findings.
 
 ### What got done
 
@@ -598,3 +651,137 @@ route to Neuron, so the measurement has to go through `kernelize_for_neuron()`. 
 whether that's an acceptable basis for a customer-facing number, or whether the upstream fix
 should land first. *Recommendation:* measure now via the helper, and state the caveat.
 Also report launch count alongside MFU, per #19.
+
+---
+
+## Session 3 — 2026-07-31 06:45-08:30 UTC — Weeks 4, 5, 6
+
+Instruction was to keep going as far as possible. Worked through the remaining project in
+priority order: tech debt, then MFU, then MoE, then the PoC document.
+
+### T12 — Migrated RMSNorm + SiLU to NKI 0.5.0 (`nl.ds`)
+
+Cleared the Finding #14 tech debt. Both kernels used `nl.arange` + `mask=`, removed in 0.5.0,
+which pinned them to the older bundled API. Validated the replacement pattern first
+(`scripts/probe_nki05_api.py`) across ragged tails of 0, 44, 122, and a 1-row case with zero
+full tiles.
+
+Four 0.5.0 API differences and two structural constraints found, all documented in the probe:
+`nl.arange`/`nl.mgrid` removed; `nl.load`/`nl.store` have no `mask`; `tile.broadcast_to(...)`
+method doesn't resolve (use `nl.broadcast_to`); `tile / python_int` is rejected. And: kernels
+must be module-level with module-global `nl` imports (a closure gives
+`failed to resolve name 'nl.ndarray'`, *identical text* to a genuinely missing API), and no
+inner function definitions.
+
+**The bf16 case initially failed** with `nisa.tensor_scalar_arith operand0 must be float32` —
+the `[rows,1]` reciprocal can't be bf16. Fixing it by computing the reduction in fp32 also made
+the kernel match PyTorch's RMSNorm, which upcasts for the variance. So a *required* fix turned
+out to be a correctness improvement: fp32 max_diff 1.2e-05…3.9e-04 → 4.8e-07…8.1e-06 (~50x),
+and bf16 became bit-identical.
+
+### T13 — MFU measurement (Week 4)
+
+Baseline 41.95 ms/step, MFU 5.06%. Kernelized 8753.65 ms/step, MFU 0.02%. Denominator stated
+explicitly (632 TFLOPS/device TensorEngine ÷ 2 for LNC2 = 316) and FLOP count printed so it's
+auditable.
+
+Did **not** stop at "208x slower". Added `--only` for per-kernel attribution: SiLU alone gave
+51.9 ms/call, all three gave 51.6 ms/call — uniform, which pointed at a fixed charge. Then swept
+problem size: **52.7-54.6 ms across a 112x range in rows.** Completely flat. One call on 28x the
+data costs 1.02x one call on 1x. Then ruled out the alternatives one at a time.
+
+Two operational notes: full-model compiles exceed the SSH command timeout, so added
+`scripts/run_detached.sh`. And a run I killed left a **stale compile-cache lock** that made the
+next run wait forever on a compiler that no longer existed — verified no live compiler and no
+completed NEFF before removing only that lock file.
+
+### T14 — Qwen3-MoE (Week 5)
+
+Dense kernels transfer with zero changes. But first had to discover that Qwen3-MoE doesn't run on
+Neuron at all by default (`sort` HLO unsupported via `torch.histc`), and probe the four experts
+implementations to find `batched_mm` works. Finding #22.
+
+That reframed the MoE recommendation: the valuable NKI target is the routing histogram, not the
+expert matmul.
+
+### T15 — The decisive experiment, which failed honestly (Finding #21)
+
+Wrote `scripts/experiment_torch_compile_nki.py` to answer whether graph mode amortizes the
+per-invocation cost. **v1 produced a convincing false finding** —
+`ModuleNotFoundError: No module named 'neuron_silu'` under compile, which reads as "NKI is
+incompatible with torch.compile". It was my own loader failing to register the module in
+`sys.modules`, which Dynamo needs to re-import a traced function's defining module.
+
+Fixed that, then added a mandatory plain-PyTorch control — and the control fails too, across
+`openxla`/`inductor`/`eager` and both dtypes. So the question is unanswerable here. The script
+now *skips* the NKI case when no control passes, rather than emitting a failure that would read
+as a NKI result.
+
+### T16 — Deliverables
+
+`deliverables/week-4.md`, `week-5-moe-gap-analysis.md`, and **`poc-document.md`** (the final
+one). Updated the steering doc's week-by-week status and definition of done, and rewrote both
+draft messages (John, Samir) around the new findings — the John one had been asking him to decide
+Week 4/5 scope, which had since resolved by getting done.
+
+---
+
+## DECISIONS (continued)
+
+**D14. Root-cause the slowdown instead of reporting it.** "208x slower" is a number; "~53 ms
+fixed per invocation, flat across 112x problem size, and here are the five alternatives ruled
+out" is a finding someone can act on. The attribution work took longer than the measurement and
+was worth more.
+
+**D15. Refuse to answer the graph-mode question rather than answer it badly.** I could have
+reported "NKI fails under torch.compile" from v1 of that experiment. It would have been wrong and
+it would have been quoted. Added a mandatory control and made the script skip rather than guess.
+
+**D16. Did not soften Finding #20 on the hope that graph mode rescues it.** As measured, on the
+stack a customer would use today, eager per-layer NKI swapping is not performance-viable. Whether
+a future path fixes it is a separate, clearly-labelled claim.
+
+**D17. Wrote the PoC recommendation with a real negative branch.** It says invest — but it also
+says that if graph mode doesn't amortize the cost, Neuron should *not* invest further in this
+integration point. A PoC that can only conclude "yes" isn't worth running, and the negative
+branch is cheap to test.
+
+**D18. MFU on Qwen3-0.6B at full depth rather than Qwen3-8B at reduced depth.** A real model end
+to end beats a width-proxy, and given ~53 ms/invocation a bigger model only makes the ratio
+worse. Stated as a limitation rather than hidden.
+
+---
+
+## BLOCKED — NEEDS INPUT (final)
+
+**B7. Get onto a stack where `torch.compile` works on Neuron.** Blocks the single most valuable
+remaining experiment (Finding #21). The Native PyTorch beta compile path is the likely candidate.
+*This is the top ask.*
+
+**B8. Is ~53 ms per NKI invocation expected on SDK 2.31 / NKI 0.5.0 via torch-xla eager?** It is
+large enough to look like a misconfiguration rather than a design point. If the NKI or
+torch-neuronx teams already know, asking beats measuring — and if it's a known issue the PoC's
+conclusion changes materially.
+
+**B9. Sanity-check the PoC recommendation before it goes to Hanbo/Karthick.** It contains a
+stronger negative than I'd have predicted at Week 1 ("if graph mode doesn't help, don't invest
+further"). Worth a mentor's read.
+
+Still open from earlier sessions: B1 (Hub repo home — Samir), B2 (who drives the upstream fixes),
+B3 (is inference-only acceptable for beta), B4 (Hub upload, gated on B1), B5 (fused-kernel work
+blocked by #17/#18), B6 (superseded — MFU methodology resolved).
+
+---
+
+## SUGGESTIONS (out of scope, logged not done)
+
+- **A NKI kernel for the MoE routing `sort`/`histc`.** Best-scoped MoE work identified: unblocks
+  the default Qwen3-MoE path on Neuron, compiler explicitly recommends NKI for it, blocked by
+  neither #17 nor #18. Building blocks exist in `nkilib/core/topk` and `core/router_topk`.
+- **`model.get_kernel_report()` in the `kernels` library.** The single highest-value
+  customer-experience improvement — today a user cannot distinguish acceleration from a silent
+  no-op, because a fallback is numerically correct.
+- **RoPE `seq_len` padding** to remove the `% 128` constraint. Needs a perf check, and is moot
+  until Finding #20 resolves.
+- **GeLU-family activation kernels.** Cheap now that the pattern is established, but memory-bound
+  and moot under #20. Explicitly *not* recommended until graph mode is settled.

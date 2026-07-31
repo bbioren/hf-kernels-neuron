@@ -9,7 +9,7 @@ VENV := .venv
 PYTHON := $(VENV)/bin/python
 PIP := $(VENV)/bin/pip
 
-.PHONY: help venv install verify demo test test-nki test-e2e probe registration sync lint clean versions
+.PHONY: help venv install verify demo test test-nki test-e2e probe mfu experiments registration sync lint clean versions
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -41,7 +41,7 @@ demo: ## Run identity kernel swap demo
 # require_neuron() refuses to report results otherwise, because a CPU run silently
 # exercises the PyTorch fallback instead of NKI (docs/poc-findings.md Finding #8).
 NKI_TESTS := tests/test_rmsnorm_nki.py tests/test_rope_nki.py tests/test_silu_nki.py
-E2E_TESTS := tests/test_qwen3_neuron_e2e.py
+E2E_TESTS := tests/test_qwen3_neuron_e2e.py tests/test_qwen3_moe_e2e.py
 
 test: test-nki test-e2e ## Run all kernel + e2e tests (must be on trn2)
 
@@ -57,11 +57,24 @@ test-e2e: ## Run the Qwen3 end-to-end kernel swap test
 		$(PYTHON) $$t || exit 1; \
 	done
 
-probe: ## Run all investigation probes (device path, NKI execution, API, packaging)
+probe: ## Run all investigation probes (device path, NKI execution, API, packaging, versions)
+	$(PYTHON) scripts/smoke_device.py
 	$(PYTHON) scripts/probe_neuron_device_path.py
 	$(PYTHON) scripts/probe_nki_execution.py
 	$(PYTHON) scripts/probe_nki_api.py
+	$(PYTHON) scripts/probe_nki05_api.py
+	$(PYTHON) scripts/probe_nki_versions.py
 	$(PYTHON) scripts/probe_hub_packaging.py
+	$(PYTHON) scripts/probe_nkilib_bundled.py
+
+mfu: ## Measure MFU with and without the NKI kernels (long-running)
+	$(PYTHON) scripts/measure_mfu.py --preset 0.6b --seq 512
+
+experiments: ## Run the perf-attribution experiments behind Findings #20 and #21
+	$(PYTHON) scripts/experiment_nkilib_thin_wrapper.py
+	$(PYTHON) scripts/spike_nkilib_mlp.py
+	$(PYTHON) scripts/experiment_nki_graph_break.py
+	$(PYTHON) scripts/experiment_torch_compile_nki.py
 
 registration: ## Print the neuron kernel mapping + proposed upstream diff
 	$(PYTHON) scripts/neuron_kernel_registration.py
