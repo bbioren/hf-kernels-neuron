@@ -129,3 +129,73 @@ between them unblock most of the experience. The interception points already exi
 upstream, Qwen3 already opts into them, and coverage is large (115 RMSNorm, 95 RoPE).
 Nothing here requires architectural change — which is the central input to the
 "is this worth investing in" question.
+
+---
+
+## The worst customer-experience issue in this project is invisible and costs 102x
+
+Added after Finding #24, and it outranks everything above.
+
+**A customer calling NKI kernels per-layer from eager PyTorch today pays ~52 ms per kernel call to
+fork `neuron-ls`.** No error, no warning, no log line. It presents as "NKI kernels are slow", which
+is the single most misleading possible symptom because it points at the kernel — the one thing that
+is not the problem.
+
+What a customer would actually experience:
+
+1. Write or adopt a NKI kernel. It is numerically correct.
+2. Benchmark it. It is dramatically slower than the PyTorch op it replaced.
+3. Conclude the kernel is bad, or that NKI is not worth it, and stop.
+
+Nothing in that loop points at process spawning. The profile that reveals it is not one a customer
+would think to run: you need to compare device time against wall time, notice a ~2400x gap, and then
+cProfile a single call. We only did it after four framework-level experiments failed to close the
+story, and we had a strong prior that something was wrong. A customer with a deadline stops at
+step 3.
+
+**Severity: highest in this document.** It is a one-decorator fix (`functools.lru_cache` on
+`_detect_target`) worth 102x per call, and the current state actively teaches customers a false
+lesson about NKI.
+
+### What would have surfaced it
+
+| Mitigation | Cost | Effect |
+|---|---|---|
+| Cache `_detect_target()` | one decorator | removes the problem |
+| Warn once if target detection runs more than N times per process | a few lines | makes it self-diagnosing |
+| Document `NEURON_PLATFORM_TARGET_OVERRIDE` as a perf-relevant setting | doc change | gives customers a lever, but only if they know to look |
+| A "why is my kernel slow" playbook that starts with device-time vs wall-time | doc change | generalises past this bug |
+
+The last one is the most broadly useful. The technique that found this — compare device time to wall
+time before forming any hypothesis — would find *any* host-side overhead problem, and it is two
+numbers. That belongs in the NKI performance documentation as step one.
+
+### A second, related paper cut
+
+`_detect_target()` falls back to `"trn3"` when `neuron-ls` is not on `PATH`:
+
+```python
+if shutil.which("neuron-ls") is None:
+    return "trn3"
+```
+
+On a trn1 or trn2 host without `neuron-ls` installed, this silently compiles for the wrong
+generation. Same failure shape as everything else in this document: a wrong result rather than an
+error. Worth fixing in the same change.
+
+### And a third: `torch.compile` fails on most transformers, confusingly
+
+Covered in Finding #23. `torch_neuronx` overrides `gelu`, `silu`, `randn`, `CrossEntropyLoss`,
+`Dropout`, `Embedding`, `clip_grad_norm_`, `argmax`, `Softmax`, `topk` and `upsample_nearest2d` with
+XLA user computations that are not fake-tensor safe. A customer running `torch.compile` on any model
+containing an embedding or a softmax gets:
+
+```
+Dynamo failed to run FX node with fake tensors: call_function <function silu ...>
+got RuntimeError('Expected all tensors ... Got: XLAFloatType')
+```
+
+That message names `silu` and mentions XLA tensor types, which invites the conclusion that
+`torch.compile` is unsupported on Neuron generally. We drew exactly that conclusion and recorded it
+as a finding before checking. `add`/`mul`/`relu` compile fine. The workaround
+(`torch_xla.compile()`) exists and is undocumented in this context.

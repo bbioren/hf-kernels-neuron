@@ -8,6 +8,15 @@
 
 ## Headline
 
+> **SUPERSEDED IN PART — read this box first.** This deliverable was written before the ~53 ms was
+> root-caused. Every measurement in it is correct and reproducible. The *attribution* was wrong: the
+> cost is an uncached `neuron-ls` subprocess forked on every `@nki.jit` invocation, not a
+> framework-boundary or NEFF-switching charge. One `lru_cache` removes 102x of it. The corrected
+> headline is **3.4x slower at seq 512, 2.06x at seq 2048**, not 208x. Finding #24 has the full
+> story; the "What would change the answer" section below is superseded outright. Kept as written
+> because the reasoning trace is the useful part, and because the *ruling-out* work here is what
+> eventually made the root cause findable.
+
 **The kernels make the model 208x slower.** MFU goes from 5.06% to 0.02%.
 
 The cause is not kernel quality. Every `@nki.jit` invocation from eager PyTorch/XLA carries
@@ -34,6 +43,26 @@ time stable to within 0.2% (IQR 8746–8764 ms).
 
 All kernels confirmed engaged via call counters — RMSNorm 113, RoPE 28, SiLU 28, zero
 fallbacks. So this measures what it claims to.
+
+### The same measurement after the root cause was fixed
+
+`scripts/measure_mfu.py --fix-target-detection` caches `_detect_target`, which is the entire fix.
+Same model, same kernels, same denominator:
+
+| Configuration | Step time | MFU (per core) | NKI calls/step | vs baseline |
+|---|---|---|---|---|
+| baseline, seq 512 | 42.04 ms | 5.05 % | 0 | — |
+| all three kernels, seq 512 | **141.43 ms** | **1.50 %** | 169 | 3.36x slower |
+| baseline, seq 2048 | 108.76 ms | 9.90 % | 0 | — |
+| all three kernels, seq 2048 | **223.99 ms** | **4.81 %** | 169 | **2.06x slower** |
+
+The two sequence lengths are the amortisation test: call count is fixed by model depth, so more
+sequence means more work per call. 2.59x more baseline work costs only 1.16x more per call, so the
+residual overhead is near-fixed and the penalty nearly halves.
+
+Residual added cost is 0.588 ms/call at seq 512 against **0.02 ms/call of device time** — the device
+executes a 28-call NEFF in 0.609 ms at 43% memory-bandwidth utilisation and 95% engine active time.
+The kernels were never the problem.
 
 ### Denominator, stated explicitly
 
@@ -127,28 +156,38 @@ plausible and the conclusion was still wrong, which is why the measurement was n
 
 ---
 
-## What would change the answer
+## What would change the answer — RESOLVED, and both guesses were wrong
 
-**Graph mode is now the decisive question**, and it could not be answered here.
+> This section originally named graph mode as the decisive question and asked for a different stack.
+> Kept in place because how it resolved is more instructive than the conclusion.
 
-If the ~53 ms is a per-invocation framework-boundary cost, compiling the model should amortize
-it — the kernels become part of one graph entered once per step instead of 169 times. If it is
-intrinsic to executing a NKI NEFF, compilation will not help.
+**Graph mode was not the decisive question, and `torch.compile` was not blocking it.**
 
-`scripts/experiment_torch_compile_nki.py` tried to settle it and **could not**, because
-`torch.compile` fails on this stack for **plain PyTorch** — `F.silu` with no NKI anywhere fails
-identically across `openxla`, `inductor`, and `eager` backends in both bf16 and fp32
-(`Dynamo failed to run FX node with fake tensors`). A NKI failure would be indistinguishable
-from compilation being broken generally, so the experiment refuses to report a NKI result and
-says so. See Finding #21.
+Two corrections:
 
-Answering it needs either a stack where `torch.compile` works on Neuron (the Native PyTorch
-beta's compile path) or direct guidance from the NKI / torch-neuronx teams on the supported way
-to invoke a NKI kernel from a compiled graph.
+1. **`torch.compile` is not broken on this stack.** `add`, `mul` and `relu` all compile and run on
+   XLA tensors. What fails is the set of ops `torch_neuronx` replaces with XLA user computations —
+   `silu`, `gelu`, `Embedding`, `Softmax`, `CrossEntropyLoss`, `topk`, `argmax`, `Dropout` — because
+   the dispatch predicate accepts a `FakeTensor` and then rejects it inside
+   `_xla_user_computation`. Real upstream bug (Finding #23), but not a blocker here.
+2. **torch-xla is already a graph runtime**, so the question was answerable without `torch.compile`
+   at all. Counting device executions with torch-xla's own `ExecuteTime` metric: **28 NKI calls fuse
+   into one HLO graph and one device execution** (196 nodes) and still cost 28x. Graph batching was
+   never the lever.
 
-**Second thing worth checking:** ~53 ms is large enough to look like a misconfiguration rather
-than a design point. Worth asking whether it is expected on SDK 2.31 / NKI 0.5.0 via
-torch-xla eager, before treating it as a fundamental property.
+That relocated the cost off the device, and the profile confirmed it: the NEFF containing all 28
+calls executes in **0.609 ms** while wall time is 1459 ms, and 99.9% of that wall time is spent
+before `mark_step`. cProfile then named the function — 51 of the 52 ms is `select.poll` waiting on
+`subprocess.check_output` inside `_detect_target()`.
+
+**The second thing this section flagged turned out to be right.** It said "~53 ms is large enough to
+look like a misconfiguration rather than a design point. Worth asking whether it is expected." It
+was not expected — it is a bug, and one decorator fixes it. That instinct should have been pursued
+before four more framework-level experiments.
+
+**What would change the answer now:** whether the residual ~0.59 ms/call in `create_computation` is
+also cacheable. That is the difference between 3.4x slower and plausibly near parity, and it is a
+scoping question for the NKI team rather than an experiment we can run.
 
 ---
 
@@ -156,7 +195,8 @@ torch-xla eager, before treating it as a fundamental property.
 
 | Goal | Status |
 |---|---|
-| Measure MFU with and without kernels, denominator stated | **Done.** 5.06% → 0.02%, denominator explicit, FLOP count auditable |
+| Measure MFU with and without kernels, denominator stated | **Done, then re-done.** 5.06% → 0.02% as first measured; 5.05% → 1.50% after root-causing (→ 4.81% at seq 2048). Denominator explicit, FLOP count auditable. |
+| Root-cause the regression rather than just reporting it | **Done** — an uncached `neuron-ls` subprocess per invocation, fix verified at 102x. Not in the original Week 4 goals; it is the most valuable output of the week. |
 | Report launch count alongside MFU (per Finding #19) | **Done**, and it turned out to be the whole story |
 | Full-size model rather than the 2-layer stand-in | **Done** — Qwen3-0.6B at full 28 layers |
 | Confirm the RoPE `seq_len % 128` guard doesn't silently disable the kernel | **Done** — seq 512, RoPE engaged 28/28, zero fallbacks |

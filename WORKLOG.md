@@ -7,26 +7,56 @@ Weeks 3, 4, 5 and 6 are all done. Final deliverable: **`deliverables/poc-documen
 
 ### The result that matters
 
-**MFU 5.06% → 0.02%. The kernels make the model 208x slower.**
+**Every `@nki.jit` invocation was forking a subprocess. Fixing it is one decorator and worth 102x
+per call.**
 
-Root cause, and it took real digging: **every `@nki.jit` invocation from eager PyTorch/XLA
-costs ~53 ms of fixed overhead, independent of problem size.** That is more than the entire
-42 ms baseline forward pass, so at 169 kernel calls per step nothing else matters. Flat across a
-112x range in input size; reproduced four times within 1%. Ruled out interleaving, host dispatch,
-my kernels (nki-library's production `rope_hf` shows the same number), recompilation, and sync
-artifacts. Finding #20.
+`nki/framework/compiled.py::_compile_opts()` calls `resolve_target()` on every invocation, which
+falls through to `_detect_target()`, which runs `neuron-ls` to ask the hardware what it is. ~52 ms
+per kernel call. It sits *outside* `_nki_compile_cache`, because its result is part of the cache
+key — so a cache **hit** still pays it in full. Finding #24.
 
-It is an **integration-model** result, not a kernel-quality one. The Kernel Hub wants many small
-kernel invocations; NKI charges ~53 ms each; nki-library's kernels are built as a few large fused
-megakernels. Three separate findings now converge on that same mismatch — weight layout (#17),
-single-core width limits (#18), and invocation cost (#20).
+| | step time | MFU | penalty |
+|---|---|---|---|
+| baseline, seq 512 | 42.04 ms | 5.05% | — |
+| kernelized, before fix | 8753.65 ms | 0.02% | 208x |
+| kernelized, after fix | 141.43 ms | 1.50% | 3.36x |
+| kernelized, after fix, seq 2048 | 223.99 ms | 4.81% | **2.06x** |
 
-**The one escape, and I could not test it.** If that cost is a per-invocation framework-boundary
-charge, graph mode should amortize it and the whole picture changes. But `torch.compile` does not
-work on this stack *at all* — plain `F.silu` with no NKI fails across every backend and dtype — so
-a NKI failure would be indistinguishable from compile being broken generally, and I refused to
-record a NKI result from it (#21). **This is the single most valuable remaining experiment in the
-project** and it needs a different stack.
+Verified two ways (env override and `lru_cache`), baseline re-run last as a control, cosine
+similarity identical to six decimals across all variants. This is **not Kernel Hub specific** —
+anything invoking NKI kernels per-layer from eager PyTorch is paying it today.
+
+**I had this wrong, and the correction is the more useful story.** The previous version of this
+summary said the ~53 ms was a graph-transition cost, that the mismatch was structural, and that the
+decisive experiment needed a stack where `torch.compile` works. All three were wrong:
+
+- `torch.compile` is not broken here. `add`/`mul`/`relu` compile fine on XLA. What fails is the set
+  of ops `torch_neuronx` overrides with XLA user computations (`silu`, `gelu`, `Embedding`,
+  `Softmax`, `CrossEntropyLoss`, `topk`, `argmax`, `Dropout`) because the dispatch predicate accepts
+  a `FakeTensor` and then rejects it. Real bug, filed separately (#23), but not a blocker.
+- `torch.compile` was never the right instrument. torch-xla is *already* a graph runtime. 28 NKI
+  calls fuse into **one** HLO graph and **one** device execution (196 nodes) and still cost 28x.
+- The cost was never on the device. The NEFF containing all 28 calls executes in **0.609 ms** at
+  43% memory-bandwidth utilisation and 95% engine active time.
+
+The wrong hypothesis survived four experiments — interleaving, data volume, recompilation, and
+our-kernels-vs-production — because **all four measured wall-clock time at the framework level and
+none of them could see inside the 52 ms.** Two changes of instrument settled it in about 35 minutes:
+a device profile (0.609 ms device vs 1459 ms wall) and then a cProfile, which named the function.
+
+### What still holds
+
+Even fixed, the kernels are a net loss at these shapes. ~0.59 ms/call of dispatch remains against
+0.02 ms of device time, and cProfile puts it in `create_computation` rebuilding the XLA computation
+and its HLO protobufs *on every call* — same class of bug, 100x smaller. A torch op costs
+0.02–0.03 ms, so NKI dispatch is still 15–20x a torch op's.
+
+Break-even needs a kernel to save >0.59 ms/call; RMSNorm, RoPE and SiLU at these shapes are 15–30x
+short. It does amortise — 2.59x more work per call costs only 1.16x more, so 4x the sequence nearly
+halves the penalty — but that heads toward parity, not a speedup. So the structural argument
+survives with a corrected mechanism: the granularity that wins is the granularity the Kernel Hub
+cannot express (#17, #18), not because NKI can't fuse into the graph, but because its per-call
+dispatch is too expensive to amortise over one small layer.
 
 ### What else landed
 
@@ -51,6 +81,7 @@ Worth reading as a set, because the pattern is the most transferable output of t
 | 8 | "RMSNorm validated, bit-identical" | kernel never ran; fallback compared to itself |
 | 19 | "NKI is 8-400x slower" | outputs discarded, XLA eliminated the computation — timed an empty graph |
 | 21 | "NKI is incompatible with torch.compile" | my loader didn't register the module in `sys.modules` |
+| **24** | **"per-layer NKI swapping is structurally launch-bound"** | **an uncached `neuron-ls` subprocess; 102x recoverable with one decorator** |
 
 On a lazy-execution backend, **both correctness and performance measurements fail silently by
 default.** A fallback is numerically correct. An eliminated computation is fast. A harness bug
@@ -58,6 +89,26 @@ looks like a platform limitation. None of them error. The guards now in place (e
 counters, a scaling gate, mandatory controls, negative controls) are in
 `tests/nki_test_utils.py` and `scripts/benchmark_kernels.py`, and #19 was caught *by* the guard
 built after #8.
+
+**The fourth one is a different failure mode and it is the one I would most want to avoid
+repeating.** The first three are harness bugs: the measurement was invalid, and a guard catches
+them. In the fourth the measurements were all *valid* — ~52 ms/call really is the cost, reproduced
+five times within 1% — and the conclusion drawn from them was wrong. No guard catches that, because
+nothing is broken.
+
+Two practices came out of it:
+
+- **When a hypothesis has survived several tests and the story still doesn't close, change
+  instrument rather than adding another variant.** Repeated survival is evidence about the
+  instrument as much as about the hypothesis.
+- **Measure the two ends against each other early.** Device time vs wall time is one number each.
+  Their ratio was 2400x and it invalidated an entire class of explanation at once. It should have
+  been the first thing measured, not the fifth.
+
+There is also a smaller trap worth naming. When I believed the cost was inside the NEFF, I wrote out
+three candidate explanations ranked by plausibility. All three were device-side, because the framing
+had already concluded the cost was in the execution. The true answer wasn't ranked low — it was
+absent. **Enumerating candidates inside a single framing feels like rigour and isn't.**
 
 ### What needs you
 
@@ -754,22 +805,47 @@ worse. Stated as a limitation rather than hidden.
 
 ## BLOCKED — NEEDS INPUT (final)
 
-**B7. Get onto a stack where `torch.compile` works on Neuron.** Blocks the single most valuable
-remaining experiment (Finding #21). The Native PyTorch beta compile path is the likely candidate.
-*This is the top ask.*
+**~~B7. Get onto a stack where `torch.compile` works on Neuron.~~ WITHDRAWN.** This was the top ask
+and it was wrong. `torch.compile` is not broken here — `add`/`mul`/`relu` compile fine on XLA; only
+ops `torch_neuronx` overrides fail (#23). More importantly `torch.compile` was never the right
+instrument: torch-xla is already a graph runtime, and 28 NKI calls already fuse into one HLO graph
+and one device execution while still costing 28x. Nothing to get onto a different stack for.
 
-**B8. Is ~53 ms per NKI invocation expected on SDK 2.31 / NKI 0.5.0 via torch-xla eager?** It is
-large enough to look like a misconfiguration rather than a design point. If the NKI or
-torch-neuronx teams already know, asking beats measuring — and if it's a known issue the PoC's
-conclusion changes materially.
+**~~B8. Is ~53 ms per NKI invocation expected on SDK 2.31 / NKI 0.5.0?~~ ANSWERED — no, it's a bug.**
+It is an uncached `neuron-ls` subprocess in `_detect_target()`, called on every invocation from
+`_compile_opts()`, outside the compile cache because its result is part of the cache key. One
+`lru_cache` is worth 102x per call. Finding #24. The instinct that it "looked like a
+misconfiguration rather than a design point" was right and I should have pushed on it sooner.
 
-**B9. Sanity-check the PoC recommendation before it goes to Hanbo/Karthick.** It contains a
-stronger negative than I'd have predicted at Week 1 ("if graph mode doesn't help, don't invest
-further"). Worth a mentor's read.
+**B9. Sanity-check the PoC recommendation before it goes to Hanbo/Karthick.** Still open, and now
+more necessary: the recommendation *inverted*. It went from "yes but defer kernel work, and answer
+the graph-mode question first" to "yes, fix two caching bugs first, then reassess." Worth a mentor's
+read before it goes out.
+
+**B10. Who owns `nki/compiler/target.py`, and do I write the CR?** Highest-value item in the
+project, one decorator, reproducer in `scripts/probe_target_override_fix.py`. Not Kernel Hub
+specific — any eager per-layer NKI use pays this today.
+
+**B11. Is `NEURON_PLATFORM_TARGET_OVERRIDE` customer-supported or internal-only?** Decides whether
+it can be documented as a workaround. Related and worth raising together: with no `neuron-ls` on
+PATH, `_detect_target()` silently returns `"trn3"`, so it would compile for the wrong generation
+rather than fail loudly.
+
+**B12. Is the residual `create_computation` cost cacheable?** ~0.59 ms/call, rebuilt on every
+invocation. Same class of bug as B10, 100x smaller, but it is the difference between 3.4x slower and
+plausibly near parity. Not attempted — it sits inside `torch_xla`'s op-registry path, and I would
+rather ask than guess. **This is now the top technical ask.**
+
+**B13. Scope check.** I am now a layer below the Kernel Hub, inside NKI's dispatch path. In scope
+for this PoC, or hand off and return to kernels?
 
 Still open from earlier sessions: B1 (Hub repo home — Samir), B2 (who drives the upstream fixes),
 B3 (is inference-only acceptable for beta), B4 (Hub upload, gated on B1), B5 (fused-kernel work
 blocked by #17/#18), B6 (superseded — MFU methodology resolved).
+
+**Also, unchanged and still true: 30-odd commits exist only on this laptop.** Nothing has been
+pushed, per the guardrail. That is a single point of failure for the whole project and worth
+resolving deliberately rather than by accident.
 
 ---
 

@@ -296,3 +296,80 @@ Updated after Week 3. Answered ones kept for the record.
 - *Is there appetite for a `kernel-builder init --backends neuron` command?* Lower priority
   than originally thought — NKI kernels are pure Python and need no build step, so the flat
   layout suffices.
+
+---
+
+## Before porting anything else: fix the dispatch path, and measure differently
+
+Added after Finding #24. This changes the sequencing advice in this document, so read it before
+acting on the porting guidance above.
+
+### 1. The porting cost was never the bottleneck
+
+This document has spent most of its length on how hard nki-library kernels are to port — fusion,
+dependency closures, interface mismatch, SPMD assumptions. All of that is accurate. None of it was
+what made the kernels slow.
+
+Two caching bugs in NKI's eager dispatch path account for the entire measured regression:
+
+| bug | cost per call | status |
+|---|---|---|
+| `_detect_target()` forks `neuron-ls` on every invocation | ~52 ms | **fix verified, 102x** |
+| `create_computation` rebuilds the XLA computation + HLO protobufs every invocation | ~0.59 ms | attributed, not fixed |
+
+A perfectly ported kernel would have paid both. So **the highest-leverage porting work right now is
+not porting** — it is fixing the second bug, because it sets the break-even threshold every future
+port has to clear.
+
+### 2. Break-even is the number that should drive the porting queue
+
+After the first fix, a swapped kernel is a net win only if it saves more than **~0.59 ms of torch
+time per call**. That is a concrete admission criterion, and it reorders the candidate list:
+
+| candidate | torch cost per call at typical shapes | worth porting today? |
+|---|---|---|
+| RMSNorm | ~0.02–0.05 ms | **no** — 12–30x underwater |
+| SiLU / activations | 0.02–0.04 ms | **no** — same |
+| RoPE | small | **no** |
+| Fused MLP (gate+up+silu+down) | replaces many ops | **yes, if #17/#18 resolve** |
+| Fused attention block | replaces many ops | **yes, same caveat** |
+| MoE routing `sort`/`histc` | currently *impossible* on Neuron | **yes — different reason, see below** |
+
+The three kernels this PoC built are all in the "no" bucket. They were the right choice for proving
+the *mechanism* — small, single-op, no weight-layout issues, no sharding — and they are the wrong
+choice for a performance win. Those are different goals and it is worth being explicit about which
+one a given port serves.
+
+The MoE routing kernel is the exception that does not need break-even arithmetic: without it,
+Qwen3-MoE does not run on Neuron at all with transformers' default experts implementation. Enabling
+a model beats speeding one up, and it is blocked by neither #17 nor #18.
+
+### 3. Two things larger shapes fix for free
+
+Per-call dispatch overhead is near-fixed, so it amortises: 2.59x more work per call cost only 1.16x
+more, and 4x the sequence length took the penalty from 3.36x to 2.06x. Practical consequence for
+anyone evaluating a port:
+
+- **Benchmark at realistic shapes.** A 0.6B model at seq 512 is close to the worst case for fixed
+  dispatch overhead, and it is the easiest thing to reach for. We used it, and it made the
+  integration look worse than it is.
+- **Report the shape alongside the ratio.** "3.4x slower" and "2.06x slower" are the same build on
+  the same hardware with the same kernels. A ratio without a shape is not a result.
+
+### 4. Add a device-time check to the porting checklist
+
+The most transferable process change from this project. Before forming any hypothesis about why a
+kernel is slow:
+
+```
+device time (neuron-explorer `total_time`)  vs  wall time (time.perf_counter)
+```
+
+Two numbers. If they differ by orders of magnitude, the problem is not in the kernel and no amount
+of kernel tuning will help. Our ratio was 2400x, and that single comparison invalidated four
+experiments' worth of conclusions.
+
+Concretely, for each ported kernel record: device `total_time`, MBU, engine active %, wall time per
+call, and the wall/device ratio. If the ratio is large, stop and profile the host before touching the
+kernel. A kernel executing at 43% memory-bandwidth utilisation — which ours was, the whole time —
+is not the thing to optimise.
