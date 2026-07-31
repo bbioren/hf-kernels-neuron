@@ -1646,3 +1646,136 @@ Python profile.
 A hypothesis that keeps surviving tests is not necessarily right. It may only be untestable by the
 instrument in use. When a hypothesis has survived several tests and the story still does not close,
 the next move is a different *kind* of measurement, not another variant of the same one.
+
+---
+
+## 25. Each NKI call is an optimisation barrier: the compiler cannot fuse across it, and for memory-bound ops fusion is the whole optimisation [CRITICAL — the real structural limit]
+
+Every performance finding before this one measured **dispatch** cost: ~52 ms/call from an uncached
+subprocess (#24, fixed), ~0.59 ms/call residual from rebuilding the XLA computation (#24, open),
+0.02 ms/call of device time. None of them said whether the kernels are any *good*.
+
+That gap mattered, because the two possibilities point opposite ways. If NKI is faster than torch on
+device, dispatch is the only thing between here and a win and Fix 7 is the whole ballgame. If NKI is
+slower on device, fixing dispatch never produces a speedup and per-layer swapping of these ops is a
+dead end on merit rather than on plumbing.
+
+**It is the second one, and the reason is not kernel quality.**
+
+### The measurement
+
+Device time only, from `neuron-explorer` `total_time`, for identical work computed both ways: N
+chained applications of the op, same shape, dtype and compiler defaults (`NEURON_CC_FLAGS` unset, as
+everywhere else in this project). Wall-clock dispatch cost is excluded by construction.
+
+| config | device ms | ms/call | HBM r+w | MBU | active |
+|--------|-----------|---------|---------|-----|--------|
+| silu / NKI / N=28 | 0.607 | 0.0217 | 188.7 MB | 43.2% | 95.1% |
+| silu / torch / N=28 | **0.224** | **0.0080** | **6.3 MB** | 3.9% | 97.8% |
+| rmsnorm / NKI / N=28 | 1.625 | 0.0581 | 188.8 MB | 16.2% | 99.1% |
+| rmsnorm / torch / N=28 | **0.637** | **0.0227** | **6.4 MB** | 1.4% | 94.4% |
+
+**NKI is 2.71x slower on SiLU and 2.55x on RMSNorm, with ~30x the HBM traffic.**
+
+### The attribution needed care, and the first pass of it was wrong
+
+The obvious next step is to divide traffic by N and compare against a floor. Doing that at N=1 says
+NKI moves 3.00x the necessary traffic for both ops, which reads as a spilled intermediate — plausibly
+the fp32 temporary introduced when these kernels were migrated to `nl.ds` (Finding #14 correction).
+
+That conclusion is an artifact. **Traffic is not linear in N**: a small NEFF carries fixed setup
+traffic that dominates at N=1. With two call counts, both terms are solvable:
+
+```
+traffic(N) = FIXED + N x MARGINAL
+```
+
+| config | traffic(1) | traffic(28) | marginal/call | vs floor | fixed |
+|--------|-----------|-------------|---------------|----------|-------|
+| silu / NKI | 18.87 MB | 188.74 MB | **6.29 MB** | **1.00x** | 4.0 tiles |
+| silu / torch | 6.29 MB | 6.29 MB | **0.00 MB** | 0.00x | 2.0 tiles |
+| rmsnorm / NKI | 18.88 MB | 188.76 MB | **6.29 MB** | **1.00x** | 4.0 tiles |
+| rmsnorm / torch | 7.88 MB | 6.42 MB | **~0.00 MB** | 0.00x | 2.5 tiles |
+
+The unfused floor for a `[512, 3072]` bf16 tile is 2 tiles = 6.29 MB: one read in, one write out, the
+minimum for an op that cannot fuse with its neighbours.
+
+**NKI's marginal traffic is exactly 1.00x that floor, for both ops.** The kernels spill nothing and
+are optimal for an unfused op. **Torch's traffic is independent of N**, which is only possible if the
+entire chain fused into a single pass.
+
+So the kernels are blameless and the whole gap has one cause.
+
+### The cause
+
+A NKI kernel reaches the compiler as an opaque custom call. **The compiler cannot fuse across it.**
+So replacing a torch op with a NKI kernel does not merely add dispatch cost — it *removes* a fusion
+opportunity the compiler was already exploiting. Each swapped op is forced to materialise its output
+to HBM and re-read it, where before it stayed resident across a fused region.
+
+For memory-bound operations — elementwise activations, normalisations — fusion *is* the optimisation.
+There is no arithmetic to speed up; the only thing that matters is how many times the data crosses
+the HBM boundary. A NKI kernel for such an op is therefore competing against "not touching HBM at
+all", and it cannot win, however well written it is.
+
+The MBU column makes this visible from the other side: NKI runs at 43.2% memory-bandwidth
+utilisation (it is bandwidth-bound, moving 188 MB), torch at 3.9% (it barely touches memory).
+
+### Why this is the most consequential finding in the project
+
+It changes the recommendation, and it is a stronger claim than anything preceding it.
+
+Findings #20 and #24 said per-layer swapping is *expensive*. This says it is the *wrong operation to
+perform* on this class of op. Fixing dispatch is necessary but **not sufficient**: even at zero
+dispatch cost, NKI SiLU and RMSNorm stay 2.5–2.7x slower on device than what they replace. So
+break-even is **unreachable** for these ops, not merely distant — which is different from #24's
+"15–30x short of break-even", and worse.
+
+It also explains the shape of the entire project. The ops the Kernel Hub is *best* at intercepting —
+RMSNorm (115 upstream registrations), RoPE (95 model files), activations (one decoration covering all
+of `ACT2FN`) — are precisely the ops that lose most from being intercepted. They are small, memory
+bound, and already fused. The mechanism's reach and its usefulness are inversely correlated.
+
+What *can* win is a kernel that replaces a whole fused region, so the kernel performs the fusion
+internally instead of blocking the compiler's. That is exactly what `nkilib`'s fused megakernels are,
+and exactly what Findings #17 (weight layout) and #18 (single-core width limit) say the Kernel Hub
+cannot currently express. Four findings now converge on the same conclusion from four independent
+directions:
+
+| Finding | Direction | Says |
+|---------|-----------|------|
+| #17 | weight layout | fused kernels need weights `kernelize()` can't produce |
+| #18 | sharding | fused kernels assume SPMD; won't compile single-core at real widths |
+| #24 | dispatch cost | per-call overhead, ~0.59 ms after the big fix |
+| **#25** | **compiler fusion** | **per-layer swap destroys the fusion that makes small ops fast** |
+
+### Honest limits of this measurement
+
+- **The chained microbenchmark maximises the fusion advantage.** 28 identical ops back to back is the
+  best possible case for the compiler. In a real model these ops are separated by matmuls, so less
+  fusion is available and the real penalty is smaller than 2.7x. It is not zero — Qwen3's SiLU sits
+  between the `gate * up` elementwise multiply and the down projection, which is exactly the kind of
+  neighbour it would otherwise fuse with — but the magnitude in situ was not measured.
+- **N=1 numbers are unreliable for traffic attribution**, since fixed NEFF traffic dominates. The
+  regression above is the right instrument; the raw N=1 per-call division is the wrong one, and it is
+  what produced the false spilled-intermediate reading.
+- **This says nothing about compute-bound ops.** A matmul-heavy fused kernel has real arithmetic to
+  optimise and is not competing against "stay in registers". #25 is a statement about memory-bound
+  ops specifically.
+- **Not measured: whether a NKI kernel spanning a fused region beats the compiler on that region.**
+  That is the experiment that would confirm the positive half of the recommendation, and it is
+  blocked by #17 and #18.
+
+### What to do
+
+1. **Stop treating RMSNorm, RoPE and activations as performance targets on this mechanism.** They are
+   excellent *mechanism* demonstrations — small, single-op, no weight-layout issues, no sharding — and
+   they cannot be wins. Those are different goals and the PoC conflated them for weeks.
+2. **Re-scope the porting queue around fusion span, not op popularity.** The question for a candidate
+   kernel is "does this replace a region the compiler would otherwise fuse, and does it do that
+   fusion better?" — not "how many models call this op?"
+3. **Ask the compiler team whether fusion across NKI custom calls is achievable at all.** If a NKI
+   kernel could be made transparent to the fusion pass, or could declare itself fusable, that would
+   change this finding. Worth asking before concluding it is fundamental.
+4. **Keep Fix 0 and Fix 7 anyway.** They are correct regardless, they benefit all eager NKI usage, and
+   #25 does not depend on them.

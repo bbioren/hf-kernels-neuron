@@ -9,11 +9,18 @@
 
 ## Recommendation
 
-**Yes. Fix two caching bugs in NKI's dispatch path first — one of them is a one-line change worth
-102x — then invest at the granularity that can actually win, which is not one small layer at a
-time.**
+**Yes, but not at per-layer granularity for small ops — and that is now a statement about what is
+possible, not about what is expensive.**
 
-Four findings, in order of how much they should change your plans:
+Fix the one-line caching bug in NKI's dispatch path regardless: it is worth 102x per kernel call and
+it benefits every eager NKI user on the platform, not just this integration. But do not expect it to
+make RMSNorm, RoPE or activation kernels into wins. Measured on device with dispatch cost excluded
+entirely, NKI SiLU is **2.71x slower** than torch SiLU and NKI RMSNorm is **2.55x slower** — not
+because the kernels are bad (their memory traffic is exactly optimal) but because a NKI custom call
+is opaque to the compiler, so nothing fuses across it. For memory-bound ops, fusion is the entire
+optimisation.
+
+Five findings, in order of how much they should change your plans:
 
 1. **A one-line bug was costing 102x per kernel call.** `nki/framework/compiled.py::_compile_opts()`
    calls `resolve_target()` on *every* invocation, which forks `neuron-ls` to ask the hardware what
@@ -42,21 +49,47 @@ Four findings, in order of how much they should change your plans:
    fails as a *silent no-op*. We found the fix (~3 lines in transformers) and verified it takes
    Qwen3 from 0 to 9 swapped layers.
 
-Break-even follows directly from item 3: a swapped kernel is a net win only if it saves more than
-~0.59 ms of torch time per call. Torch SiLU on `[512, 3072]` costs 0.02–0.04 ms, so these ops are
-**15–30x underwater**. Winning requires either dispatch cost at torch-op levels, or kernels that
-replace far more work per call — fused kernels, which is what `nkilib` actually ships and what
-Findings #17 and #18 say the Kernel Hub cannot currently express.
+5. **And even with dispatch free, these kernels still lose — on device.** This is the finding that
+   changes the conclusion from "expensive" to "wrong operation". Profiled with `neuron-explorer`, so
+   dispatch cost is excluded by construction:
+
+   | | device ms (N=28) | HBM traffic | marginal traffic/call | MBU |
+   |---|---|---|---|---|
+   | NKI SiLU | 0.607 | 188.7 MB | 6.29 MB = **1.00x** the unfused floor | 43.2% |
+   | torch SiLU | **0.224** | **6.3 MB** | **~0.00 MB** | 3.9% |
+   | NKI RMSNorm | 1.625 | 188.8 MB | 6.29 MB = **1.00x** the floor | 16.2% |
+   | torch RMSNorm | **0.637** | **6.4 MB** | **~0.00 MB** | 1.4% |
+
+   The kernels are *optimal*: marginal traffic is exactly one read in and one write out, the minimum
+   for an op that cannot fuse. Torch's traffic is independent of N, which is only possible if the
+   chain fused into one pass. So the whole 2.5–2.7x gap is the **fusion barrier** — a NKI custom call
+   is opaque to the compiler, and each swap forces a HBM round-trip where the data previously stayed
+   resident across a fused region. Finding #25.
+
+**Break-even is therefore unreachable for these ops, not merely distant.** The earlier version of
+this document derived break-even from dispatch cost alone — a kernel must save >0.59 ms/call, and
+these are 15–30x short. That understated it. Even at *zero* dispatch cost the device time is 2.5–2.7x
+worse, so no amount of plumbing work gets there.
+
+The uncomfortable corollary: **the ops the Kernel Hub is best at intercepting are the ops that lose
+most from being intercepted.** RMSNorm has 115 upstream registrations, RoPE covers 95 model files, one
+activation decoration covers all of `ACT2FN` — and all three are small, memory-bound, and already
+being fused. The mechanism's reach and its usefulness are inversely correlated.
+
+What could win is a kernel spanning a whole fused region, performing the fusion internally rather than
+blocking the compiler's. That is what `nkilib` ships, and what Findings #17 and #18 say the Kernel Hub
+cannot currently express.
 
 So the recommended investment is:
 
 | Priority | Investment | Cost | Why |
 |---|---|---|---|
-| 1 | **Cache `_detect_target()`** in `nki/compiler/target.py` | one decorator | 102x per call, verified accuracy-neutral. Benefits all eager NKI usage, not just this integration. |
-| 2 | **Cache the per-call XLA computation build** (`create_computation` + pyhlo scribe) | unknown, needs scoping | The remaining 0.59 ms/call, and the difference between 3.4x slower and plausibly near parity. Not yet attempted — see *What is not done*. |
-| 3 | **Four small upstream fixes** (device routing, `_backend()`, `nkilib` allowlist, weight-layout contract) | ~a week, three teams | Each smaller than one kernel port. Together they make the mechanism reachable and honest. |
-| 4 | **A NKI kernel for MoE routing** (`sort`/`histc`) | small | Unblocks Qwen3-MoE on Neuron *entirely*, and is blocked by none of our other findings. |
-| 5 | Kernel porting at per-layer granularity | — | **Defer** until item 2 lands. Until dispatch is cheaper, small-op swaps lose on arithmetic, however good the kernel is. |
+| 1 | **Cache `_detect_target()`** in `nki/compiler/target.py` | one decorator | 102x per call, verified accuracy-neutral. Benefits all eager NKI usage, not just this integration. Correct regardless of everything below. |
+| 2 | **Ask the compiler team whether fusion across a NKI custom call is achievable** | a question | Finding #25 is the binding constraint. If a NKI kernel could be made transparent to the fusion pass, or could declare itself fusable, the whole picture changes. Worth asking before treating it as fundamental. |
+| 3 | **A NKI kernel for MoE routing** (`sort`/`histc`) | small | Unblocks Qwen3-MoE on Neuron *entirely* — it does not run at all today with the default experts implementation. Blocked by none of our findings, and enabling a model beats speeding one up. |
+| 4 | **Four small upstream fixes** (device routing, `_backend()`, `nkilib` allowlist, weight-layout contract) | ~a week, three teams | Each smaller than one kernel port. Together they make the mechanism reachable and honest. Worth doing for correctness even if performance never arrives. |
+| 5 | **Scope caching the per-call XLA computation build** (`create_computation` + pyhlo scribe) | unknown | The remaining 0.59 ms/call. Demoted from item 2 in the previous version: #25 shows it is no longer decisive, because closing it still leaves a 2.5–2.7x device deficit. |
+| 6 | Kernel porting at per-layer granularity for small memory-bound ops | — | **Don't.** Not "defer" — these cannot win. Re-scope the queue around fusion span rather than op popularity. |
 
 The previous version of this document made item 1 "answer the graph-mode question — can a NKI kernel
 live in a compiled graph with invocation cost paid once?" **That question is now answered, and it
@@ -66,10 +99,26 @@ because the cost was on the host before `mark_step`. That ask is withdrawn.
 
 ### What would change this recommendation
 
-If item 2 turns out to be infeasible — if the XLA computation genuinely must be rebuilt per call —
-then per-layer NKI swapping stays a net loss for small ops, and the honest conclusion is that the
-Kernel Hub's granularity cannot host `nki-library`'s fused design. That is still worth knowing, and
-it is now a scoping question for the NKI team rather than an open experiment.
+**One thing, and it is item 2.** If NKI custom calls could participate in compiler fusion — made
+transparent to the fusion pass, or able to declare themselves fusable — then Finding #25 dissolves,
+break-even becomes reachable, and item 5 goes back to being decisive. That is the single question
+worth asking before accepting the negative half of this recommendation.
+
+Two things that would *not* change it, stated because they were previously believed to:
+
+- **Graph mode.** Answered and withdrawn. 28 NKI calls already fuse into one HLO graph and one device
+  execution and still cost 28x, because the cost was on the host before `mark_step`.
+- **Fixing all the dispatch overhead.** Necessary, and insufficient. The device deficit survives it.
+
+### One thing this PoC did not measure, and should have
+
+The 2.5–2.7x device figures come from a **chained** microbenchmark — 28 identical ops back to back —
+which is the best possible case for the compiler's fusion and therefore the worst case for NKI. In a
+real model these ops are separated by matmuls, so less fusion is available and the in-situ penalty is
+smaller. It is not zero: Qwen3's SiLU sits between the `gate * up` elementwise multiply and the down
+projection, exactly the neighbour it would otherwise fuse with. But the magnitude in a real forward
+pass was not isolated, and it should be before anyone acts on the size of the number rather than its
+direction.
 
 ---
 
@@ -375,6 +424,7 @@ More tractable than maintaining hand-ports of 7,000-line kernels, but not free.
 | `torch.compile` fails on most transformers | **not** a broken stack: `add`/`mul`/`relu` compile fine. `torch_neuronx` overrides `silu`, `gelu`, `Embedding`, `Softmax`, `CrossEntropyLoss`, `topk`, `argmax`, `Dropout` with XLA user computations that accept a `FakeTensor` and then reject it, so Dynamo cannot trace them. `torch_xla.compile()` works around it. |
 | Every NKI call forks a subprocess | `_detect_target()` runs `neuron-ls` per invocation, ~52 ms, outside the compile cache. One decorator fixes it (Finding #24). |
 | Every NKI call rebuilds its XLA computation | `create_computation` + pyhlo scribe + 168 protobuf enum lookups per call, ~0.59 ms. The residual after the fix above. |
+| The compiler cannot fuse across a NKI custom call | Each swapped op is forced to round-trip through HBM where the data previously stayed resident across a fused region. 2.5–2.7x on device for memory-bound ops, independent of dispatch cost and of kernel quality (Finding #25). The binding constraint. |
 
 Fixing `_backend()` is one line in `torch_neuronx` and resolves the first two at once. It does
 **not** fix device routing — that is Finding 2's separate transformers change. Two distinct
@@ -430,6 +480,26 @@ Two practices follow, and they generalise past this stack:
   and their ratio invalidated an entire class of explanation at once. It should have been the first
   thing measured, not the fifth.
 
+### A fifth instance, caught before it shipped, and worth recording for that reason
+
+Finding #25's first attribution was also wrong, and the mechanism is worth naming because it is a
+different trap again: **a correct calculation applied to a quantity that isn't linear.**
+
+Dividing HBM traffic by call count gave "NKI moves 3.00x more data than necessary", which reads as a
+spilled intermediate — and there was even a plausible culprit, the fp32 temporary introduced when
+these kernels were migrated off `nl.arange`. Exactly 3.00x for both ops independently is the tell: a
+real inefficiency would not land on a round number twice.
+
+Traffic is not linear in N. A small NEFF carries fixed setup traffic that dominates at N=1, so per-call
+division overstates cost there. Measuring two call counts and solving `traffic(N) = FIXED + N x
+MARGINAL` gives marginal traffic of exactly 1.00x the floor — the kernels are optimal, and the earlier
+reading was an artifact of the arithmetic rather than a property of the kernels.
+
+The generalisable point: **before dividing by N, check that the quantity is actually proportional to
+N.** Two data points cost one extra profile run and turned a wrong finding into a right one. This is
+the same class of error as #19 (latency not scaling with problem size), and the same fix applies —
+vary the independent variable and look at the shape, don't assume it.
+
 What we now do, and would recommend to anyone doing kernel work on this stack:
 
 1. **Assert execution, don't infer it.** A call counter on the dispatch targets proves the
@@ -444,6 +514,11 @@ What we now do, and would recommend to anyone doing kernel work on this stack:
    only avoided a false finding because it compiled plain `F.silu` first.
 5. **Include negative controls.** Every accuracy suite checks that it can *fail* — against a
    wrong reference and against the unmodified input.
+6. **Compare device time against wall time before forming any hypothesis.** Two numbers. If they
+   differ by orders of magnitude, the problem is not in the kernel and no kernel tuning will help.
+   Ours differed by 2400x and that single ratio invalidated four experiments' worth of conclusions.
+7. **Vary N before dividing by N.** Fixed and marginal costs are different quantities, and a
+   per-call average conflates them. Two call counts separate them and cost one extra run.
 
 This cost roughly a cycle each time, and one of the three was caught only because the guard
 built after the previous one fired.
@@ -455,7 +530,8 @@ built after the previous one fired.
 | # | Ask | Owner | Size | Status |
 |---|-----|-------|------|--------|
 | 1 | **Cache `_detect_target()`** — it forks `neuron-ls` on every kernel invocation, ~52 ms, outside the compile cache | NKI | one decorator | **102x verified, accuracy-neutral** |
-| 2 | **Scope caching the per-call XLA computation build** (`create_computation` + pyhlo scribe, ~0.59 ms/call) | NKI / torch-neuronx | unknown | the difference between 3.4x slower and near parity |
+| 2 | **Can a NKI custom call participate in compiler fusion?** Today it is opaque, so each swap costs a HBM round-trip the compiler would otherwise elide | NKI / compiler | a question | **now the binding constraint (#25)** |
+| 2b | Scope caching the per-call XLA computation build (`create_computation` + pyhlo scribe, ~0.59 ms/call) | NKI / torch-neuronx | unknown | demoted: closing it still leaves a 2.5–2.7x device deficit |
 | 3 | Route XLA-on-Neuron to `Device(type="neuron")` (3 sites) | transformers + `kernels` | ~12 lines | **fix verified sufficient** |
 | 4 | Set `torch.neuron` so `_backend()` reports neuron | `torch_neuronx` | 1 line | unblocks two things |
 | 5 | Add `nkilib` to `python_depends.json` under `neuron` | HF `kernels` | ~6 lines | `nki` is precedent |
@@ -468,15 +544,22 @@ built after the previous one fired.
 Full detail with exact code locations and ready-to-paste patches in `docs/upstream-fixes.md`.
 
 **Sequencing matters.** Item 1 is the highest ratio of value to effort in this document and is
-independent of everything else — it benefits any eager NKI usage, not just the Kernel Hub. Item 2
-gates whether items 7 and 8 are worth anyone's time: there is no point designing a
-weight-transformation contract for kernels that cannot be a net speedup. Items 3, 4, 5, 9 and 10
-are worth doing regardless, because they concern correctness, reachability and documentation
-rather than performance. Item 6 is unrelated to this integration and is filed because we found it.
+independent of everything else — it benefits any eager NKI usage, not just the Kernel Hub. **Item 2 is
+now the question that decides whether this integration can ever be a performance win**, and it is a
+question rather than an experiment, so it is cheap. Items 3, 4, 5, 9 and 10 are worth doing regardless,
+because they concern correctness, reachability and documentation rather than performance. Item 6 is
+unrelated to this integration and is filed because we found it.
 
-**A previous version of this table led with "answer the graph-mode question."** That is now
-answered and was the wrong question — 28 NKI calls already share one HLO graph and one device
-execution and still cost 28x, so graph batching was never the lever. Withdrawn.
+Items 7 and 8 (the fused-kernel enablers) are gated on item 2 in one direction only: if fusion across
+custom calls is impossible, then a fused kernel spanning a whole region becomes *more* important, not
+less, because it is the only way to get the fusion done at all. So item 2 changes the shape of the
+answer rather than whether to act.
+
+**Two asks from earlier versions of this table have been withdrawn.** "Answer the graph-mode
+question" — answered and wrong; 28 NKI calls already share one HLO graph and one device execution and
+still cost 28x. And item 2's predecessor, "cache the XLA computation build", was listed as the
+difference between 3.4x slower and near parity; Finding #25 shows that closing it still leaves a
+2.5–2.7x device deficit, so it is no longer decisive.
 
 ---
 
@@ -504,9 +587,16 @@ Stated plainly so nobody inherits a false impression:
   one. With the fix applied this caveat cuts the *other* way, and we measured it via sequence length
   rather than model size: 4x the sequence narrows the penalty from 3.36x to 2.06x. An 8B model would
   narrow it further. We did not run 8B at full depth.
-- **No demonstration that any kernel beats the torch op it replaces.** Every performance result here
-  is about dispatch overhead. Whether NKI RMSNorm is intrinsically faster than torch RMSNorm at a
-  given shape is unmeasured, and it is a separate question from all of the above.
+- ~~**No demonstration that any kernel beats the torch op it replaces.**~~ **Now measured (Finding
+  #25): none of them do.** NKI SiLU is 2.71x slower on device and NKI RMSNorm 2.55x, with dispatch
+  excluded. The kernels themselves are optimal (marginal traffic exactly at the unfused floor); the
+  gap is the compiler's inability to fuse across a custom call.
+- **The in-situ magnitude of the fusion penalty is not measured.** The 2.5–2.7x figures are from a
+  chained microbenchmark, which maximises fusion opportunity and so is the worst case for NKI. The
+  direction is solid; the size in a real forward pass is not.
+- **Not measured: whether a NKI kernel spanning a fused region beats the compiler on that region.**
+  This is the experiment that would confirm the positive half of the recommendation, and it is blocked
+  by Findings #17 and #18.
 - **Single core only.** Eager per-layer swap doesn't manage multi-core; SPMD was stripped from
   the RoPE port.
 
@@ -555,14 +645,42 @@ swapped three kernels into two model architectures with matching logits and no m
 Neither the kernel quality nor the integration design caused the regression we spent most of this
 project measuring.
 
-**The single most valuable next step is item 1 — cache `_detect_target()`.** It is one decorator, it
-is verified, and it is worth 102x per call to every eager NKI user on the platform. Item 2 then
-decides whether this integration can reach parity, and it is a scoping question rather than an
-experiment. We would recommend both before committing engineering time to kernel porting.
+The third answer, and where it rests: **even with dispatch free, these kernels lose on device.** NKI
+SiLU is 2.71x slower than torch SiLU and NKI RMSNorm 2.55x, measured with dispatch excluded. The
+kernels are not at fault — their marginal memory traffic is exactly the theoretical floor for an op
+that cannot fuse. The compiler simply cannot fuse across a NKI custom call, so each swap forces a HBM
+round-trip where the data previously stayed resident across a fused region. For memory-bound ops,
+fusion is the whole optimisation, so the swap is competing against not touching memory at all.
+
+That makes break-even **unreachable** for these ops rather than distant, and it is the one conclusion
+in this document that no amount of plumbing work changes.
+
+It also explains the shape of the project in a way none of the earlier framings did. **The ops the
+Kernel Hub is best at intercepting are the ops that lose most from being intercepted.** RMSNorm has
+115 upstream registrations, RoPE covers 95 model files, one decoration covers every `ACT2FN`
+activation — and all three are small, memory-bound, and already fused. Reach and usefulness are
+inversely correlated here, which is why the mechanism looked so promising for four weeks and then
+didn't.
+
+**The single most valuable next step is still item 1 — cache `_detect_target()`.** One decorator,
+verified, 102x per call for every eager NKI user on the platform, and correct regardless of everything
+else. **The most valuable next question is item 2:** can a NKI custom call participate in compiler
+fusion? If yes, Finding #25 dissolves and this integration becomes a good bet. If no, then per-layer
+swapping of small ops is closed, and the only viable shape is a kernel spanning a whole fused region —
+which is what `nki-library` already ships, and what Findings #17 and #18 say the Kernel Hub cannot yet
+express.
 
 One closing note on process, since it changed the answer more than any single measurement did. This
-document previously stated the 208x figure with a structural explanation, and that explanation had
-survived four experiments. It was overturned by asking one question the experiments could not
-answer — how much of the wall time is actually on the device — and the answer was 0.04%. The
-measurements were never wrong. The framing was, and no additional variant of the same measurement
-would have revealed it.
+document has stated three different explanations for the same slowdown, and the measurements behind
+all three were correct every time. The framing was what kept being wrong.
+
+First it was "graph-transition cost, structurally unavoidable" — overturned by asking how much of the
+wall time was actually on the device (0.04%). Then it was "an uncached subprocess, and fixing it plus
+the residual gets us to parity" — overturned by asking whether the kernels beat the ops they replace
+on device (they don't, by 2.5–2.7x). Each correction came from a question the previous round of
+experiments structurally could not answer, not from a better version of the same experiment.
+
+The practice worth taking from this: when a performance story doesn't close, the next move is a
+different *kind* of measurement, not another variant of the current one. And the specific instrument
+that resolved two of the three rounds is cheap enough to make routine — compare device time against
+wall time, and vary N before dividing by N.
