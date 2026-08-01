@@ -52,6 +52,7 @@ These are the primary references we used. Critically, they describe different la
 | 23 | `torch_neuronx`'s op overrides aren't fake-tensor safe, breaking `torch.compile` on nearly every transformer (`Embedding`, `Softmax`, `CrossEntropyLoss`, …) | High | Open — outside this project's scope, reproducer included |
 | 24 | **THE ROOT CAUSE: `_detect_target()` forks `neuron-ls` on every kernel invocation, ~52 ms, outside the compile cache. One `lru_cache` = 102x/call, MFU 0.02% → 1.50%** | **Critical** | **Fix verified, accuracy-neutral. Residual ~0.59 ms/call in `create_computation` is 91.6% of what's left** |
 | 25 | Each NKI call is an optimisation barrier — the compiler can't fuse across it. Kernels are provably optimal (marginal traffic 1.00x the unfused floor); the loss is the forfeited fusion | Critical | **2.5–2.7x in a chained microbenchmark, but 8.4% of the regression in situ.** Decides the last ~18% after #24's residual |
+| 26 | **The fused MLP — the one kernel that could win — loses by 2.8–3.0x on device too, at both shapes it can run single-core. `nkilib` kernels need an SPMD grid; #18 is a design boundary, not a bug** | **Critical** | **Answers "where would a speedup come from?": nowhere, in this configuration.** Also explains why RMSNorm/SiLU had to be tutorial-derived — no standalone versions exist in nki-library |
 
 ---
 
@@ -810,7 +811,18 @@ nki-library's own MLP tests use `rtol=2e-2`, two orders of magnitude looser than
 `cos_sim > 0.999` bar we hold RMSNorm/RoPE to — decide which bar applies before starting,
 because a fused three-matmul kernel will not be bit-identical.
 
-## 18. The fused MLP kernel cannot run single-core when `intermediate_size > 4096` [HIGH — harder than #17]
+## 18. The fused MLP kernel cannot run single-core when `intermediate_size > 4096` [MEASUREMENT STANDS — reframed by #26: this is a design boundary, not a bug]
+
+> **Read #26 alongside this.** The boundary below is real and reproducible across ten data points.
+> The *interpretation* was wrong. This section filed it as an nki-library divide-by-zero to fix; #26
+> shows that `nkilib` kernels require a multi-core SPMD launch grid, and a `floordiv` by zero when
+> `intermediate_size > 4096` is what a shard-count calculation looks like with no shard grid. The
+> kernel is telling us single-core is not its execution model.
+>
+> Two consequences. The upstream ask changes from "fix the divide-by-zero" to "document the supported
+> configuration and emit a better diagnostic". And the fused MLP is **not** blocked-but-promising: at
+> `H=1024, I=3072` it compiles and runs fine (see the table below) and is still 2.99x slower on device
+> than torch, because single-core it tiles badly and moves 2x the HBM traffic.
 
 Found by the Week 4 derisking spike (`scripts/spike_nkilib_mlp.py`). This is a **sharp,
 reproducible boundary**, and it excludes every model anyone would actually want to accelerate.
@@ -1841,3 +1853,125 @@ since `NEURON_RT_INSPECT` adds a few ms; the decomposition uses one consistent p
 5. **Do not quote the 2.5–2.7x figure without its context.** It is a chained-microbenchmark upper bound.
    The in-situ number is 8.4% of the regression, and the two will be confused if the first is stated
    alone.
+
+---
+
+## 26. The fused MLP also loses by ~3x on device — and #18 was a design boundary, not a bug [CRITICAL — answers "where would a speedup come from?"]
+
+Prompted by the question the PoC should have asked in Week 2: *why is there a slowdown at all — we
+should be seeing a speedup.* Chasing it produced the clearest statement of the mismatch in this
+document, and corrected two earlier errors of mine.
+
+### First, why RMSNorm and SiLU were tutorial-derived rather than ported
+
+Not a shortcut. **Standalone versions do not exist in nki-library.**
+
+- `nkilib/core/rmsnorm/` contains exactly one kernel, `rmsnorm_quant.py`, which fuses RMSNorm with
+  FP8 quantisation and always quantises — `QuantizationType.NONE` is not a validated input. The
+  closest thing to a plain BF16→BF16 RMSNorm is `_rms_normalize_tile()`, an internal subroutine.
+- `nkilib/core/` has **no activations module at all**: `attention, cumsum, embeddings, max, mlp, moe,
+  moe_block, output_projection, qkv, quantization, rmsnorm, router_topk, subkernels, topk, utils`.
+  SiLU exists only inside `mlp/mlp.py`.
+- `embeddings/rope_hf.py` is standalone and already HF-shaped. It is the one op of the three that was
+  ported directly.
+
+So the sourcing decision *was* the structural finding, arriving in Week 2: **the ops the Kernel Hub
+can intercept mostly do not exist as separable units in nki-library.** It was recorded in
+`docs/nki-library-porting-analysis.md` and then not allowed to inform what the Week 4 MFU measurement
+was expected to show.
+
+### Second, the fused MLP was written off on a limit it does not hit
+
+Finding #18 established that `nkilib.core.mlp.mlp` fails to compile single-core when
+`intermediate_size > 4096`, and that was used to defer all fused-kernel work. But #18's own data shows
+`hidden_size=1024, intermediate_size=3072` **passes** at cos_sim 0.999995 — which is exactly
+Qwen3-0.6B's MLP shape, the model every MFU number in this project was measured on.
+
+So the one kernel that could plausibly show a speedup works for the benchmarked model, and had never
+been timed. It replaces a whole fusable region (gate + up + SiLU + down) rather than interrupting one,
+and it contains two real matmuls, so unlike RMSNorm/RoPE/SiLU there is compute to optimise.
+
+### The measurement
+
+`scripts/profile_fused_mlp_vs_torch.py`. Device time from `neuron-explorer`, correctness gated against
+a CPU fp32 reference on every run, weights transposed on device (the realistic path).
+
+| H=1024, I=3072, S=512, 28 blocks | device ms | per block | HBM r+w | MBU |
+|---|---|---|---|---|
+| NKI fused MLP | 8.321 | 0.2972 | 2172.6 MB | 36.5% |
+| torch (3 matmuls + silu) | **2.782** | **0.0993** | **1059.1 MB** | 53.2% |
+| | | | | **NKI/torch = 2.99x** |
+
+| H=4096, I=4096, S=512, 8 blocks — largest single-core shape per #18 | device ms | per block | HBM r+w | MBU |
+|---|---|---|---|---|
+| NKI fused MLP | 11.625 | 1.4532 | 3288.3 MB | 39.5% |
+| torch | **4.180** | **0.5225** | **1619.1 MB** | 54.1% |
+| | | | | **NKI/torch = 2.78x** |
+
+cos_sim 0.999979 and 0.999977, so both are correct. The gap barely narrows with scale
+(2.99x → 2.78x), HBM traffic stays at ~2.0x, and torch gets consistently better bandwidth
+utilisation at both shapes. **Not a shape artifact.**
+
+### A harness error caught mid-measurement, and it is the same one as #25
+
+The first version reused **one** weight set across all 28 chained blocks. That let the compiler load
+the weights once and amortise them over all 28, and torch came out at 12.1 MB/block of traffic against
+an 18.9 MB weight set — *less than a single weight load*, which is what exposed it. A real model has
+distinct weights per layer, so that amortisation does not exist.
+
+Fixed to one weight set per block (528 MB total) and re-run. `--shared-weights` reproduces the flawed
+configuration deliberately. Same class of error as #25's chained microbenchmark: **the harness handed
+one side an advantage that does not occur in practice.** Twice now, so it is worth a standing check —
+before comparing two implementations, ask what the harness lets each one amortise that a real model
+would not.
+
+### The interpretation, which reframes Finding #18
+
+`nki-library` kernels are built for the NxDI inference pipeline: **multi-core SPMD**, large shapes,
+frequently quantised. Run single-core, a kernel has one core's SBUF (24–28 MB) to work with, so it
+tiles the problem far more finely than it was designed to and pays a HBM round-trip at every tile
+boundary. Hence ~2x the traffic at ~40% MBU, against torch's ~54%. The Neuron compiler, targeting that
+same single core, picks better tiling.
+
+**So #18 is not a bug to route upstream. It is the kernel telling us single-core is not its execution
+model.** A `floordiv` by zero when `intermediate_size > 4096` is what a shard-count calculation looks
+like when there is no shard grid. Finding #18 filed it as a divide-by-zero to fix and recommended it as
+an nki-library bug; it should have been read as a design boundary. That correction belongs in the
+upstream asks — it changes what we are asking for and of whom.
+
+### Where a speedup would actually come from
+
+Putting #25 and #26 together answers the question completely:
+
+| candidate | why it can't win here |
+|---|---|
+| RMSNorm, RoPE, SiLU | small, memory-bound, already fused by the compiler; the swap forfeits that fusion (#25) |
+| fused MLP | spans a fusable region and has real compute, but runs single-core with no SPMD grid, so it tiles badly and moves 2x the traffic (this finding) |
+
+**The mechanism and the kernel library are built for different execution models**, and that is now a
+measured 3x on device rather than an inference from weight layouts and compile errors.
+
+A speedup needs the kernels in their intended configuration: multi-core SPMD, `intermediate_size`
+beyond 4096, likely quantised. `kernelize()` expresses none of that — it swaps a `forward()` method,
+on one device, with weights in whatever layout the model already has.
+
+### Incidentally: Finding #17 now has a number
+
+The on-device weight transpose the kernel requires costs **3.533 ms / 1172 MB** at H=1024/I=3072 and
+**6.726 ms / 2223 MB** at H=4096/I=4096, as its own NEFF. That is a one-time load cost rather than
+per-step, so it does not belong in the per-step comparison above — but it is the first time the
+weight-layout mismatch has been quantified rather than described.
+
+### What to do
+
+1. **Re-file Finding #18.** Not "fix the divide-by-zero" but "document that these kernels require an
+   SPMD launch grid, and state the supported configuration." The current error is a poor diagnostic for
+   what is actually a usage constraint.
+2. **Stop treating the fused MLP as the blocked-but-promising candidate.** It is not blocked by a bug;
+   it is being run in a configuration it was not built for, and it loses by 3x there.
+3. **If per-layer Kernel Hub integration is to be pursued for performance, the question to answer first
+   is whether `kernelize()` can express a multi-core launch.** Not weight layout (#17), not the compile
+   limit (#18) — those are downstream of the execution-model mismatch this finding measures.
+4. **Do not read this as "NKI kernels are slow."** These kernels are correct to six decimals and are
+   presumably good at what they were built for. Nothing here measures them in their intended
+   configuration, and this document should not be cited as if it did.
