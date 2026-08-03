@@ -79,8 +79,10 @@ def main():
         print(f"      {d} \\")
     print("      --calls <N>")
     print()
-    print("NOTE: --calls is only used for the per-call column, so summarise each call count")
-    print("separately rather than mixing N=1 and N=28 directories in one invocation.")
+    print("N=1 and N=28 directories can be summarised in ONE invocation: the summariser reads the")
+    print("call count from each directory's _n<N> suffix, so --calls is only a fallback for")
+    print("directories without one. It used to divide every directory by a single --calls, which")
+    print("silently divided an N=1 profile by 28.")
     return 1 if failures else 0
 
 

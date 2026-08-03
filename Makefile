@@ -11,7 +11,7 @@ PIP := $(VENV)/bin/pip
 
 .PHONY: help venv install verify demo test test-nki test-e2e test-all probe mfu mfu-unfixed \
         mfu-amortisation rootcause fusion insitu profile experiments registration sync lint clean \
-        versions results results-render check-docs
+        versions results results-render check-docs check-provenance flagcheck
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -23,17 +23,29 @@ results: ## Re-run EVERY measurement, writing raw artifacts into results/raw/ (3
 results-render: ## Regenerate results/README.md from results/measurements.json (runs anywhere)
 	python3 scripts/render_results.py
 
-check-docs: ## Verify doc links, number qualifiers, and results sync (runs anywhere)
+check-docs: ## Verify doc links, number qualifiers, results sync, and artifact provenance
 	python3 scripts/check_docs_consistency.py
+	python3 scripts/check_measurement_provenance.py
 
-insitu: ## Finding #26 in-situ split: how much of the regression is device vs dispatch
+check-provenance: ## Verify every measurement's named artifact exists AND would be committed
+	python3 scripts/check_measurement_provenance.py
+
+insitu: ## In-situ split: how much of the regression is device vs dispatch
 	$(PYTHON) scripts/profile_model_device_time.py --mode baseline \
 		--outdir results/raw/prof_model_baseline
 	$(PYTHON) scripts/profile_model_device_time.py --mode kernelized \
 		--outdir results/raw/prof_model_kernelized
+	# No --wall-* : each profile dir carries its own wall_times.json, so the walls and the device
+	# times come from the same run. Passing them here is how a previous version ended up pairing
+	# walls from an expired host with device times from a live one.
 	$(PYTHON) scripts/sum_model_device_time.py \
-		results/raw/prof_model_baseline results/raw/prof_model_kernelized \
-		--wall-baseline 46.65 --wall-kernelized 146.65 --nki-calls 169
+		results/raw/prof_model_baseline results/raw/prof_model_kernelized --nki-calls 169 \
+		--json-out results/raw/insitu-summary/insitu_decomposition.json
+
+flagcheck: ## Controls: is the NKI/torch gap a compiler-flag artifact? (wall clock, then device)
+	$(PYTHON) scripts/probe_compiler_flags.py
+	$(PYTHON) scripts/probe_device_time_under_flags.py --op silu \
+		--outdir-base results/raw/flagcheck
 
 venv: ## Create venv linked to Neuron PyTorch environment
 	@if [ -d "$(NEURON_VENV)" ]; then \
@@ -96,16 +108,19 @@ mfu: ## Measure MFU with the Finding #24 fix applied (long-running)
 mfu-unfixed: ## Same without the fix — reproduces the original 208x regression
 	$(PYTHON) scripts/measure_mfu.py --preset 0.6b --seq 512
 
+# --json-out under results/raw/, not /tmp: on a rented instance /tmp is the least durable path
+# available, and this project already lost every raw artifact to it once (sticking point #17).
 mfu-amortisation: ## Two sequence lengths + comparison, showing the residual is near-fixed per call
 	$(PYTHON) scripts/measure_mfu.py --preset 0.6b --seq 512 --fix-target-detection \
-		--json-out /tmp/mfu_512.json
+		--json-out results/raw/mfu-amortisation/mfu_512.json
 	$(PYTHON) scripts/measure_mfu.py --preset 0.6b --seq 2048 --fix-target-detection \
-		--json-out /tmp/mfu_2048.json
-	$(PYTHON) scripts/compare_mfu_runs.py /tmp/mfu_512.json /tmp/mfu_2048.json
+		--json-out results/raw/mfu-amortisation/mfu_2048.json
+	$(PYTHON) scripts/compare_mfu_runs.py \
+		results/raw/mfu-amortisation/mfu_512.json results/raw/mfu-amortisation/mfu_2048.json
 
-fusion: ## Reproduce Finding #25: are the kernels faster than the ops they replace, on device?
-	$(PYTHON) scripts/run_device_profile_sweep.py --calls 1 28
-	$(PYTHON) scripts/analyse_fusion_barrier.py
+fusion: ## Are the kernels faster than the ops they replace, on device?
+	$(PYTHON) scripts/run_device_profile_sweep.py --calls 1 28 --outdir-base results/raw
+	$(PYTHON) scripts/analyse_fusion_barrier.py --profile-base results/raw
 
 rootcause: ## Reproduce Finding #24: graph batching -> device profile -> cProfile -> verified fix
 	$(PYTHON) scripts/probe_neff_count.py
@@ -115,7 +130,7 @@ rootcause: ## Reproduce Finding #24: graph batching -> device profile -> cProfil
 	$(PYTHON) scripts/probe_target_override_fix.py
 
 profile: ## Generate a NEFF+NTFF for the 28-call graph (then read with neuron-explorer)
-	$(PYTHON) scripts/profile_nki_call_cost.py --calls 28 --outdir /tmp/prof_n28
+	$(PYTHON) scripts/profile_nki_call_cost.py --calls 28 --outdir results/raw/prof_n28
 
 experiments: ## Run the perf-attribution experiments behind Findings #20, #21 and #23
 	$(PYTHON) scripts/experiment_nkilib_thin_wrapper.py

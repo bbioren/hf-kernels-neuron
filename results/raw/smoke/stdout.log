@@ -1,0 +1,12 @@
+2026-Aug-03 18:24:48.0110 59922:59958 [0] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):273 CCOM WARN NET/OFI Failed to initialize rdma protocol
+2026-Aug-03 18:24:48.0113 59922:59958 [0] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):416 CCOM WARN NET/OFI aws-ofi-nccl initialization failed
+2026-Aug-03 18:24:48.0115 59922:59958 [0] ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t):78 CCOM WARN NET/OFI Initializing plugin failed
+2026-Aug-03 18:24:48.0117 59922:59958 [0] net_plugin.cc:104 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+env NEURON_RT_* : (none set)
+device = xla:0  hw = NEURON
+2026-08-03 18:24:48.000148:  59922  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_8607928967585796506+fad94d7c/model.neff
+compute ok: sum = 32.0 (expect 32.0)
+
+----- stderr -----
+/home/ubuntu/hf-kernels-neuron/scripts/smoke_device.py:26: DeprecationWarning: Use torch_xla.device instead
+  dev = xm.xla_device()

@@ -1,0 +1,53 @@
+==============================================================================
+COMPILER-FLAG CONTROL: does the NKI/torch ratio depend on NEURON_CC_FLAGS?
+==============================================================================
+  28 chained SiLU applications, tile [512, 3072] bf16, wall clock
+  one subprocess per setting, isolated compile cache per setting
+  the ABSOLUTE times will differ; only the RATIO matters here
+
+  running: (unset — project default) ...
+    nki   14.096 ms   torch    0.728 ms   ratio 19.366x
+  running: --target trn2 ...
+    nki   14.061 ms   torch    0.764 ms   ratio 18.393x
+  running: --target trn2 --lnc 1 ...
+    nki   13.821 ms   torch    1.708 ms   ratio 8.094x
+  running: --target trn2 --lnc 2 ...
+    nki   14.019 ms   torch    0.726 ms   ratio 19.321x
+  running: --target trn2 -O2 ...
+    nki   14.152 ms   torch    1.023 ms   ratio 13.832x
+
+==============================================================================
+VERDICT
+==============================================================================
+  flags                                 nki ms  torch ms    ratio
+  --------------------------------------------------------------
+  (unset — project default)             14.096     0.728  19.366x
+  --target trn2                         14.061     0.764  18.393x
+  --target trn2 --lnc 1                 13.821     1.708   8.094x
+  --target trn2 --lnc 2                 14.019     0.726  19.321x
+  --target trn2 -O2                     14.152     1.023  13.832x
+
+  spread across settings:  ratio 2.39x   NKI 1.02x   torch 2.35x
+
+  -> NKI is INVARIANT across compiler settings (13.82-14.15 ms,
+     1.02x spread). **No setting rescues the NKI path.** So the gap is
+     not a compiler-flag artifact, which is what this control set out to establish.
+     The ratio spread (2.39x) is driven by TORCH moving (2.35x), not NKI.
+     Specifically '--target trn2 --lnc 1' makes torch slower (1.708 ms), which flatters the ratio without helping NKI.
+     -> The open item is CLOSED for the wall-clock gap. Record it.
+
+  SCOPE LIMIT — read before citing this as settling Findings #25/#26:
+    This measures WALL time. At 13.82 ms for 28 calls that is
+    0.494 ms/call, which is the post-fix DISPATCH floor — so this run is
+    ~97% dispatch and only a few percent device. It therefore establishes that the
+    DISPATCH cost is flag-invariant, and does NOT by itself settle whether the
+    DEVICE-time gap in #25/#26 depends on flags. For that, profile device time under
+    two settings:
+      NEURON_CC_FLAGS='--target trn2 --lnc 2' python scripts/run_device_profile_sweep.py \
+          --calls 1 28 --ops silu
+    and compare against the default-flag profiles via analyse_fusion_barrier.py.
+
+  Then update results/measurements.json: set the compiler_flags note and record what
+  this closed (dispatch) versus what remains open (device).
+
+----- stderr -----

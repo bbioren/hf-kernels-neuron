@@ -1,0 +1,309 @@
+===== tests/test_rmsnorm_nki.py =====
+2026-Aug-03 18:25:02.0545 60034:60071 [0] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):273 CCOM WARN NET/OFI Failed to initialize rdma protocol
+2026-Aug-03 18:25:02.0547 60034:60071 [0] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):416 CCOM WARN NET/OFI aws-ofi-nccl initialization failed
+2026-Aug-03 18:25:02.0550 60034:60071 [0] ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t):78 CCOM WARN NET/OFI Initializing plugin failed
+2026-Aug-03 18:25:02.0552 60034:60071 [0] net_plugin.cc:104 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+2026-08-03 18:25:02.000795:  60034  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_3120343774392351785+fad94d7c/model.neff
+2026-08-03 18:25:02.000971:  60034  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_2286852441933593597+fad94d7c/model.neff
+2026-08-03 18:25:03.000144:  60034  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_7308889839933561135+fad94d7c/model.neff
+2026-08-03 18:25:03.000318:  60034  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_10530907332884044572+fad94d7c/model.neff
+2026-08-03 18:25:03.000492:  60034  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_1022619682567981265+fad94d7c/model.neff
+2026-08-03 18:25:03.000664:  60034  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_3531971130280686491+fad94d7c/model.neff
+2026-08-03 18:25:03.000832:  60034  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_1699780434982188752+fad94d7c/model.neff
+2026-08-03 18:25:04.000008:  60034  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_1875965725553037365+fad94d7c/model.neff
+2026-08-03 18:25:04.000184:  60034  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_2821060654411762441+fad94d7c/model.neff
+2026-08-03 18:25:04.000364:  60034  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_7158042568753714194+fad94d7c/model.neff
+2026-08-03 18:25:04.000541:  60034  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_9945655489641758361+fad94d7c/model.neff
+
+============================================================================
+NKI RMSNorm on Neuron hardware (execution-verified)
+============================================================================
+  hardware: NEURON
+
+  PASS  (1, 8, 64) float32  cos_sim=1.000000  max_diff=4.768e-07  nki=1 fallback=0
+  PASS  (2, 16, 128) float32  cos_sim=1.000000  max_diff=9.537e-07  nki=1 fallback=0
+  PASS  (1, 128, 896) float32  cos_sim=1.000001  max_diff=3.815e-06  nki=1 fallback=0
+  PASS  (1, 128, 1536) float32  cos_sim=1.000004  max_diff=4.768e-06  nki=1 fallback=0
+  PASS  (2, 64, 2048) float32  cos_sim=1.000007  max_diff=6.199e-06  nki=1 fallback=0
+  PASS  (1, 32, 3584) float32  cos_sim=1.000002  max_diff=4.768e-06  nki=1 fallback=0
+  PASS  (1, 1, 256) float32  cos_sim=1.000000  max_diff=4.768e-07  nki=1 fallback=0
+  PASS  (1, 250, 512) float32  cos_sim=1.000001  max_diff=2.384e-06  nki=1 fallback=0
+  PASS  (1, 128, 4096) float32  cos_sim=1.000017  max_diff=8.106e-06  nki=1 fallback=0
+  PASS  (1, 300, 128) float32  cos_sim=1.000000  max_diff=1.907e-06  nki=1 fallback=0
+  PASS  (1, 128, 896) bfloat16  cos_sim=0.999997  max_diff=0.000e+00  nki=1 fallback=0
+
+  11/11 passed
+  ALL PASSED (cos_sim > 0.999, NKI execution confirmed)
+============================================================================
+
+----------------------------------------------------------------------------
+Fallback behaviour (CPU input — the Finding #8 scenario)
+----------------------------------------------------------------------------
+  dispatch        : nki=0 fallback=1
+  took fallback   : True
+  warning emitted : True
+  warning text    : neuron_rmsnorm: falling back to eager PyTorch RMSNorm (input on CPU; NKI requires XLA/Neuron te
+  still correct   : cos_sim=1.000000
+  PASS
+----- tests/test_rmsnorm_nki.py: PASS in 16.4s -----
+===== tests/test_rope_nki.py =====
+2026-Aug-03 18:25:17.0127 60384:60420 [0] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):273 CCOM WARN NET/OFI Failed to initialize rdma protocol
+2026-Aug-03 18:25:17.0130 60384:60420 [0] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):416 CCOM WARN NET/OFI aws-ofi-nccl initialization failed
+2026-Aug-03 18:25:17.0133 60384:60420 [0] ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t):78 CCOM WARN NET/OFI Initializing plugin failed
+2026-Aug-03 18:25:17.0135 60384:60420 [0] net_plugin.cc:104 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+2026-08-03 18:25:19.000149:  60384  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_3033855308392205014+fad94d7c/model.neff
+2026-08-03 18:25:19.000438:  60384  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_12637707000409018263+fad94d7c/model.neff
+2026-08-03 18:25:19.000746:  60384  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_6825225676106820628+fad94d7c/model.neff
+2026-08-03 18:25:19.000957:  60384  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_1390322074371237205+fad94d7c/model.neff
+2026-08-03 18:25:20.000244:  60384  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_5147018502998512562+fad94d7c/model.neff
+2026-08-03 18:25:20.000483:  60384  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_6145840140748341216+fad94d7c/model.neff
+2026-08-03 18:25:20.000688:  60384  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_3127568669587232754+fad94d7c/model.neff
+2026-08-03 18:25:20.000889:  60384  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_4897843774975207732+fad94d7c/model.neff
+2026-08-03 18:25:21.000132:  60384  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_6374860838746011864+fad94d7c/model.neff
+2026-08-03 18:25:21.000310:  60384  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_11673092615186412925+fad94d7c/model.neff
+
+============================================================================
+NKI RoPE on Neuron hardware (execution-verified)
+============================================================================
+  hardware: NEURON
+
+  PASS  q  b1 qh4 kh2 s128 d64 float32  cos_sim=1.000000  max_diff=0.000e+00  nki=1 fallback=0
+  PASS  k  b1 qh4 kh2 s128 d64 float32  cos_sim=1.000000  max_diff=0.000e+00  nki=1 fallback=0
+  PASS  q  b1 qh32 kh8 s256 d128 float32  cos_sim=1.000019  max_diff=0.000e+00  nki=1 fallback=0
+  PASS  k  b1 qh32 kh8 s256 d128 float32  cos_sim=1.000003  max_diff=0.000e+00  nki=1 fallback=0
+  PASS  q  b2 qh16 kh4 s512 d128 float32  cos_sim=1.000056  max_diff=0.000e+00  nki=1 fallback=0
+  PASS  k  b2 qh16 kh4 s512 d128 float32  cos_sim=1.000009  max_diff=0.000e+00  nki=1 fallback=0
+  PASS  q  b4 qh1 kh1 s512 d128 float32  cos_sim=1.000003  max_diff=0.000e+00  nki=1 fallback=0
+  PASS  k  b4 qh1 kh1 s512 d128 float32  cos_sim=1.000003  max_diff=0.000e+00  nki=1 fallback=0
+  PASS  q  b1 qh32 kh8 s512 d64 float32  cos_sim=1.000022  max_diff=0.000e+00  nki=1 fallback=0
+  PASS  k  b1 qh32 kh8 s512 d64 float32  cos_sim=1.000003  max_diff=0.000e+00  nki=1 fallback=0
+  PASS  q  b1 qh16 kh8 s128 d128 float32  cos_sim=1.000003  max_diff=0.000e+00  nki=1 fallback=0
+  PASS  k  b1 qh16 kh8 s128 d128 float32  cos_sim=1.000001  max_diff=0.000e+00  nki=1 fallback=0
+  PASS  q  b1 qh8 kh4 s1024 d128 float32  cos_sim=1.000019  max_diff=0.000e+00  nki=1 fallback=0
+  PASS  k  b1 qh8 kh4 s1024 d128 float32  cos_sim=1.000007  max_diff=0.000e+00  nki=1 fallback=0
+  PASS  q  b2 qh4 kh2 s128 d64 float32  cos_sim=1.000000  max_diff=0.000e+00  nki=1 fallback=0
+  PASS  k  b2 qh4 kh2 s128 d64 float32  cos_sim=1.000000  max_diff=0.000e+00  nki=1 fallback=0
+  PASS  q  b1 qh16 kh8 s256 d128 bfloat16  cos_sim=0.999951  max_diff=0.000e+00  nki=1 fallback=0
+  PASS  k  b1 qh16 kh8 s256 d128 bfloat16  cos_sim=0.999994  max_diff=0.000e+00  nki=1 fallback=0
+  PASS  q  b1 qh4 kh2 s128 d64 float32 cos2d  cos_sim=1.000000  max_diff=0.000e+00  nki=1 fallback=0
+  PASS  k  b1 qh4 kh2 s128 d64 float32 cos2d  cos_sim=1.000000  max_diff=0.000e+00  nki=1 fallback=0
+
+  20/20 passed
+  ALL PASSED (cos_sim > 0.999, NKI execution confirmed)
+============================================================================
+
+----------------------------------------------------------------------------
+Discrimination checks (negative controls)
+----------------------------------------------------------------------------
+  A. vs negated-sin reference : cos_sim=0.430325 max_diff=7.446e+00  -> discriminates
+  B. vs unrotated input       : cos_sim=0.500301 max_diff=6.864e+00  -> kernel rotated
+  C. vs correct reference     : cos_sim=1.000000  -> matches
+  PASS — comparison is meaningful
+
+----------------------------------------------------------------------------
+Fallback behaviour (seq_len=100, not a multiple of 128)
+----------------------------------------------------------------------------
+2026-08-03 18:25:21.000380:  60384  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_3246535127938789761+fad94d7c/model.neff
+  dispatch          : nki=0 fallback=1
+  took fallback     : True
+  warning emitted   : True
+  warning text      : neuron_rope: falling back to eager PyTorch RoPE (seq_len must be a multiple of 128, got 100). The NK
+  still correct     : cos_sim=1.000000 max_diff=0.000e+00
+  PASS
+
+----------------------------------------------------------------------------
+Guard conditions (each must fall back, warn, and remain correct)
+----------------------------------------------------------------------------
+  PASS  seq_len=100 (not multiple of 128)    fallback=True warned=True correct=True
+  PASS  unsqueeze_dim=2                      fallback=True warned=True (dispatch only) eager_raised=RuntimeError
+2026-08-03 18:25:21.000399:  60384  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_13769723050084739712+fad94d7c/model.neff
+  PASS  3D q/k (kernel is 4D-only)           fallback=True warned=True correct=True
+2026-08-03 18:25:21.000416:  60384  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_13187323200783330898+fad94d7c/model.neff
+  PASS  odd head_dim=65                      fallback=True warned=True correct=True
+  PASS  cos width mismatch                   fallback=True warned=True (dispatch only) eager_raised=RuntimeError
+2026-08-03 18:25:21.000435:  60384  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_16798623619321387221+fad94d7c/model.neff
+  PASS  q/k dtype mismatch                   fallback=True warned=True (dispatch only)
+  PASS — 6/6 guards behave correctly
+----- tests/test_rope_nki.py: PASS in 17.1s -----
+===== tests/test_silu_nki.py =====
+2026-Aug-03 18:25:32.0671 60756:60792 [0] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):273 CCOM WARN NET/OFI Failed to initialize rdma protocol
+2026-Aug-03 18:25:32.0673 60756:60792 [0] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):416 CCOM WARN NET/OFI aws-ofi-nccl initialization failed
+2026-Aug-03 18:25:32.0676 60756:60792 [0] ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t):78 CCOM WARN NET/OFI Initializing plugin failed
+2026-Aug-03 18:25:32.0678 60756:60792 [0] net_plugin.cc:104 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+2026-08-03 18:25:32.000900:  60756  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_9933397527312628994+fad94d7c/model.neff
+2026-08-03 18:25:33.000067:  60756  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_14970816229069791171+fad94d7c/model.neff
+2026-08-03 18:25:33.000232:  60756  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_17301770977821360308+fad94d7c/model.neff
+2026-08-03 18:25:33.000399:  60756  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_5002356913283707701+fad94d7c/model.neff
+2026-08-03 18:25:33.000566:  60756  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_13089679507610204073+fad94d7c/model.neff
+2026-08-03 18:25:33.000730:  60756  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_1188118870596707460+fad94d7c/model.neff
+2026-08-03 18:25:33.000895:  60756  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_1791434798629719721+fad94d7c/model.neff
+2026-08-03 18:25:34.000060:  60756  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_13028128812506599814+fad94d7c/model.neff
+2026-08-03 18:25:34.000223:  60756  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_7704344939062665221+fad94d7c/model.neff
+
+============================================================================
+NKI SiLU on Neuron hardware (execution-verified)
+============================================================================
+  hardware: NEURON
+
+  PASS  (1, 8, 64) float32  cos_sim=1.000000  max_diff=1.550e-06  nki=1 fallback=0
+  PASS  (2, 16, 128) float32  cos_sim=1.000000  max_diff=2.027e-06  nki=1 fallback=0
+  PASS  (1, 128, 896) float32  cos_sim=1.000000  max_diff=2.146e-06  nki=1 fallback=0
+  PASS  (1, 64, 4864) float32  cos_sim=1.000011  max_diff=2.146e-06  nki=1 fallback=0
+  PASS  (1, 32, 12288) float32  cos_sim=1.000013  max_diff=2.146e-06  nki=1 fallback=0
+  PASS  (1, 1, 256) float32  cos_sim=1.000000  max_diff=9.537e-07  nki=1 fallback=0
+  PASS  (1, 250, 512) float32  cos_sim=1.000000  max_diff=2.146e-06  nki=1 fallback=0
+  PASS  (4, 64, 1024) float32  cos_sim=1.000007  max_diff=2.146e-06  nki=1 fallback=0
+  PASS  (1, 128, 896) bfloat16  cos_sim=0.999993  max_diff=0.000e+00  nki=1 fallback=0
+
+  9/9 passed
+  ALL PASSED (cos_sim > 0.999, NKI execution confirmed)
+============================================================================
+
+----------------------------------------------------------------------------
+Discrimination checks (negative controls)
+----------------------------------------------------------------------------
+2026-08-03 18:25:34.000383:  60756  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_7572619792911371987+fad94d7c/model.neff
+  A. vs GELU reference  : cos_sim=0.991164  -> discriminates
+  B. vs raw input       : cos_sim=0.837064  -> activation applied
+  C. vs correct SiLU    : cos_sim=1.000000  -> matches
+  PASS — comparison is meaningful
+
+----------------------------------------------------------------------------
+Fallback behaviour (last dim > MAX_FREE_DIM = 16384)
+----------------------------------------------------------------------------
+2026-08-03 18:25:34.000397:  60756  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_12541179785237172001+fad94d7c/model.neff
+  dispatch        : nki=0 fallback=1
+  took fallback   : True
+  warning emitted : True
+  warning text    : neuron_silu: falling back to eager PyTorch SiLU (last dim 16512 exceeds SBUF-safe width 16384).
+  still correct   : cos_sim=1.000000
+  PASS
+----- tests/test_silu_nki.py: PASS in 12.8s -----
+===== tests/test_qwen3_neuron_e2e.py =====
+2026-Aug-03 18:25:47.0556 61089:61125 [0] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):273 CCOM WARN NET/OFI Failed to initialize rdma protocol
+2026-Aug-03 18:25:47.0559 61089:61125 [0] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):416 CCOM WARN NET/OFI aws-ofi-nccl initialization failed
+2026-Aug-03 18:25:47.0561 61089:61125 [0] ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t):78 CCOM WARN NET/OFI Initializing plugin failed
+2026-Aug-03 18:25:47.0563 61089:61125 [0] net_plugin.cc:104 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+
+============================================================================
+Qwen3 + NKI RMSNorm + NKI RoPE on Neuron — end to end
+============================================================================
+  seq_len = 128 (multiple of 128, so the RoPE kernel engages)
+
+============================================================================
+1. Both NKI kernels in a real Qwen3 forward pass (execution-verified)
+============================================================================
+2026-08-03 18:25:49.000466:  61089  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_10638952309050830618+fad94d7c/model.neff
+2026-08-03 18:25:49.000508:  61089  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_9969715167774468897+fad94d7c/model.neff
+  RMSNorm forwards swapped: 9
+  swapped modules:
+      model.layers.0.input_layernorm         -> NeuronRMSNorm.forward
+      model.layers.0.mlp.act_fn              -> NeuronSiLU.forward
+      model.layers.0.post_attention_layernorm -> NeuronRMSNorm.forward
+      model.layers.0.self_attn.k_norm        -> NeuronRMSNorm.forward
+      model.layers.0.self_attn.q_norm        -> NeuronRMSNorm.forward
+      model.layers.1.input_layernorm         -> NeuronRMSNorm.forward
+      model.layers.1.mlp.act_fn              -> NeuronSiLU.forward
+      model.layers.1.post_attention_layernorm -> NeuronRMSNorm.forward
+      model.layers.1.self_attn.k_norm        -> NeuronRMSNorm.forward
+      model.layers.1.self_attn.q_norm        -> NeuronRMSNorm.forward
+      model.norm                             -> NeuronRMSNorm.forward
+2026-08-03 18:25:50.000852:  61089  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_17293446288511656687+fad94d7c/model.neff
+
+  RMSNorm dispatch : nki=9 fallback=0  (expected nki=9)
+  RoPE    dispatch : nki=2 fallback=0  (expected nki=2)
+  SiLU    dispatch : nki=2 fallback=0  (expected nki=2)
+  logits cos_sim   : 1.000001
+  logits max_diff  : 5.364e-07
+
+  NKI RMSNorm executed  : yes (nki=9 fallback=0)
+  NKI RoPE executed     : yes (nki=2 fallback=0)
+  NKI SiLU executed     : yes (nki=2 fallback=0)
+  call counts as expected: yes
+  logits match (>0.999) : yes
+  PASS
+
+============================================================================
+2. Would the proposed upstream fix make use_kernels=True work?
+============================================================================
+  --- stock behaviour (no shim) ---
+    kernelize() returned without error; RMSNorm swapped = 0
+    => mapping ignored, as predicted (device resolved to xla/cpu)
+
+  --- with proposed fix applied in-process ---
+    RMSNorm layers swapped: 9
+    logits cos_sim after use_kernels path: 1.000001
+
+  stock use_kernels reaches neuron : no
+  with proposed fix                : yes
+  => Finding #9 confirmed AND the proposed fix is sufficient.
+  PASS
+
+============================================================================
+RESULTS
+============================================================================
+  PASS  both NKI kernels execute in Qwen3, logits match
+  PASS  proposed fix enables use_kernels=True
+============================================================================
+----- tests/test_qwen3_neuron_e2e.py: PASS in 17.8s -----
+===== tests/test_qwen3_moe_e2e.py =====
+2026-Aug-03 18:26:06.0064 61598:61649 [3] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):273 CCOM WARN NET/OFI Failed to initialize rdma protocol
+2026-Aug-03 18:26:06.0067 61598:61649 [3] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):416 CCOM WARN NET/OFI aws-ofi-nccl initialization failed
+2026-Aug-03 18:26:06.0069 61598:61649 [3] ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t):78 CCOM WARN NET/OFI Initializing plugin failed
+2026-Aug-03 18:26:06.0072 61598:61649 [3] net_plugin.cc:104 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+
+================================================================================
+Qwen3-MoE + the three dense NKI kernels
+================================================================================
+  probing experts implementations (default grouped_mm fails on Neuron) ...
+2026-08-03 18:26:07.000927:  61598  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_10638952309050830618+fad94d7c/model.neff
+2026-08-03 18:26:07.000955:  61598  [ERROR]: Got a cached failed neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_14794114539382344109+fad94d7c/model.neff. Will skip compilation, please set --retry_failed_compilation for recompilation: 
+ Failed compilation with ['neuronx-cc', 'compile', '--framework=XLA', '/tmp/ubuntu/neuroncc_compile_workdir/140025a7-b47f-480d-bc0b-46744224e27f/model.MODULE_14794114539382344109+fad94d7c.hlo_module.pb', '--output', '/tmp/ubuntu/neuroncc_compile_workdir/140025a7-b47f-480d-bc0b-46744224e27f/model.MODULE_14794114539382344109+fad94d7c.neff', '--target=trn2', '--verbose=35']:
+[ERROR] [NCC_EVRF029] Operation sort is not supported on trn2. Use supported equivalent operation like TopK or replace it with an alternate implementation via Neuron Kernel Interface (NKI).
+%sort.0 = u32[256]{0} sort(%reshape.371), dimensions={0}, to_apply=%compare-less-than.379.clone
+[libneuronxla 2.2.17544.0+fb9962bf].
+    default (grouped_mm)     FAILED  sort is not supported
+2026-08-03 18:26:08.000012:  61598  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_4568251434095327472+fad94d7c/model.neff
+    batched_mm               OK
+  using experts_implementation = batched_mm
+
+  layers=2 hidden=256 experts=4 top_k=2 seq=128
+  Qwen3MoeRMSNorm.kernel_layer_name = 'RMSNorm'
+  apply_rotary_pos_emb kernel name  = 'rotary_pos_emb'
+
+  RMSNorm forwards swapped: 9
+  SiLU    forwards swapped: 2
+  running instrumented forward (each NKI call costs ~52 ms, Finding #20) ...
+2026-08-03 18:26:09.000580:  61598  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_10089395886872235637+fad94d7c/model.neff
+
+  RMSNorm dispatch : nki=9 fallback=0   (expect nki=9, same structure as dense)
+  RoPE    dispatch : nki=2 fallback=0   (expect nki=2)
+  SiLU    dispatch : nki=2 fallback=0   (count discovered, not predicted — see docstring)
+  logits cos_sim   : 1.000002
+  logits max_diff  : 5.215e-07
+
+  NKI RMSNorm transfers : yes
+  NKI RoPE    transfers : yes
+  NKI SiLU    engaged   : yes ()
+  logits match (>0.999) : yes
+
+  PASS
+
+  => The dense kernels transfer to Qwen3-MoE with no changes. Week 5's
+     'reuse RMSNorm/RoPE/SiLU' goal is met. The MoE-specific kernels remain
+     blocked — see deliverables/week-5-moe-gap-analysis.md.
+================================================================================
+----- tests/test_qwen3_moe_e2e.py: PASS in 18.4s -----
+
+========================================================================
+REGRESSION SUMMARY
+========================================================================
+  PASS                    16.4s  tests/test_rmsnorm_nki.py
+  PASS                    17.1s  tests/test_rope_nki.py
+  PASS                    12.8s  tests/test_silu_nki.py
+  PASS                    17.8s  tests/test_qwen3_neuron_e2e.py
+  PASS                    18.4s  tests/test_qwen3_moe_e2e.py
+
+  all 5 suites pass
+
+----- stderr -----

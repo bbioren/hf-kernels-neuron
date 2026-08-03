@@ -43,6 +43,13 @@ STAGES = [
     # setting, and it is better to learn that in minute five than at the end.
     ("compiler-flag-control", [sys.executable, "scripts/probe_compiler_flags.py"], []),
 
+    # The wall-clock control above is ~97% dispatch by construction, so it cannot speak to the
+    # device-time claims in Findings #25/#26. This is the device half. Slower (~20 profile runs)
+    # but it is the control for the two findings the recommendation rests on, so it runs early too.
+    ("compiler-flag-control-device",
+     [sys.executable, "scripts/probe_device_time_under_flags.py", "--op", "silu",
+      "--outdir-base", "RAW/flagcheck"], []),
+
     ("mfu-baseline-and-kernelized-512-fixed",
      [sys.executable, "scripts/measure_mfu.py", "--preset", "0.6b", "--seq", "512",
       "--fix-target-detection", "--json-out", "STAGE/mfu_512_fixed.json"], []),
@@ -61,9 +68,13 @@ STAGES = [
      [sys.executable, "scripts/probe_inside_one_call.py", "--fix-target-detection"], []),
     ("torch-compile-diagnosis", [sys.executable, "scripts/diagnose_torch_compile.py"], []),
 
+    # RAW/ not STAGE/ because extract-device-metrics reads this back at the end. Writing it to
+    # STAGE/ put it at results/raw/device-profile-28-calls/prof_n28 while the extractor looked in
+    # results/raw/prof_n28, so it was silently skipped and the run's headline device profile never
+    # made it into device_metrics.json.
     ("device-profile-28-calls",
      [sys.executable, "scripts/profile_nki_call_cost.py", "--calls", "28",
-      "--outdir", "STAGE/prof_n28"], []),
+      "--outdir", "RAW/prof_n28"], []),
 
     # --outdir-base RAW so the per-configuration profiles land in the artifact tree rather than
     # /tmp, and so extract-device-metrics can find them at the end.
@@ -83,7 +94,8 @@ STAGES = [
     # pairs this run's walls with this run's device times instead of a carried-over constant.
     ("insitu-summary",
      [sys.executable, "scripts/sum_model_device_time.py",
-      "RAW/prof_model_baseline", "RAW/prof_model_kernelized", "--nki-calls", "169"], []),
+      "RAW/prof_model_baseline", "RAW/prof_model_kernelized", "--nki-calls", "169",
+      "--json-out", "STAGE/insitu_decomposition.json"], []),
 
     ("fused-mlp-nki",
      [sys.executable, "scripts/profile_fused_mlp_vs_torch.py", "--impl", "nki", "--calls", "28",
@@ -149,7 +161,19 @@ def main():
         #             by the artifact glob below and cannot collide with another stage.
         #   RAW/   -> the shared raw root. Use only when a LATER stage must read the output
         #             (the in-situ profiles are produced by two stages and consumed by a third).
-        resolved = [a.replace("STAGE/", f"{outdir}/").replace("RAW/", f"{RAW}/") for a in argv]
+        # Handle both the prefix form ("RAW/foo") and the bare token ("RAW", used for
+        # --outdir-base style flags). Only matching the prefix form once let a bare "RAW" through
+        # as a literal, which created a stray ./RAW directory in the repo root: the producing
+        # stage wrote there, the consuming stage read from there and looked fine, and the
+        # extraction stage looked in results/raw/ and silently found nothing.
+        def sub(a):
+            if a == "STAGE":
+                return str(outdir)
+            if a == "RAW":
+                return str(RAW)
+            return a.replace("STAGE/", f"{outdir}/").replace("RAW/", f"{RAW}/")
+
+        resolved = [sub(a) for a in argv]
 
         print(f"[{i}/{len(stages)}] {name}")
         print(f"    {' '.join(resolved[1:])}", flush=True)

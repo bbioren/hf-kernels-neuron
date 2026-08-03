@@ -14,3 +14,16 @@
 *.ntff
 *.neff
 *.pb
+
+# LOAD-BEARING NEGATION — do not remove.
+#
+# The repo root .gitignore has a blanket `*.log`, which is right for stray logs and wrong here:
+# each stage's stdout.log IS the artifact. Ten measurements in results/measurements.json name a
+# stdout.log as the file backing their number, and without this line all ten would be recorded as
+# committed while being invisible to anyone who cloned the repo — the same failure as writing
+# artifacts to /tmp, one layer further down.
+#
+# This was not caught by inspection. It was caught by scripts/check_measurement_provenance.py,
+# which now verifies that an artifact is not git-ignored rather than only that it exists on disk.
+# Removing this line will fail that check.
+!*.log

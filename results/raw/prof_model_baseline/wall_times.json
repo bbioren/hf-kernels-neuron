@@ -1,0 +1,19 @@
+{
+  "mode": "baseline",
+  "seq": 512,
+  "batch": 1,
+  "layers": 28,
+  "wall_ms_all": [
+    2752.016,
+    54.783,
+    54.0,
+    55.232
+  ],
+  "wall_ms_steady": [
+    54.0,
+    54.783,
+    55.232
+  ],
+  "wall_ms_median": 54.783,
+  "note": "iter 0 excluded from steady \u2014 it includes the compile"
+}

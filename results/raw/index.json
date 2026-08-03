@@ -1,0 +1,191 @@
+{
+  "versions": {
+    "command": "scripts/probe_nki_versions.py",
+    "exit_code": 0,
+    "seconds": 0.9,
+    "artifacts": [
+      "results/raw/versions/stdout.log"
+    ]
+  },
+  "smoke": {
+    "command": "scripts/smoke_device.py",
+    "exit_code": 0,
+    "seconds": 12.1,
+    "artifacts": [
+      "results/raw/smoke/stdout.log"
+    ]
+  },
+  "tests": {
+    "command": "scripts/run_all_tests.py",
+    "exit_code": 0,
+    "seconds": 82.4,
+    "artifacts": [
+      "results/raw/tests/stdout.log"
+    ]
+  },
+  "compiler-flag-control": {
+    "command": "scripts/probe_compiler_flags.py",
+    "exit_code": 0,
+    "seconds": 68.5,
+    "artifacts": [
+      "results/raw/compiler-flag-control/stdout.log"
+    ]
+  },
+  "mfu-baseline-and-kernelized-512-fixed": {
+    "command": "scripts/measure_mfu.py --preset 0.6b --seq 512 --fix-target-detection --json-out /home/ubuntu/hf-kernels-neuron/results/raw/mfu-baseline-and-kernelized-512-fixed/mfu_512_fixed.json",
+    "exit_code": 0,
+    "seconds": 35.1,
+    "artifacts": [
+      "results/raw/mfu-baseline-and-kernelized-512-fixed/mfu_512_fixed.json",
+      "results/raw/mfu-baseline-and-kernelized-512-fixed/stdout.log"
+    ]
+  },
+  "mfu-kernelized-512-nofix": {
+    "command": "scripts/measure_mfu.py --preset 0.6b --seq 512 --json-out /home/ubuntu/hf-kernels-neuron/results/raw/mfu-kernelized-512-nofix/mfu_512_nofix.json",
+    "exit_code": 0,
+    "seconds": 154.8,
+    "artifacts": [
+      "results/raw/mfu-kernelized-512-nofix/mfu_512_nofix.json",
+      "results/raw/mfu-kernelized-512-nofix/stdout.log"
+    ]
+  },
+  "mfu-2048-fixed": {
+    "command": "scripts/measure_mfu.py --preset 0.6b --seq 2048 --fix-target-detection --json-out /home/ubuntu/hf-kernels-neuron/results/raw/mfu-2048-fixed/mfu_2048_fixed.json",
+    "exit_code": 0,
+    "seconds": 39.8,
+    "artifacts": [
+      "results/raw/mfu-2048-fixed/mfu_2048_fixed.json",
+      "results/raw/mfu-2048-fixed/stdout.log"
+    ]
+  },
+  "fix-verification": {
+    "command": "scripts/probe_target_override_fix.py",
+    "exit_code": 0,
+    "seconds": 21.3,
+    "artifacts": [
+      "results/raw/fix-verification/stdout.log"
+    ]
+  },
+  "graph-batching": {
+    "command": "scripts/probe_neff_count.py",
+    "exit_code": 0,
+    "seconds": 20.2,
+    "artifacts": [
+      "results/raw/graph-batching/stdout.log"
+    ]
+  },
+  "host-vs-device-split": {
+    "command": "scripts/probe_where_is_the_time.py",
+    "exit_code": 0,
+    "seconds": 20.7,
+    "artifacts": [
+      "results/raw/host-vs-device-split/stdout.log"
+    ]
+  },
+  "cprofile-before": {
+    "command": "scripts/probe_inside_one_call.py",
+    "exit_code": 0,
+    "seconds": 12.1,
+    "artifacts": [
+      "results/raw/cprofile-before/stdout.log"
+    ]
+  },
+  "cprofile-after": {
+    "command": "scripts/probe_inside_one_call.py --fix-target-detection",
+    "exit_code": 0,
+    "seconds": 13.2,
+    "artifacts": [
+      "results/raw/cprofile-after/stdout.log"
+    ]
+  },
+  "torch-compile-diagnosis": {
+    "command": "scripts/diagnose_torch_compile.py",
+    "exit_code": 0,
+    "seconds": 20.5,
+    "artifacts": [
+      "results/raw/torch-compile-diagnosis/stdout.log"
+    ]
+  },
+  "device-profile-28-calls": {
+    "command": "scripts/profile_nki_call_cost.py --calls 28 --outdir /home/ubuntu/hf-kernels-neuron/results/raw/prof_n28",
+    "exit_code": 0,
+    "seconds": 15.8,
+    "artifacts": [
+      "results/raw/device-profile-28-calls/stdout.log"
+    ]
+  },
+  "fusion-sweep": {
+    "command": "scripts/run_device_profile_sweep.py --calls 1 28 --outdir-base /home/ubuntu/hf-kernels-neuron/results/raw",
+    "exit_code": 0,
+    "seconds": 101.0,
+    "artifacts": [
+      "results/raw/fusion-sweep/stdout.log"
+    ]
+  },
+  "fusion-analysis": {
+    "command": "scripts/analyse_fusion_barrier.py --profile-base /home/ubuntu/hf-kernels-neuron/results/raw",
+    "exit_code": 0,
+    "seconds": 1.2,
+    "artifacts": [
+      "results/raw/fusion-analysis/stdout.log"
+    ]
+  },
+  "insitu-baseline": {
+    "command": "scripts/profile_model_device_time.py --mode baseline --outdir /home/ubuntu/hf-kernels-neuron/results/raw/prof_model_baseline",
+    "exit_code": 0,
+    "seconds": 35.7,
+    "artifacts": [
+      "results/raw/insitu-baseline/stdout.log"
+    ]
+  },
+  "insitu-kernelized": {
+    "command": "scripts/profile_model_device_time.py --mode kernelized --outdir /home/ubuntu/hf-kernels-neuron/results/raw/prof_model_kernelized",
+    "exit_code": 0,
+    "seconds": 36.3,
+    "artifacts": [
+      "results/raw/insitu-kernelized/stdout.log"
+    ]
+  },
+  "insitu-summary": {
+    "command": "scripts/sum_model_device_time.py /home/ubuntu/hf-kernels-neuron/results/raw/prof_model_baseline /home/ubuntu/hf-kernels-neuron/results/raw/prof_model_kernelized --nki-calls 169 --json-out /home/ubuntu/hf-kernels-neuron/results/raw/insitu-summary/insitu_decomposition.json",
+    "exit_code": 0,
+    "seconds": 39.1,
+    "artifacts": [
+      "results/raw/insitu-summary/insitu_decomposition.json",
+      "results/raw/insitu-summary/stdout.log"
+    ]
+  },
+  "fused-mlp-nki": {
+    "command": "scripts/profile_fused_mlp_vs_torch.py --impl nki --calls 28 --outdir /home/ubuntu/hf-kernels-neuron/results/raw/prof_mlp_nki",
+    "exit_code": 0,
+    "seconds": 13.8,
+    "artifacts": [
+      "results/raw/fused-mlp-nki/stdout.log"
+    ]
+  },
+  "fused-mlp-torch": {
+    "command": "scripts/profile_fused_mlp_vs_torch.py --impl torch --calls 28 --outdir /home/ubuntu/hf-kernels-neuron/results/raw/prof_mlp_torch",
+    "exit_code": 0,
+    "seconds": 12.5,
+    "artifacts": [
+      "results/raw/fused-mlp-torch/stdout.log"
+    ]
+  },
+  "fused-mlp-boundary": {
+    "command": "scripts/spike_nkilib_mlp.py",
+    "exit_code": 0,
+    "seconds": 33.4,
+    "artifacts": [
+      "results/raw/fused-mlp-boundary/stdout.log"
+    ]
+  },
+  "extract-device-metrics": {
+    "command": "scripts/summarise_device_profiles.py /home/ubuntu/hf-kernels-neuron/results/raw/prof_n28 /home/ubuntu/hf-kernels-neuron/results/raw/prof_model_baseline /home/ubuntu/hf-kernels-neuron/results/raw/prof_model_kernelized /home/ubuntu/hf-kernels-neuron/results/raw/prof_mlp_nki /home/ubuntu/hf-kernels-neuron/results/raw/prof_mlp_torch /home/ubuntu/hf-kernels-neuron/results/raw/prof_silu_nki_n1 /home/ubuntu/hf-kernels-neuron/results/raw/prof_silu_torch_n1 /home/ubuntu/hf-kernels-neuron/results/raw/prof_silu_nki_n28 /home/ubuntu/hf-kernels-neuron/results/raw/prof_silu_torch_n28 /home/ubuntu/hf-kernels-neuron/results/raw/prof_rmsnorm_nki_n1 /home/ubuntu/hf-kernels-neuron/results/raw/prof_rmsnorm_torch_n1 /home/ubuntu/hf-kernels-neuron/results/raw/prof_rmsnorm_nki_n28 /home/ubuntu/hf-kernels-neuron/results/raw/prof_rmsnorm_torch_n28 --json-out /home/ubuntu/hf-kernels-neuron/results/raw/extract-device-metrics/device_metrics.json",
+    "exit_code": 0,
+    "seconds": 49.6,
+    "artifacts": [
+      "results/raw/extract-device-metrics/device_metrics.json",
+      "results/raw/extract-device-metrics/stdout.log"
+    ]
+  }
+}

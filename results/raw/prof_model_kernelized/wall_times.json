@@ -1,0 +1,19 @@
+{
+  "mode": "kernelized",
+  "seq": 512,
+  "batch": 1,
+  "layers": 28,
+  "wall_ms_all": [
+    3812.135,
+    165.896,
+    153.011,
+    153.43
+  ],
+  "wall_ms_steady": [
+    153.011,
+    153.43,
+    165.896
+  ],
+  "wall_ms_median": 153.43,
+  "note": "iter 0 excluded from steady \u2014 it includes the compile"
+}

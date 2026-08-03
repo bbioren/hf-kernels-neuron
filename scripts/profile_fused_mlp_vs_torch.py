@@ -36,6 +36,7 @@ Then:
 import argparse
 import functools
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -63,6 +64,13 @@ os.environ["NEURON_RT_INSPECT_DEVICE_PROFILE"] = "1"
 os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"] = OUTDIR
 os.environ.setdefault("NEURON_RT_VISIBLE_CORES", "0")
 
+# Clear the output directory before writing. This run emits exactly TWO NEFFs and that is
+# expected: the correctness check executes a 1-block graph, then the timed loop executes an
+# args.calls-block graph. summarise_device_profiles.py reports one row per NEFF, and the timed
+# graph is the one with args.calls x the instruction count. Anything beyond two rows is a leftover
+# from a previous run, which would be read as real device time.
+if Path(OUTDIR).exists():
+    shutil.rmtree(OUTDIR)
 Path(OUTDIR).mkdir(parents=True, exist_ok=True)
 sys.path.insert(0, str(Path(__file__).parent.parent / "tests"))
 

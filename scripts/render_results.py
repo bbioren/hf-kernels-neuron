@@ -51,14 +51,38 @@ def main():
     # --- the honest bit, first -----------------------------------------------------------
     L.append("## Read this before quoting any number")
     L.append("")
-    L.append("### Raw artifacts are missing")
+    L.append("### Provenance")
     L.append("")
     L.append(about["_artifact_loss"])
     L.append("")
-    L.append("Every number below is marked `transcribed` (from the run's stdout, captured in the "
-             "listed commit message) or `in_repo` (raw artifact under `results/raw/`). "
-             "At time of writing all are `transcribed`.")
+    counts = {}
+    for m in d["measurements"]:
+        counts[m["status"]] = counts.get(m["status"], 0) + 1
+    L.append("Every number below carries a `status`:")
     L.append("")
+    for st, desc in about["provenance_status"].items():
+        L.append(f"- **`{st}`** ({counts.get(st, 0)} of {len(d['measurements'])}) — {desc}")
+    L.append("")
+    if "_reproduction" in about:
+        rep = about["_reproduction"]
+        L.append("### The whole set was re-run on a second instance")
+        L.append("")
+        L.append(rep["why"])
+        L.append("")
+        L.append(f"- **When** {rep['date']}")
+        L.append(f"- **Where** {rep['instance']}")
+        L.append(f"- **Command** `{rep['command']}`")
+        L.append(f"- **Outcome** {rep['outcome']}")
+        L.append("")
+        L.append("| quantity | original | re-run | delta |")
+        L.append("|---|---|---|---|")
+        for a in rep["agreement"]:
+            L.append(f"| {a['quantity']} | {a['original']} | {a['reproduced']} | {a['delta']} |")
+        L.append("")
+        L.append(f"{rep['caveat']}")
+        L.append("")
+        L.append(f"Versions were checked before trusting any of it: {rep['versions_verified']}")
+        L.append("")
     L.append("### The number to lead with")
     L.append("")
     ins = ms["in-situ-device-vs-dispatch"]
@@ -76,12 +100,55 @@ def main():
              f"approach**. With dispatch fixed the projection is ~{proj['step_ms']:.0f} ms/step, "
              f"about **{proj['slowdown_vs_baseline']}x** slower — {proj['status']}.")
     L.append("")
+    if "robustness" in ins:
+        L.append(ins["robustness"])
+        L.append("")
     L.append("Two figures elsewhere in this project are easy to quote out of context:")
     L.append("")
     L.append("- **208x slower** — real, but that is *before* the one-line fix in Finding #24.")
     L.append("- **2.5–2.7x slower on device** — real, but from a chained microbenchmark that "
              "maximises the compiler's fusion advantage and so is NKI's worst case. In situ the "
              f"device term is {ins['device_gap_pct']}% of the regression.")
+    L.append("")
+
+    # --- the control, before any result it licenses ---------------------------------------
+    cf = ms["compiler-flag-control"]
+    L.append("## Control: is any of this a compiler-flag artifact?")
+    L.append("")
+    L.append("Asked first, because a bad compiler default would be the cheapest possible "
+             "explanation for the whole slowdown, and because it is the most plausible technical "
+             "form of the objection that there should not be a slowdown at all.")
+    L.append("")
+    L.append(cf["method"])
+    L.append("")
+    L.append("| `NEURON_CC_FLAGS` | NKI ms | torch ms | ratio |")
+    L.append("|---|---|---|---|")
+    for r in cf["rows"]:
+        L.append(f"| `{r['flags']}` | {r['nki_ms']} | {r['torch_ms']} | {r['ratio']}x |")
+    L.append("")
+    sp = cf["spread"]
+    L.append(f"Spread across settings: ratio **{sp['ratio']}x**, NKI **{sp['nki']}x**, "
+             f"torch **{sp['torch']}x**.")
+    L.append("")
+    L.append(f"**{cf['verdict']}** The ratio spread is driven entirely by torch moving: "
+             f"`--lnc 1` makes *torch* slower, which flatters the ratio without helping NKI.")
+    L.append("")
+    L.append(f"*Scope limit.* {cf['scope_limit']}")
+    L.append("")
+    dv = ms["device-time-under-flags"]
+    L.append("So the device half was measured separately. " + dv["method"])
+    L.append("")
+    L.append("| `NEURON_CC_FLAGS` | NKI ms | torch ms | ratio | NKI MB/call | vs unfused floor |")
+    L.append("|---|---|---|---|---|---|")
+    for r in dv["rows"]:
+        L.append(f"| `{r['flags']}` | {r['nki_ms']} | {r['torch_ms']} | {r['ratio']}x | "
+                 f"{r['nki_marginal_mb']} | {r['vs_floor']:.2f}x |")
+    L.append("")
+    L.append(f"**{dv['verdict']}**")
+    L.append("")
+    L.append(dv["why_this_is_the_strong_form"])
+    L.append("")
+    L.append(f"*On the 1.35x row.* {dv['lnc1_caveat']}")
     L.append("")
 
     # --- MFU ------------------------------------------------------------------------------
@@ -94,8 +161,8 @@ def main():
              f"({den['device_tflops_published_bf16']} is the published figure; it includes "
              f"VectorE and ScalarE.)")
     L.append("")
-    L.append("| configuration | step ms | MFU | NKI calls | vs baseline |")
-    L.append("|---|---|---|---|---|")
+    L.append("| configuration | step ms | MFU | NKI calls | vs baseline | re-run step ms |")
+    L.append("|---|---|---|---|---|---|")
     order = [
         ("mfu-baseline-512", "baseline, seq 512"),
         ("mfu-silu-only-512", "NKI SiLU only, seq 512, no fix"),
@@ -107,8 +174,13 @@ def main():
     for k, label in order:
         m = ms[k]
         sd = m.get("slowdown_vs_baseline")
+        rr = m.get("reproduced", {}).get("step_ms")
         L.append(f"| {label} | {m['step_ms']} | {m['mfu_per_core_pct']}% | "
-                 f"{m.get('nki_calls_per_step', 0)} | {str(sd) + 'x' if sd else '—'} |")
+                 f"{m.get('nki_calls_per_step', 0)} | {str(sd) + 'x' if sd else '—'} | "
+                 f"{rr if rr else '—'} |")
+    L.append("")
+    L.append("The re-run column is the same configuration on a second physical instance. Step "
+             "times run a few percent higher there; the slowdown ratios are what reproduce.")
     L.append("")
     L.append(f"FLOPs per step: {ms['mfu-baseline-512']['flops_per_step_gflop']} GFLOP, "
              f"computed explicitly rather than estimated.")

@@ -1,0 +1,37 @@
+  baseline wall: 54.783 ms (from wall_times.json, this run)
+  kernelized wall: 153.43 ms (from wall_times.json, this run)
+================================================================================================
+IN-SITU DECOMPOSITION: how much of the model regression is device, how much dispatch?
+================================================================================================
+  baseline      1 NEFF(s)  device   14.330 ms  HBM    2662.4 MB  activates 8038
+  kernelized    1 NEFF(s)  device   22.696 ms  HBM    3779.9 MB  activates 16468
+
+  wall gap            98.65 ms   (54.783 -> 153.43)
+  device gap          8.366 ms   (  8.5% of the wall gap)
+  dispatch gap       90.281 ms   ( 91.5% of the wall gap)
+
+  per NKI call (169 calls/step):
+    device     0.0495 ms
+    dispatch   0.5342 ms
+  HBM traffic  baseline 2662.4 MB -> kernelized 3779.9 MB (1.42x)
+
+  PROJECTION — if dispatch overhead were eliminated entirely:
+    step            63.15 ms   (baseline 54.783 + device gap 8.366)
+    vs baseline      1.15x   <- NOT MEASURED. Assumes dispatch -> 0, which is
+                            an upper bound on what fixing dispatch can buy.
+
+INTERPRETATION
+  Device accounts for only 8.5% of the regression, so IN A REAL MODEL the
+  fusion penalty is minor and the slowdown is overwhelmingly dispatch. Finding #25's
+  2.5-2.7x is then a genuine upper bound from the chained microbenchmark rather than
+  a representative figure — and Fix 7 (caching create_computation) matters MORE than
+  #25's framing implies. State both, and do not let the microbenchmark carry the
+  headline.
+
+  Caveat: HBM traffic here includes weights, so the kernelized/baseline traffic ratio is
+  diluted compared to the activation-only microbenchmark and should not be read as the
+  fusion penalty directly.
+
+  wrote /home/ubuntu/hf-kernels-neuron/results/raw/insitu-summary/insitu_decomposition.json
+
+----- stderr -----

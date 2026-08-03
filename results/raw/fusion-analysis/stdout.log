@@ -1,0 +1,81 @@
+====================================================================================================
+FUSION BARRIER vs KERNEL QUALITY
+====================================================================================================
+  tile [512, 3072] @ 2 B = 3.15 MB
+  unfused floor per call = 2 tiles = 6.29 MB (one read in, one write out)
+
+config                      device ms   ms/call    HBM MB   MB/call  vs floor    MBU%
+----------------------------------------------------------------------------------------------------
+silu/nki/n1                     0.051    0.0515      18.9     18.87     3.00x   46.6%
+silu/torch/n1                   0.027    0.0269       6.3      6.29     1.00x   32.6%
+rmsnorm/nki/n1                  0.091    0.0909      18.9     18.88     3.00x   28.0%
+rmsnorm/torch/n1                0.038    0.0384       7.9      7.88     1.25x   28.4%
+silu/nki/n28                    0.609    0.0218     188.7      6.74     1.07x   43.1%
+silu/torch/n28                  0.224    0.0080       6.3      0.22     0.04x    3.9%
+rmsnorm/nki/n28                 1.626    0.0581     188.8      6.74     1.07x   16.2%
+rmsnorm/torch/n28               0.636    0.0227       6.4      0.23     0.04x    1.4%
+
+ATTRIBUTION — fixed vs marginal traffic
+----------------------------------------------------------------------------------------------------
+  Traffic is NOT linear in N: a small NEFF carries fixed setup traffic that dominates
+  at N=1. Dividing total traffic by N therefore overstates per-call cost at small N and
+  produces a false 'kernel is inefficient' reading. With two call counts we can solve
+  for both terms instead:
+      traffic(N) = FIXED + N * MARGINAL
+  MARGINAL is the real per-call cost, and it is what should be compared to the floor.
+
+  silu/nki:  traffic(1)=18.87 MB, traffic(28)=188.74 MB
+    marginal per call =   6.29 MB = 1.00x the unfused floor
+    fixed per NEFF    =  12.58 MB = 4.0 tiles of setup
+
+  silu/torch:  traffic(1)=6.29 MB, traffic(28)=6.29 MB
+    marginal per call =   0.00 MB = 0.00x the unfused floor
+    fixed per NEFF    =   6.29 MB = 2.0 tiles of setup
+
+  rmsnorm/nki:  traffic(1)=18.88 MB, traffic(28)=188.76 MB
+    marginal per call =   6.29 MB = 1.00x the unfused floor
+    fixed per NEFF    =  12.59 MB = 4.0 tiles of setup
+
+  rmsnorm/torch:  traffic(1)=7.88 MB, traffic(28)=6.42 MB
+    marginal per call =  -0.05 MB = -0.01x the unfused floor
+    fixed per NEFF    =   7.93 MB = 2.5 tiles of setup
+
+VERDICT
+----------------------------------------------------------------------------------------------------
+
+  silu:
+    device time at N=28:  NKI   0.609 ms vs torch   0.224 ms = 2.72x
+    marginal traffic/call:   NKI   6.29 MB vs torch   0.00 MB
+    NKI vs unfused floor:    1.00x
+    -> NKI marginal traffic is EXACTLY the unfused floor (one read in, one
+       write out). The kernel spills nothing and is optimal for an op that
+       cannot fuse. Kernel quality is NOT the problem.
+    -> torch marginal traffic is 0.00 MB, far below the floor, which is
+       only possible if the chain FUSED into a single pass.
+    => The entire device gap is the FUSION BARRIER.
+
+  rmsnorm:
+    device time at N=28:  NKI   1.626 ms vs torch   0.636 ms = 2.56x
+    marginal traffic/call:   NKI   6.29 MB vs torch  -0.05 MB
+    NKI vs unfused floor:    1.00x
+    -> NKI marginal traffic is EXACTLY the unfused floor (one read in, one
+       write out). The kernel spills nothing and is optimal for an op that
+       cannot fuse. Kernel quality is NOT the problem.
+    -> torch marginal traffic is -0.05 MB, far below the floor, which is
+       only possible if the chain FUSED into a single pass.
+    => The entire device gap is the FUSION BARRIER.
+
+====================================================================================================
+WHY THIS MATTERS FOR THE RECOMMENDATION
+====================================================================================================
+  A NKI custom call is opaque to the Neuron compiler, so it cannot fuse across one.
+  Replacing a torch op with a NKI kernel therefore does not merely add dispatch cost —
+  it REMOVES a fusion opportunity the compiler was already exploiting. For
+  memory-bound ops (elementwise activations, normalisations) fusion is the entire
+  optimisation, so the swap loses on device even with a perfect kernel.
+
+  That is a property of the per-layer swap model, not of NKI or of these kernels, and
+  it is why the ops best suited to the Kernel Hub mechanism are the ones LEAST suited
+  to benefit from it.
+
+----- stderr -----

@@ -98,6 +98,9 @@ def main():
                     help="NEFFs each profile dir should contain. Qwen3-0.6B forward emits 1; more "
                          "than that usually means leftovers from a previous run, which would be "
                          "silently summed in. Set to 0 to disable the check.")
+    ap.add_argument("--json-out", default=None,
+                    help="write the decomposition here. This is the single most quoted result in "
+                         "the project, so it should be a file and not only a log line.")
     args = ap.parse_args()
     if args.expect_neffs == 0:
         args.expect_neffs = None
@@ -155,6 +158,20 @@ def main():
     print(f"  HBM traffic  baseline {b['hbm']/1e6:.1f} MB -> kernelized {k['hbm']/1e6:.1f} MB "
           f"({k['hbm'] / max(b['hbm'], 1):.2f}x)")
 
+    # PROJECTION, computed here rather than by hand. This is the number the design doc leads with,
+    # and it was previously arithmetic done in a commit message: baseline wall + device gap. Doing
+    # it by hand means it silently keeps the old walls when the walls change, which is exactly the
+    # drift measurements.json exists to prevent. It is a projection and is labelled as one on every
+    # line that prints it: it assumes the dispatch gap goes to zero, which no fix has achieved.
+    proj_ms = args.wall_baseline + d_dev
+    proj_ratio = proj_ms / args.wall_baseline if args.wall_baseline else float("nan")
+    print()
+    print("  PROJECTION — if dispatch overhead were eliminated entirely:")
+    print(f"    step        {proj_ms:9.2f} ms   (baseline {args.wall_baseline} + device gap "
+          f"{d_dev:.3f})")
+    print(f"    vs baseline {proj_ratio:9.2f}x   <- NOT MEASURED. Assumes dispatch -> 0, which is")
+    print("                            an upper bound on what fixing dispatch can buy.")
+
     print()
     print("INTERPRETATION")
     frac = d_dev / d_wall if d_wall else 0
@@ -176,6 +193,32 @@ def main():
     print("  Caveat: HBM traffic here includes weights, so the kernelized/baseline traffic ratio is")
     print("  diluted compared to the activation-only microbenchmark and should not be read as the")
     print("  fusion penalty directly.")
+
+    if args.json_out:
+        out = {
+            "baseline": {"dir": args.baseline_dir, "neffs": b["n"],
+                         "device_ms": round(b["device_ms"], 3), "hbm_mb": round(b["hbm"] / 1e6, 1),
+                         "activates": b["acts"], "wall_ms": args.wall_baseline},
+            "kernelized": {"dir": args.kernelized_dir, "neffs": k["n"],
+                           "device_ms": round(k["device_ms"], 3), "hbm_mb": round(k["hbm"] / 1e6, 1),
+                           "activates": k["acts"], "wall_ms": args.wall_kernelized},
+            "nki_calls_per_step": args.nki_calls,
+            "wall_gap_ms": round(d_wall, 3),
+            "device_gap_ms": round(d_dev, 3),
+            "device_gap_pct": round(100 * frac, 1),
+            "dispatch_gap_ms": round(d_disp, 3),
+            "dispatch_gap_pct": round(100 * (1 - frac), 1),
+            "per_call_device_ms": round(d_dev / args.nki_calls, 4),
+            "per_call_dispatch_ms": round(d_disp / args.nki_calls, 4),
+            "projected_with_dispatch_fixed": {
+                "step_ms": round(proj_ms, 2),
+                "slowdown_vs_baseline": round(proj_ratio, 2),
+                "status": "PROJECTION, not measured — assumes dispatch gap goes to zero",
+            },
+        }
+        Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.json_out).write_text(json.dumps(out, indent=2) + "\n")
+        print(f"\n  wrote {args.json_out}")
     return 0
 
 

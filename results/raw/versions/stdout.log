@@ -1,0 +1,41 @@
+============================================================================
+NKI import paths: versions and API surface
+============================================================================
+
+  nki              version=0.5.0+28631259367.ga768afa6             
+                   file=/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nki/__init__.py
+  neuronxcc.nki    version=unknown                                 
+                   file=/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/neuronxcc/nki/__init__.cpython-312-x86_64-linux-gnu.so
+
+  same module object? False
+  same version?       False
+
+============================================================================
+Language-level API surface
+============================================================================
+  symbol                            nki             neuronxcc
+  arange                            NO                   yes
+  ds                               yes                   yes
+  mgrid                             NO                   yes
+  load                             yes                   yes
+  store                            yes                   yes
+  affine_range                     yes                   yes
+  shared_hbm                       yes                   yes
+  sbuf                             yes                   yes
+  silu                             yes                   yes
+  ndarray                          yes                   yes
+
+============================================================================
+INTERPRETATION
+============================================================================
+  Two different NKI versions are installed:
+    import nki               -> 0.5.0+28631259367.ga768afa6
+    from neuronxcc import nki -> unknown
+
+  => Finding #14 is VERSION SKEW, not a capability split between peers.
+     If `nl.arange` is absent from the newer one, it is a removed/deprecated
+     idiom, and our RMSNorm + SiLU kernels are written against the old API.
+     That is our tech debt to pay, not an upstream question to file.
+============================================================================
+
+----- stderr -----

@@ -274,3 +274,132 @@ the two figures most likely to be quoted out of context, with why. `results/meas
 the microbenchmark rows with a note saying not to cite them without the in-situ figure. That is a
 partial fix — a doc cannot stop a number travelling — but it at least means the correction ships
 alongside the claim.
+
+---
+
+## 19. The sync script deleted the artifacts it was supposed to be unrelated to [cost: ~40 min, 19 stages of artifacts]
+
+**What happened.** After the first full regeneration run finished on the replacement instance, I
+pushed a small code change with `./scripts/sync_to_trn2.sh` and then went to fetch the results. 19 of
+22 stages' artifacts were gone from the remote.
+
+`sync_to_trn2.sh` uses `rsync --delete`, which is right for pushing source: it means a file deleted
+locally goes away remotely instead of lingering. But `results/raw/` existed locally containing only
+`README.md`, so `--delete` did exactly what it was told and removed everything under the remote
+`results/raw/` that had no local counterpart. Which was all of it.
+
+**Why it took a while to see.** The sync printed a normal success line. The loss was only visible on
+the next `ls`, and my first theory was that a stage had failed rather than that a later, unrelated
+command had deleted the output of stages that had already succeeded.
+
+**What it is really an instance of.** Sticking point #17 was "results lived somewhere something else
+destroys them", and the destroyer was an expiring instance. This is the same failure with a different
+destroyer, discovered *while fixing the first one*. Moving artifacts out of `/tmp` and into the repo
+tree put them directly in the path of a tool whose whole job is making the remote tree match the
+local one.
+
+**Fix.** `results/raw/` is excluded from the push, with a comment saying the exclusion is
+load-bearing and why. That comment matters more than the exclusion: the line looks removable —
+"why would we not sync results?" — and removing it re-arms the bug.
+
+**Generalisable rule:** *a directory that is written remotely and read locally must be excluded from
+any bidirectional sync, and the exclusion needs a comment explaining what breaks if you remove it.*
+The push and the fetch are different directions with different correct flags, so they are two
+scripts, not one script with a flag.
+
+---
+
+## 20. A summing consumer plus a non-clearing producer, and no error [cost: ~30 min, one wrong headline number]
+
+**What happened.** `sum_model_device_time.py` sums device time across every NEFF/NTFF pair it finds
+in a directory, because a full model forward can compile to several NEFFs. `profile_model_device_time.py`
+wrote into its output directory without clearing it. Re-running the profile into a directory that
+already had a NEFF therefore produced exactly double the device time — and the number it produced,
+16.9% device instead of 8.4%, is plausible. Nothing errored, nothing warned. It would have gone into
+the design doc if the "2 NEFF(s)" in the output line had not looked odd.
+
+Doubling is the worst possible corruption here, because it is *almost* right. A 10x error announces
+itself; a 2x error looks like a different but reasonable measurement.
+
+**Fix, in two places, because either alone is insufficient.** The producer now clears its own output
+directory. The consumer gained `--expect-neffs` (default 1) and prints a loud warning naming each
+file when the count is wrong. Clearing alone would still leave the consumer silently summing whatever
+it finds if some other producer writes there; the assertion alone would still let a stale file in.
+
+**Two more instances of the same shape, found by looking for it deliberately.** Once the pattern was
+named, `profile_nki_call_cost.py` and `profile_fused_mlp_vs_torch.py` turned out not to clear their
+directories either. The fused-MLP case is the interesting one: it legitimately emits *two* NEFFs, a
+1-block correctness graph and an N-block timed graph, so "more than one NEFF" is not by itself the
+signal. They are told apart by instruction count.
+
+**Generalisable rule:** *if a consumer aggregates over "everything in this directory", the producer
+must own that directory exclusively and clear it, and the consumer must assert the count it expects.*
+Aggregating with `sum` over a glob is a silent-corruption interface — `max`, or reading a manifest the
+producer wrote, would have failed loudly instead.
+
+---
+
+## 21. A string placeholder that only matched its prefix form [cost: ~25 min, 8 profile directories in the wrong place]
+
+**What happened.** `regenerate_results.py` substitutes `STAGE/` and `RAW/` in each stage's argv so
+output lands in the artifact tree. The substitution was `a.replace("RAW/", ...)`, which handles
+`RAW/prof_model_baseline` but not a bare `RAW` — and `--outdir-base` takes a bare directory. So the
+token passed through literally, the sweep created `./RAW/` in the repo root, wrote 8 profile
+directories there, and the *consuming* stage read from the same literal path and looked fine. Only
+the final extraction stage, which globs `results/raw/`, noticed — and its complaint was eight lines of
+`skip ... (missing)`, which reads like a stage that had not run yet.
+
+**Why the design invited it.** A placeholder that is sometimes a prefix and sometimes a whole value
+has two forms, and a `str.replace` only sees one. The fix handles the exact token as a separate case.
+
+**The deeper problem was the same class as #19 and #20:** an output path that no one verified. Three
+separate path bugs in one harness, all of the same shape — *a file was written somewhere nobody
+checked* — and all invisible because every stage exited 0. A harness that reports "all stages ok"
+while writing to the wrong directory is worse than one that fails, because it produces confidence.
+
+**Fix, beyond the substitution.** `scripts/check_measurement_provenance.py` now verifies that every
+path named in a `measurements.json` `artifact` field actually exists. That converts "the artifact is
+somewhere" from a belief into a check, and it caught its own first run: fifteen artifacts recorded as
+committed while they were still only on the instance.
+
+**Generalisable rule:** *a harness must verify its outputs exist where it claims, not just that its
+subprocesses exited 0.* Exit code 0 means the command ran, not that it did the thing.
+
+---
+
+## 22. A blanket `*.log` in `.gitignore` would have made ten provenance claims false [cost: ~15 min, would have cost reviewer trust]
+
+**What happened.** With artifacts finally fetched into `results/raw/`, `measurements.json` was updated
+to say 17 of 20 measurements were file-backed, naming the exact artifact for each. Ten of those
+artifacts are a stage's `stdout.log`. The repo root `.gitignore` has a blanket `*.log`.
+
+So the repository would have claimed, in writing and per-measurement, that ten numbers were backed by
+committed files that git was silently declining to commit. A reviewer cloning the repo would have
+found the claim and not the file. That is worse than the original artifact loss, because the original
+loss was *disclosed* and this would have been an assertion that was false.
+
+**How it was caught.** Not by reading the `.gitignore` — I had read it earlier in the session and it
+looked fine, because `*.log` is a sensible rule and the problem only exists in combination with a
+decision made later. It was caught because `check_measurement_provenance.py` had been written to test
+that named artifacts exist, and extending it from "exists on disk" to "git would actually commit it"
+was an obvious next question once the file paths were in a machine-readable field.
+
+**A second bug inside the fix.** The first implementation used `git check-ignore -v`, which reports a
+match for *negation* patterns too and exits 0 for them — so after adding `!*.log` to rescue the logs,
+every rescued file still looked ignored. The check now asks the question directly: a path is
+committable iff it appears in `git ls-files` or `git ls-files --others --exclude-standard`. Membership
+in what git would commit is the actual question; interpreting ignore rules was a detour that
+introduced its own error.
+
+**Verified with a negative control**, because a check that has never failed is not known to work:
+removing `!*.log` makes the check fail on all ten artifacts and name `.gitignore:36:*.log` as the
+cause. Restoring it makes the check pass.
+
+**Generalisable rule:** *"the file exists" and "the file is in the repository" are different claims,
+and a provenance status asserts the second.* Any project that records where its evidence lives should
+verify that record against what version control would actually preserve — otherwise the record is a
+belief about the filesystem, held on one machine.
+
+This is the fourth bug this session in one family: an output written somewhere nobody verified
+(#19 deleted by a sync, #20 double-counted from a dirty directory, #21 written to a literal `RAW/`,
+#22 excluded by an ignore rule). All four were invisible to the exit code.

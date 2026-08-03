@@ -1,0 +1,44 @@
+8 configurations to profile
+(each is a separate process; two Neuron processes must not run concurrently)
+
+[1/8] silu nki calls=1 -> /home/ubuntu/hf-kernels-neuron/results/raw/prof_silu_nki_n1
+  ok in 12s  iter 3: wall      1.83 ms  (  1.826 ms/call)
+
+[2/8] silu torch calls=1 -> /home/ubuntu/hf-kernels-neuron/results/raw/prof_silu_torch_n1
+  ok in 13s  iter 3: wall      1.19 ms  (  1.192 ms/call)
+
+[3/8] rmsnorm nki calls=1 -> /home/ubuntu/hf-kernels-neuron/results/raw/prof_rmsnorm_nki_n1
+  ok in 13s  iter 3: wall      2.14 ms  (  2.141 ms/call)
+
+[4/8] rmsnorm torch calls=1 -> /home/ubuntu/hf-kernels-neuron/results/raw/prof_rmsnorm_torch_n1
+  ok in 12s  iter 3: wall      1.31 ms  (  1.306 ms/call)
+
+[5/8] silu nki calls=28 -> /home/ubuntu/hf-kernels-neuron/results/raw/prof_silu_nki_n28
+  ok in 13s  iter 3: wall     13.71 ms  (  0.490 ms/call)
+
+[6/8] silu torch calls=28 -> /home/ubuntu/hf-kernels-neuron/results/raw/prof_silu_torch_n28
+  ok in 11s  iter 3: wall      1.77 ms  (  0.063 ms/call)
+
+[7/8] rmsnorm nki calls=28 -> /home/ubuntu/hf-kernels-neuron/results/raw/prof_rmsnorm_nki_n28
+  ok in 16s  iter 3: wall     17.78 ms  (  0.635 ms/call)
+
+[8/8] rmsnorm torch calls=28 -> /home/ubuntu/hf-kernels-neuron/results/raw/prof_rmsnorm_torch_n28
+  ok in 12s  iter 3: wall      2.84 ms  (  0.101 ms/call)
+
+================================================================================
+Now summarise with:
+  python scripts/summarise_device_profiles.py \
+      /home/ubuntu/hf-kernels-neuron/results/raw/prof_silu_nki_n1 \
+      /home/ubuntu/hf-kernels-neuron/results/raw/prof_silu_torch_n1 \
+      /home/ubuntu/hf-kernels-neuron/results/raw/prof_rmsnorm_nki_n1 \
+      /home/ubuntu/hf-kernels-neuron/results/raw/prof_rmsnorm_torch_n1 \
+      /home/ubuntu/hf-kernels-neuron/results/raw/prof_silu_nki_n28 \
+      /home/ubuntu/hf-kernels-neuron/results/raw/prof_silu_torch_n28 \
+      /home/ubuntu/hf-kernels-neuron/results/raw/prof_rmsnorm_nki_n28 \
+      /home/ubuntu/hf-kernels-neuron/results/raw/prof_rmsnorm_torch_n28 \
+      --calls <N>
+
+NOTE: --calls is only used for the per-call column, so summarise each call count
+separately rather than mixing N=1 and N=28 directories in one invocation.
+
+----- stderr -----

@@ -22,6 +22,7 @@ Usage (run once per N so each gets its own output dir):
 
 import argparse
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -39,6 +40,12 @@ os.environ["NEURON_RT_INSPECT_DEVICE_PROFILE"] = "1"
 os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"] = args.outdir
 os.environ.setdefault("NEURON_RT_VISIBLE_CORES", "0")
 
+# Clear the output directory. summarise_device_profiles.py SUMS device time over every NEFF it
+# finds, so one leftover NEFF from a previous run silently doubles the reported device time. That
+# already happened once to the in-situ profiles (8.4% became 16.9% with no error). This script
+# emits exactly one NEFF, so anything else in here is stale.
+if Path(args.outdir).exists():
+    shutil.rmtree(args.outdir)
 Path(args.outdir).mkdir(parents=True, exist_ok=True)
 sys.path.insert(0, str(Path(__file__).parent.parent / "tests"))
 

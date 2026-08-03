@@ -1,0 +1,449 @@
+2026-Aug-03 18:46:35.0892 111534:111580 [2] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):273 CCOM WARN NET/OFI Failed to initialize rdma protocol
+2026-Aug-03 18:46:35.0895 111534:111580 [2] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):416 CCOM WARN NET/OFI aws-ofi-nccl initialization failed
+2026-Aug-03 18:46:35.0897 111534:111580 [2] ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t):78 CCOM WARN NET/OFI Initializing plugin failed
+2026-Aug-03 18:46:35.0899 111534:111580 [2] net_plugin.cc:104 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+============================================================================
+SPIKE: production nkilib MLP kernel vs Qwen3MLP
+============================================================================
+  nkilib: /opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/__init__.py
+  device: xla:0 (NEURON)
+
+============================================================================
+Q1. Correctness with materialized (contiguous) transposed weights
+============================================================================
+  A. Qwen3-0.6B dims, fp32
+      H=1024 I=3072 B=1 S=128 BxS=128 dtype=float32 weights=host_contiguous
+      on-device is_contiguous: gate=True up=True down=True
+2026-08-03 18:46:36.000619:  111534  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_5063107464114982108+fad94d7c/model.neff
+      cos_sim=0.999989  max_diff=1.452e-02  wall=0.7s  PASS
+  B. Qwen3-0.6B dims, bf16
+      H=1024 I=3072 B=1 S=128 BxS=128 dtype=bfloat16 weights=host_contiguous
+      on-device is_contiguous: gate=True up=True down=True
+2026-08-03 18:46:37.000280:  111534  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_15965533692941652836+fad94d7c/model.neff
+      cos_sim=0.999995  max_diff=9.559e-03  wall=0.6s  PASS
+
+============================================================================
+Q2. Does a non-contiguous transposed view work? (Finding #17's premise)
+============================================================================
+  METHODOLOGY NOTE. The first version of this spike transposed on the host and
+  then called .to(device), which lets the transfer materialize the result — so
+  it proved nothing. The meaningful test moves the HF weight to the device
+  first and transposes THERE, producing a genuinely non-contiguous device
+  tensor. That is also the realistic case: in a kernelized model the weights
+  already live on the device.
+
+  C. transpose on host, then move (may materialize)
+      H=1024 I=3072 B=1 S=128 BxS=128 dtype=float32 weights=host_view
+      on-device is_contiguous: gate=True up=True down=True
+      cos_sim=0.999989  max_diff=1.452e-02  wall=0.1s  PASS
+  D. move to device, then transpose THERE  <-- the real test
+      H=1024 I=3072 B=1 S=128 BxS=128 dtype=float32 weights=device_view
+      on-device is_contiguous: gate=True up=True down=True
+2026-08-03 18:46:37.000501:  111534  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_12245722495578341171+fad94d7c/model.neff
+      cos_sim=0.999989  max_diff=1.452e-02  wall=0.1s  PASS
+
+============================================================================
+Q3. Qwen3-8B dimensions — where is the boundary?
+============================================================================
+  H=4096, I=12288 failed with:
+    'floordiv' does not allow division by zero
+    in kernel_helpers.get_ceil_quotient, called from
+    mlp_cte_tile_info.py:236 build_with_subtiling(bxs_dim, ...)
+  i.e. a subtile size computes to 0 for this shape. Mapping the boundary:
+
+    pass  H=1024  I=3072   S=128                 cos_sim=0.999995 max_diff=9.6e-03
+    FAIL  H=2048  I=6144   S=128                 RuntimeError: error: failed to compile NKI kernel: Collected 1 different diagnostics
+    FAIL  H=4096  I=12288  S=128                 RuntimeError: error: failed to compile NKI kernel: Collected 1 different diagnostics
+    FAIL  H=4096  I=12288  S=256                 RuntimeError: error: failed to compile NKI kernel: Collected 1 different diagnostics
+    FAIL  H=4096  I=12288  S=512                 RuntimeError: error: failed to compile NKI kernel: Collected 1 different diagnostics
+2026-08-03 18:46:45.000161:  111534  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_17269434499253203643+fad94d7c/model.neff
+    pass  H=4096  I=4096   S=128                 cos_sim=0.999979 max_diff=1.3e-02
+    FAIL  H=4096  I=8192   S=128                 RuntimeError: error: failed to compile NKI kernel: Collected 1 different diagnostics
+    FAIL  H=4096  I=12288  S=128 force_cte       RuntimeError: error: failed to compile NKI kernel: Collected 1 different diagnostics
+    FAIL  H=4096  I=12288  S=128 PREFILL         RuntimeError: error: failed to compile NKI kernel: Collected 1 different diagnostics
+
+============================================================================
+Q4. Pinning the failure boundary
+============================================================================
+  Hypothesis from Q3: failures track intermediate_size > 4096, not the I/H
+  ratio. nki-library's CTE sharding heuristic forces shard_on_inter=True when
+  intermediate_size > 4096; we launch single-core (no SPMD grid), so the
+  inter-sharding tile math would divide by a zero worker count.
+
+  If true, the fused MLP cannot run single-core at the sizes that matter
+  (Qwen3-8B is I=12288), which is a harder blocker than the weight layout.
+
+    pass  H= 4096 I=  4096  (I<=4096)  cos_sim=0.999979 max_diff=1.3e-02
+    FAIL  H= 4096 I=  4224  (I >4096)  compile error
+    FAIL  H= 4096 I=  4608  (I >4096)  compile error
+    FAIL  H= 4096 I=  5120  (I >4096)  compile error
+    FAIL  H= 4096 I=  8192  (I >4096)  compile error
+    pass  H= 1024 I=  3072  (I<=4096)  cos_sim=0.999995 max_diff=9.6e-03
+2026-08-03 18:46:55.000110:  111534  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_2126207604144769148+fad94d7c/model.neff
+    pass  H= 1024 I=  4096  (I<=4096)  cos_sim=0.999996 max_diff=9.8e-03
+    FAIL  H= 1024 I=  5120  (I >4096)  compile error
+2026-08-03 18:46:56.000623:  111534  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_13744092555653427063+fad94d7c/model.neff
+    pass  H= 2048 I=  4096  (I<=4096)  cos_sim=0.999988 max_diff=1.1e-02
+    FAIL  H= 2048 I=  6144  (I >4096)  compile error
+
+  Hypothesis 'passes iff intermediate_size <= 4096': CONSISTENT with all data points
+
+============================================================================
+VERDICT
+============================================================================
+  Q1 — production kernel drivable from PyTorch/XLA with HF weights:
+       YES
+         small fp32   pass  cos_sim=0.999989 max_diff=1.5e-02
+         small bf16   pass  cos_sim=0.999995 max_diff=9.6e-03
+       => The fused MLP kernel itself works, called directly with HF
+          weights. No vendoring, no reimplementation.
+
+  Q2 — non-contiguous transposed device view accepted:
+       transpose-on-host-then-move : yes  (cos_sim=0.999989 max_diff=1.5e-02)
+       transpose-on-device         : yes  (cos_sim=0.999989 max_diff=1.5e-02)
+       => Finding #17 needs REVISING. A device-side `.t()` view is accepted,
+          so the memory-doubling and checkpoint-corruption options may both
+          be avoidable. Confirm the perf cost before relaxing the finding —
+          'accepted' is not the same as 'free'.
+
+  Q3 — shape support: 2/9 configurations compiled
+       See the table above for which. A divide-by-zero in the kernel's own
+       tile-size computation is an nki-library bug to report, not something
+       a wrapper can work around.
+============================================================================
+
+----- stderr -----
+/home/ubuntu/hf-kernels-neuron/scripts/spike_nkilib_mlp.py:191: DeprecationWarning: Use torch_xla.device instead
+  dev = xm.xla_device()
+/home/ubuntu/hf-kernels-neuron/scripts/spike_nkilib_mlp.py:150: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/spike_nkilib_mlp.py:150: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/spike_nkilib_mlp.py:150: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/spike_nkilib_mlp.py:150: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/spike_nkilib_mlp.py:150: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/kernel_helpers.py:104:12: error: 'floordiv' does not allow division by zero
+    return (numerator + denominator - 1) // denominator
+           ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/tile_info.py:37:22: note: called from here
+        tile_count = get_ceil_quotient(tiled_dim_size, tile_size)
+                     ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/tile_info.py:59:16: note: called from here
+        return TiledDimInfo.build(tiled_dim_size, tile_size, subtiled_dim_info)
+               ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte_tile_info.py:236:20: note: called from here
+    bxs_dim_tile = TiledDimInfo.build_with_subtiling(bxs_dim_size, bxs_dim_tile_size, bxs_dim_subtile_size)
+                   ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte.py:262:17: note: called from here
+    tile_info = build_mlp_cte_tile_info(shard_mlp_params, sharded_dim, dim_shard)
+                ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte.py:209:9: note: called from here
+        _execute_on_shard(
+        ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp.py:340:9: note: called from here
+        mlp_cte(mlp_params, out, fused_add_out)
+        ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp.py:53:1: note: when tracing NKI kernel
+def mlp(
+^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/kernel_helpers.py:104:12: error: 'floordiv' does not allow division by zero
+    return (numerator + denominator - 1) // denominator
+           ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/tile_info.py:37:22: note: called from here
+        tile_count = get_ceil_quotient(tiled_dim_size, tile_size)
+                     ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/tile_info.py:59:16: note: called from here
+        return TiledDimInfo.build(tiled_dim_size, tile_size, subtiled_dim_info)
+               ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte_tile_info.py:236:20: note: called from here
+    bxs_dim_tile = TiledDimInfo.build_with_subtiling(bxs_dim_size, bxs_dim_tile_size, bxs_dim_subtile_size)
+                   ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte.py:262:17: note: called from here
+    tile_info = build_mlp_cte_tile_info(shard_mlp_params, sharded_dim, dim_shard)
+                ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte.py:209:9: note: called from here
+        _execute_on_shard(
+        ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp.py:340:9: note: called from here
+        mlp_cte(mlp_params, out, fused_add_out)
+        ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp.py:53:1: note: when tracing NKI kernel
+def mlp(
+^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/kernel_helpers.py:104:12: error: 'floordiv' does not allow division by zero
+    return (numerator + denominator - 1) // denominator
+           ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/tile_info.py:37:22: note: called from here
+        tile_count = get_ceil_quotient(tiled_dim_size, tile_size)
+                     ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/tile_info.py:59:16: note: called from here
+        return TiledDimInfo.build(tiled_dim_size, tile_size, subtiled_dim_info)
+               ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte_tile_info.py:236:20: note: called from here
+    bxs_dim_tile = TiledDimInfo.build_with_subtiling(bxs_dim_size, bxs_dim_tile_size, bxs_dim_subtile_size)
+                   ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte.py:262:17: note: called from here
+    tile_info = build_mlp_cte_tile_info(shard_mlp_params, sharded_dim, dim_shard)
+                ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte.py:209:9: note: called from here
+        _execute_on_shard(
+        ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp.py:340:9: note: called from here
+        mlp_cte(mlp_params, out, fused_add_out)
+        ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp.py:53:1: note: when tracing NKI kernel
+def mlp(
+^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/kernel_helpers.py:104:12: error: 'floordiv' does not allow division by zero
+    return (numerator + denominator - 1) // denominator
+           ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/tile_info.py:37:22: note: called from here
+        tile_count = get_ceil_quotient(tiled_dim_size, tile_size)
+                     ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/tile_info.py:59:16: note: called from here
+        return TiledDimInfo.build(tiled_dim_size, tile_size, subtiled_dim_info)
+               ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte_tile_info.py:236:20: note: called from here
+    bxs_dim_tile = TiledDimInfo.build_with_subtiling(bxs_dim_size, bxs_dim_tile_size, bxs_dim_subtile_size)
+                   ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte.py:262:17: note: called from here
+    tile_info = build_mlp_cte_tile_info(shard_mlp_params, sharded_dim, dim_shard)
+                ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte.py:209:9: note: called from here
+        _execute_on_shard(
+        ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp.py:340:9: note: called from here
+        mlp_cte(mlp_params, out, fused_add_out)
+        ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp.py:53:1: note: when tracing NKI kernel
+def mlp(
+^
+/home/ubuntu/hf-kernels-neuron/scripts/spike_nkilib_mlp.py:150: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/kernel_helpers.py:104:12: error: 'floordiv' does not allow division by zero
+    return (numerator + denominator - 1) // denominator
+           ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/tile_info.py:37:22: note: called from here
+        tile_count = get_ceil_quotient(tiled_dim_size, tile_size)
+                     ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/tile_info.py:59:16: note: called from here
+        return TiledDimInfo.build(tiled_dim_size, tile_size, subtiled_dim_info)
+               ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte_tile_info.py:236:20: note: called from here
+    bxs_dim_tile = TiledDimInfo.build_with_subtiling(bxs_dim_size, bxs_dim_tile_size, bxs_dim_subtile_size)
+                   ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte.py:262:17: note: called from here
+    tile_info = build_mlp_cte_tile_info(shard_mlp_params, sharded_dim, dim_shard)
+                ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte.py:209:9: note: called from here
+        _execute_on_shard(
+        ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp.py:340:9: note: called from here
+        mlp_cte(mlp_params, out, fused_add_out)
+        ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp.py:53:1: note: when tracing NKI kernel
+def mlp(
+^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/kernel_helpers.py:104:12: error: 'floordiv' does not allow division by zero
+    return (numerator + denominator - 1) // denominator
+           ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/tile_info.py:37:22: note: called from here
+        tile_count = get_ceil_quotient(tiled_dim_size, tile_size)
+                     ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/tile_info.py:59:16: note: called from here
+        return TiledDimInfo.build(tiled_dim_size, tile_size, subtiled_dim_info)
+               ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte_tile_info.py:236:20: note: called from here
+    bxs_dim_tile = TiledDimInfo.build_with_subtiling(bxs_dim_size, bxs_dim_tile_size, bxs_dim_subtile_size)
+                   ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte.py:262:17: note: called from here
+    tile_info = build_mlp_cte_tile_info(shard_mlp_params, sharded_dim, dim_shard)
+                ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte.py:209:9: note: called from here
+        _execute_on_shard(
+        ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp.py:340:9: note: called from here
+        mlp_cte(mlp_params, out, fused_add_out)
+        ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp.py:53:1: note: when tracing NKI kernel
+def mlp(
+^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/kernel_helpers.py:104:12: error: 'floordiv' does not allow division by zero
+    return (numerator + denominator - 1) // denominator
+           ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/tile_info.py:37:22: note: called from here
+        tile_count = get_ceil_quotient(tiled_dim_size, tile_size)
+                     ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/tile_info.py:59:16: note: called from here
+        return TiledDimInfo.build(tiled_dim_size, tile_size, subtiled_dim_info)
+               ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte_tile_info.py:236:20: note: called from here
+    bxs_dim_tile = TiledDimInfo.build_with_subtiling(bxs_dim_size, bxs_dim_tile_size, bxs_dim_subtile_size)
+                   ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte.py:262:17: note: called from here
+    tile_info = build_mlp_cte_tile_info(shard_mlp_params, sharded_dim, dim_shard)
+                ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte.py:209:9: note: called from here
+        _execute_on_shard(
+        ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp.py:340:9: note: called from here
+        mlp_cte(mlp_params, out, fused_add_out)
+        ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp.py:53:1: note: when tracing NKI kernel
+def mlp(
+^
+/home/ubuntu/hf-kernels-neuron/scripts/spike_nkilib_mlp.py:150: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/kernel_helpers.py:104:12: error: 'floordiv' does not allow division by zero
+    return (numerator + denominator - 1) // denominator
+           ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/tile_info.py:37:22: note: called from here
+        tile_count = get_ceil_quotient(tiled_dim_size, tile_size)
+                     ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/tile_info.py:59:16: note: called from here
+        return TiledDimInfo.build(tiled_dim_size, tile_size, subtiled_dim_info)
+               ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte_tile_info.py:236:20: note: called from here
+    bxs_dim_tile = TiledDimInfo.build_with_subtiling(bxs_dim_size, bxs_dim_tile_size, bxs_dim_subtile_size)
+                   ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte.py:262:17: note: called from here
+    tile_info = build_mlp_cte_tile_info(shard_mlp_params, sharded_dim, dim_shard)
+                ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte.py:209:9: note: called from here
+        _execute_on_shard(
+        ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp.py:340:9: note: called from here
+        mlp_cte(mlp_params, out, fused_add_out)
+        ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp.py:53:1: note: when tracing NKI kernel
+def mlp(
+^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/kernel_helpers.py:104:12: error: 'floordiv' does not allow division by zero
+    return (numerator + denominator - 1) // denominator
+           ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/tile_info.py:37:22: note: called from here
+        tile_count = get_ceil_quotient(tiled_dim_size, tile_size)
+                     ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/tile_info.py:59:16: note: called from here
+        return TiledDimInfo.build(tiled_dim_size, tile_size, subtiled_dim_info)
+               ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte_tile_info.py:236:20: note: called from here
+    bxs_dim_tile = TiledDimInfo.build_with_subtiling(bxs_dim_size, bxs_dim_tile_size, bxs_dim_subtile_size)
+                   ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte.py:262:17: note: called from here
+    tile_info = build_mlp_cte_tile_info(shard_mlp_params, sharded_dim, dim_shard)
+                ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte.py:209:9: note: called from here
+        _execute_on_shard(
+        ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp.py:340:9: note: called from here
+        mlp_cte(mlp_params, out, fused_add_out)
+        ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp.py:53:1: note: when tracing NKI kernel
+def mlp(
+^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/kernel_helpers.py:104:12: error: 'floordiv' does not allow division by zero
+    return (numerator + denominator - 1) // denominator
+           ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/tile_info.py:37:22: note: called from here
+        tile_count = get_ceil_quotient(tiled_dim_size, tile_size)
+                     ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/tile_info.py:59:16: note: called from here
+        return TiledDimInfo.build(tiled_dim_size, tile_size, subtiled_dim_info)
+               ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte_tile_info.py:236:20: note: called from here
+    bxs_dim_tile = TiledDimInfo.build_with_subtiling(bxs_dim_size, bxs_dim_tile_size, bxs_dim_subtile_size)
+                   ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte.py:262:17: note: called from here
+    tile_info = build_mlp_cte_tile_info(shard_mlp_params, sharded_dim, dim_shard)
+                ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte.py:209:9: note: called from here
+        _execute_on_shard(
+        ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp.py:340:9: note: called from here
+        mlp_cte(mlp_params, out, fused_add_out)
+        ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp.py:53:1: note: when tracing NKI kernel
+def mlp(
+^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/kernel_helpers.py:104:12: error: 'floordiv' does not allow division by zero
+    return (numerator + denominator - 1) // denominator
+           ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/tile_info.py:37:22: note: called from here
+        tile_count = get_ceil_quotient(tiled_dim_size, tile_size)
+                     ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/tile_info.py:59:16: note: called from here
+        return TiledDimInfo.build(tiled_dim_size, tile_size, subtiled_dim_info)
+               ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte_tile_info.py:236:20: note: called from here
+    bxs_dim_tile = TiledDimInfo.build_with_subtiling(bxs_dim_size, bxs_dim_tile_size, bxs_dim_subtile_size)
+                   ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte.py:262:17: note: called from here
+    tile_info = build_mlp_cte_tile_info(shard_mlp_params, sharded_dim, dim_shard)
+                ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte.py:209:9: note: called from here
+        _execute_on_shard(
+        ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp.py:340:9: note: called from here
+        mlp_cte(mlp_params, out, fused_add_out)
+        ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp.py:53:1: note: when tracing NKI kernel
+def mlp(
+^
+/home/ubuntu/hf-kernels-neuron/scripts/spike_nkilib_mlp.py:150: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/spike_nkilib_mlp.py:150: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/kernel_helpers.py:104:12: error: 'floordiv' does not allow division by zero
+    return (numerator + denominator - 1) // denominator
+           ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/tile_info.py:37:22: note: called from here
+        tile_count = get_ceil_quotient(tiled_dim_size, tile_size)
+                     ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/tile_info.py:59:16: note: called from here
+        return TiledDimInfo.build(tiled_dim_size, tile_size, subtiled_dim_info)
+               ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte_tile_info.py:236:20: note: called from here
+    bxs_dim_tile = TiledDimInfo.build_with_subtiling(bxs_dim_size, bxs_dim_tile_size, bxs_dim_subtile_size)
+                   ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte.py:262:17: note: called from here
+    tile_info = build_mlp_cte_tile_info(shard_mlp_params, sharded_dim, dim_shard)
+                ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte.py:209:9: note: called from here
+        _execute_on_shard(
+        ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp.py:340:9: note: called from here
+        mlp_cte(mlp_params, out, fused_add_out)
+        ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp.py:53:1: note: when tracing NKI kernel
+def mlp(
+^
+/home/ubuntu/hf-kernels-neuron/scripts/spike_nkilib_mlp.py:150: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/kernel_helpers.py:104:12: error: 'floordiv' does not allow division by zero
+    return (numerator + denominator - 1) // denominator
+           ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/tile_info.py:37:22: note: called from here
+        tile_count = get_ceil_quotient(tiled_dim_size, tile_size)
+                     ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/utils/tile_info.py:59:16: note: called from here
+        return TiledDimInfo.build(tiled_dim_size, tile_size, subtiled_dim_info)
+               ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte_tile_info.py:236:20: note: called from here
+    bxs_dim_tile = TiledDimInfo.build_with_subtiling(bxs_dim_size, bxs_dim_tile_size, bxs_dim_subtile_size)
+                   ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte.py:262:17: note: called from here
+    tile_info = build_mlp_cte_tile_info(shard_mlp_params, sharded_dim, dim_shard)
+                ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp_cte/mlp_cte.py:209:9: note: called from here
+        _execute_on_shard(
+        ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp.py:340:9: note: called from here
+        mlp_cte(mlp_params, out, fused_add_out)
+        ^
+/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/core/mlp/mlp.py:53:1: note: when tracing NKI kernel
+def mlp(
+^

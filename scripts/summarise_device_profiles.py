@@ -36,6 +36,19 @@ FIELDS = [
 ]
 
 
+def calls_for(dirname: str, default: int) -> int:
+    """Calls per graph for this profile, from a trailing _n<N> in the directory name.
+
+    The sweep names directories prof_<op>_<impl>_n<N>, so the call count travels with the
+    artifact. Falling back to a single --calls for every directory in one invocation divides an
+    n1 profile by 28.
+    """
+    suffix = dirname.rsplit("_", 1)[-1]
+    if suffix.startswith("n") and suffix[1:].isdigit():
+        return int(suffix[1:])
+    return default
+
+
 def read_profile(neff: Path, ntff: Path):
     """Run neuron-explorer and return the metrics dict for this NEFF, or None."""
     cmd = ["neuron-explorer", "view", "--output-format", "summary-json",
@@ -104,6 +117,10 @@ def main():
                     "profile_dir": root.name,
                     "neff": neff.name,
                     "ntff": ntff.name,
+                    # Recorded so per-call cost is recoverable from this JSON alone. Without it
+                    # the artifact needs the invoking command to be interpretable, and the
+                    # command is not part of the artifact.
+                    "calls": calls_for(root.name, args.calls),
                     "metrics": {k: m.get(k) for k in FIELDS},
                 })
 
@@ -121,34 +138,55 @@ def main():
     print("=" * 110)
     print("DEVICE TIME COMPARISON  (wall-clock dispatch cost excluded by construction)")
     print("=" * 110)
-    hdr = (f"{'profile':<30} {'device ms':>10} {'per call':>10} {'active%':>8} "
+    hdr = (f"{'profile':<30} {'calls':>5} {'device ms':>10} {'per call':>10} {'active%':>8} "
            f"{'MBU%':>7} {'HBM r+w MB':>11} {'acts':>6}")
     print(hdr)
     print("-" * 110)
     for name, m in rows:
         tot = m.get("total_time", 0) * 1e3
         hbm = (m.get("hbm_read_bytes", 0) + m.get("hbm_write_bytes", 0)) / 1e6
-        print(f"{name:<30} {tot:10.3f} {tot / args.calls:10.4f} "
+        # Prefer the call count encoded in the directory name over --calls. A sweep passes n1 and
+        # n28 directories in one invocation, so a single global --calls divides one of them by the
+        # wrong number and the "per call" column reads as a 28x difference in cost that is really
+        # a difference in how many calls were in the graph.
+        n = calls_for(name, args.calls)
+        print(f"{name:<30} {n:5d} {tot:10.3f} {tot / n:10.4f} "
               f"{m.get('total_active_time_percent', 0) * 100:7.1f}% "
               f"{m.get('mbu_estimated_percent', 0) * 100:6.1f}% "
               f"{hbm:11.1f} {m.get('activate_instruction_count', 0):6d}")
 
-    # Pair up nki vs torch for the same op, if both are present.
+    # Pair up nki vs torch for the same op AT THE SAME CALL COUNT.
+    #
+    # Keying on the op alone silently mixed configurations: a sweep passes prof_silu_nki_n1,
+    # prof_silu_torch_n1, prof_silu_nki_n28, prof_silu_torch_n28, and with an op-only key each
+    # later directory overwrote the earlier one, so "silu" ended up holding whichever call count
+    # came last. That happened to be n28 for both, so the printed ratio was right by argument
+    # order rather than by construction, and reordering the arguments would have compared n1
+    # against n28 without saying so. The call count is part of the configuration, so it is part
+    # of the key.
     print()
     print("VERDICT")
-    by_op = {}
+    by_cfg = {}
     for name, m in rows:
         for op in ("silu", "rmsnorm"):
-            if op in name:
-                impl = "nki" if "nki" in name else "torch" if "torch" in name else None
-                if impl:
-                    by_op.setdefault(op, {})[impl] = m
+            if op not in name:
+                continue
+            impl = "nki" if "nki" in name else "torch" if "torch" in name else None
+            if not impl:
+                continue
+            # trailing _n<N> if present, so n1 and n28 are separate configurations
+            suffix = name.rsplit("_", 1)[-1]
+            cfg = f"{op} {suffix}" if suffix.startswith("n") and suffix[1:].isdigit() else op
+            if impl in by_cfg.get(cfg, {}):
+                print(f"  WARNING {cfg}/{impl}: more than one profile matched, keeping the last. "
+                      f"A stale NEFF in the profile directory would land here.")
+            by_cfg.setdefault(cfg, {})[impl] = m
 
-    if not by_op:
+    if not by_cfg:
         print("  could not pair nki/torch profiles by name; read the table above directly")
         return 0
 
-    for op, impls in sorted(by_op.items()):
+    for op, impls in sorted(by_cfg.items()):
         if "nki" not in impls or "torch" not in impls:
             print(f"  {op}: only {list(impls)} measured, need both to compare")
             continue

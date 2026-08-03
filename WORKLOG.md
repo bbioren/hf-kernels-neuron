@@ -1303,3 +1303,126 @@ the CR), B12 (is `create_computation` cacheable — top technical ask), B14 (can
 participate in fusion), B1 (Hub repo home, Samir).
 
 **And still true: 47 commits exist only on this laptop.**
+
+---
+
+## SESSION 7 — A new instance, and turning transcribed numbers back into evidence
+
+Session 6 ended with 18 measurements, every one marked `transcribed`, and a harness written but never
+run. This session got hardware, ran it, and found that the harness was wrong in four places — three of
+them silently.
+
+### T30. Set up the replacement instance
+
+New trn2 at `16.51.184.34` (`i-0b05f044388db8080`), `trn2.3xlarge`, 1 device, 4 NeuronCores, LNC2,
+96 GB. Same instance type and core configuration as the expired host, which is a precondition for
+comparing anything. `~/.ssh/config` updated, backed up first.
+
+Verified the environment matched the recorded one *before* trusting any re-run, because a version
+difference would make a disagreement uninterpretable — I would not know whether a changed number meant
+a changed stack or a changed machine. torch 2.9.1+cu128, torch_xla 2.9.0, neuronx-cc
+2.26.6360.0+6f180f47 came with the DLAMI; `kernels` 0.15.2 and transformers 5.15.0.dev0 installed from
+`requirements.txt`, which pins transformers to commit `bb3ffb97` rather than tracking main — that pin
+earned its keep here. `nki` reports `0.5.0+28631259367.ga768afa6` where `measurements.json` had plain
+`0.5.0`; same version, and the build suffix is now recorded.
+
+### T31. Ran the full harness, and it exposed four of its own bugs
+
+All 23 stages exited 0 and the numbers reproduced. But watching it run surfaced four bugs, of which
+three produced no error:
+
+1. **`sync_to_trn2.sh --delete` destroyed 19 stages' artifacts.** Sticking point #19. Same failure as
+   the original artifact loss — results living where something else deletes them — with a different
+   destroyer, found while fixing the first one.
+2. **A summing consumer plus a non-clearing producer double-counted device time.** Sticking point #20.
+   Reported 16.9% device instead of 8.4%, silently. Fixed in both the producer and the consumer,
+   because either alone still leaves a hole. Looking for the same shape deliberately found two more
+   scripts with it.
+3. **The summary read wall times from the command line,** so the harness passed constants measured on
+   the *expired* host next to fresh device times. Right by luck, wrong in principle. The producer now
+   writes `wall_times.json` and the consumer reads it, so a run is self-contained.
+4. **The `RAW/` placeholder only matched its prefix form,** so a bare `RAW` passed through literally
+   and 8 profile directories landed in `./RAW/`. Sticking point #21.
+
+Three path bugs in one harness, all of the same shape: a file written somewhere nobody checked, all
+invisible because every stage exited 0. A harness that says "all stages ok" while writing to the wrong
+directory is worse than one that fails.
+
+### T32. Made the provenance claims checkable
+
+`scripts/check_measurement_provenance.py`. Verifies that every `status` is a documented value, that
+anything claiming to be file-backed names an artifact, and that every named path actually exists. Its
+first run failed with 15 missing artifacts — correctly, because they were still only on the instance.
+That is the check earning its place immediately: "the artifact is somewhere" had been a belief.
+
+Also moved the projection out of my head and into the script that owns its inputs.
+`sum_model_device_time.py` now computes and labels `baseline wall + device gap`, and emits the whole
+decomposition as JSON. It had been arithmetic in a commit message, which means it silently keeps the
+old walls when the walls change — exactly the drift `measurements.json` exists to prevent.
+
+### T33. Closed the top open item, in both halves
+
+`probe_compiler_flags.py` (wall clock) had already shown NKI invariant across five flag settings at
+1.02x spread. But it is ~97% dispatch by construction, so it could not speak to the device-time
+findings the recommendation actually rests on. Wrote `probe_device_time_under_flags.py` for the device
+half: same five settings, isolated compile cache each, profiling at N=1 and N=28 so marginal traffic
+can be solved for.
+
+| `NEURON_CC_FLAGS` | NKI ms | torch ms | ratio | NKI MB/call | vs floor |
+|---|---|---|---|---|---|
+| (unset) | 0.608 | 0.224 | 2.72x | 6.29 | 1.00x |
+| `--target trn2` | 0.608 | 0.224 | 2.71x | 6.29 | 1.00x |
+| `--target trn2 --lnc 1` | 0.580 | 0.429 | 1.35x | 6.29 | 1.00x |
+| `--target trn2 --lnc 2` | 0.608 | 0.224 | 2.71x | 6.29 | 1.00x |
+| `--target trn2 -O2` | 0.608 | 0.224 | 2.71x | 6.29 | 1.00x |
+
+NKI device time spread 1.05x. NKI marginal traffic spread 1.00x — pinned at exactly the unfused floor
+under every setting.
+
+This is the strong form of the result, and it is worth being precise about why. The weak version is
+"we tried five settings and none helped", which leaves a sixth setting open. The actual finding is that
+the quantity a better setting would have to move is already at its theoretical minimum: NKI moves one
+tile in and one tile out per call, which is the least an unfusable operation can move. There is no
+headroom for a flag to find. The device gap is structural.
+
+The 1.35x row is the trap. It is the best ratio in the table and it is not an improvement — NKI barely
+moves (0.608 → 0.580) while torch gets 91% slower. That is the same mistake the first version of the
+wall-clock probe made, which is why that probe now reports the two spreads separately.
+
+### T34. Reproduction results
+
+Every measurement re-run. Absolute step times run a few percent higher on this physical host; the
+ratios reproduce, several to 3 significant figures.
+
+| quantity | original | re-run |
+|---|---|---|
+| baseline seq512 | 42.04 ms | 44.36 ms |
+| kernelized seq512 fixed | 141.43 ms | 146.67 ms |
+| slowdown, fixed | 3.36x | 3.31x |
+| slowdown, no fix | 208x | 206x |
+| Finding #24 fix | 102.8x / 105.5x | 105.3x / 110.5x |
+| host-issue share | 99.9% | 99.9% |
+| NKI marginal traffic vs floor | 1.00x | 1.00x |
+| device NKI/torch silu, rmsnorm | 2.70x / 2.55x | 2.72x / 2.56x |
+| in-situ device share | 8.4% | 8.9% |
+| projected with dispatch fixed | 1.18x | 1.17x |
+
+The in-situ split has now been computed from three independent wall-time pairs across two physical
+instances — 8.4%, 8.6%, 8.9% device, projecting 1.18x, 1.18x, 1.17x. The conclusion does not depend on
+which pair is used, which matters because the walls are the noisiest input to it.
+
+### T35. A new result from fixing a bug
+
+Fixing the summariser's pairing (it keyed on op name only, so `_n1` and `_n28` directories collided and
+the last one won) made the N=1 comparison visible for the first time:
+
+| op | N=1 ratio | N=28 ratio |
+|---|---|---|
+| silu | 1.91x | 2.72x |
+| rmsnorm | 2.37x | 2.56x |
+
+The ratio grows with chain length, which is the fusion story confirming itself from a second direction:
+the longer the chain, the more fusion torch gets, and the worse NKI looks by comparison. It also means
+the N=28 figure is the worst case and the N=1 figure is the fairer single-op comparison — though N=1 is
+dominated by the custom call's 12.58 MB of fixed NEFF setup traffic, which is why the marginal-traffic
+regression, not either ratio, is the right instrument.
