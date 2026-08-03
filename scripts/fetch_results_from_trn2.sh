@@ -31,8 +31,9 @@ mkdir -p "$REPO_ROOT/results/raw"
 
 # No --delete: a failed remote stage should not wipe a good local artifact.
 # NEFF/NTFF are explicitly included here, unlike the push direction.
-rsync -az --info=stats2 \
-  "$REMOTE:$REMOTE_PATH/results/raw/" "$REPO_ROOT/results/raw/"
+# --stats rather than --info=stats2: macOS ships rsync 2.6.9, which has no --info flag.
+rsync -az --stats \
+  "$REMOTE:$REMOTE_PATH/results/raw/" "$REPO_ROOT/results/raw/" | tail -6
 
 echo
 echo "=== fetched into results/raw/ ==="

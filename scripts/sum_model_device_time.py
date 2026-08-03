@@ -43,11 +43,26 @@ def read_profile(neff: Path, ntff: Path):
     return None, "no JSON in output"
 
 
-def sum_dir(d: str):
-    """Sum device time and traffic across every NEFF/NTFF pair under d."""
+def sum_dir(d: str, expect_neffs=None):
+    """Sum device time and traffic across every NEFF/NTFF pair under d.
+
+    Summing makes this vulnerable to leftovers: a NEFF from a previous run in the same directory is
+    indistinguishable from a fresh one and gets added in, doubling the total with no error. That has
+    happened — a re-run reported 2 NEFFs, exactly 2x the device time, and a device share of 16.9%
+    instead of 8.4%. `expect_neffs` turns that from a silent wrong answer into a loud one.
+    """
     root = Path(d)
     if not root.exists():
         return None
+
+    found = sorted(root.rglob("*.neff"))
+    if expect_neffs is not None and len(found) != expect_neffs:
+        print(f"  WARNING: {root.name} has {len(found)} NEFF(s), expected {expect_neffs}.")
+        print("    Device time is SUMMED across all of them, so extras from a previous run inflate")
+        print("    the total. Delete the directory and re-run the producing stage.")
+        for p in found:
+            print(f"      {p.relative_to(root)}")
+
     total_ms, hbm, acts, n_read, skipped = 0.0, 0, 0, 0, []
     for neff in sorted(root.rglob("*.neff")):
         stem = neff.name.replace("neff_", "").replace(".neff", "")
@@ -70,13 +85,42 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("baseline_dir")
     ap.add_argument("kernelized_dir")
-    ap.add_argument("--wall-baseline", type=float, required=True, help="ms/step, from measure_mfu")
-    ap.add_argument("--wall-kernelized", type=float, required=True, help="ms/step")
+    # Not required: prefer each profile dir's own wall_times.json, written by
+    # profile_model_device_time.py during the same run. A hand-passed constant can outlive the host
+    # it was measured on and then sit next to fresh device numbers, which is how an earlier run of
+    # this script ended up mixing stale walls with fresh device times.
+    ap.add_argument("--wall-baseline", type=float, default=None,
+                    help="ms/step. Omit to read wall_times.json from the baseline profile dir.")
+    ap.add_argument("--wall-kernelized", type=float, default=None,
+                    help="ms/step. Omit to read wall_times.json from the kernelized profile dir.")
     ap.add_argument("--nki-calls", type=int, default=169)
+    ap.add_argument("--expect-neffs", type=int, default=1,
+                    help="NEFFs each profile dir should contain. Qwen3-0.6B forward emits 1; more "
+                         "than that usually means leftovers from a previous run, which would be "
+                         "silently summed in. Set to 0 to disable the check.")
     args = ap.parse_args()
+    if args.expect_neffs == 0:
+        args.expect_neffs = None
 
-    b = sum_dir(args.baseline_dir)
-    k = sum_dir(args.kernelized_dir)
+    def wall_from(d, override, label):
+        if override is not None:
+            print(f"  {label} wall: {override} ms (passed on the command line)")
+            return override
+        p = Path(d) / "wall_times.json"
+        if not p.exists():
+            print(f"  ERROR: no --wall-{label} given and {p} does not exist.\n"
+                  f"  Re-run profile_model_device_time.py (it now emits wall_times.json), or pass\n"
+                  f"  --wall-{label} explicitly.")
+            sys.exit(2)
+        med = json.loads(p.read_text())["wall_ms_median"]
+        print(f"  {label} wall: {med} ms (from {p.name}, this run)")
+        return med
+
+    args.wall_baseline = wall_from(args.baseline_dir, args.wall_baseline, "baseline")
+    args.wall_kernelized = wall_from(args.kernelized_dir, args.wall_kernelized, "kernelized")
+
+    b = sum_dir(args.baseline_dir, expect_neffs=args.expect_neffs)
+    k = sum_dir(args.kernelized_dir, expect_neffs=args.expect_neffs)
     if not b or not k:
         print("missing profile directory")
         return 1

@@ -34,7 +34,18 @@ from nki_test_utils import load_kernel_module, require_neuron
 
 SEP = "=" * 84
 N_CALLS = 28
-DEVICE_MS_FROM_PROFILE = 0.609   # neuron-explorer total_time for the 28-call NEFF
+# neuron-explorer total_time for the 28-call NEFF. This is a CONSTANT FROM A PRIOR RUN, not
+# measured by this script — it cannot be, since reading it requires neuron-explorer on a captured
+# NTFF. Re-derive it with scripts/profile_nki_call_cost.py + summarise_device_profiles.py if the
+# hardware or compiler changes, and update this. Labelled in the output so a reader does not mistake
+# it for a fresh measurement sitting next to this run's fresh wall times.
+DEVICE_MS_FROM_PROFILE = 0.609
+DEVICE_MS_SOURCE = "prior run, scripts/profile_nki_call_cost.py — NOT measured here"
+
+# torch-xla metric accumulators are NANOSECONDS. metrics_report() prints them formatted with units,
+# which makes it easy to assume the raw accumulator is seconds; it is not. Reading them as seconds
+# once produced a nine-digit millisecond figure in a table next to a 1459 ms wall time.
+NS_TO_MS = 1e-6
 
 
 def snap():
@@ -117,14 +128,16 @@ def main():
         tc, tt = delta(before, after, "TransferToDeviceTime")
         dc, dt = delta(before, after, "DeviceLockWait")
 
+        # Accumulators are nanoseconds — see NS_TO_MS above.
         rows.append(dict(
             wall=wall_ms, issue=host_issue_ms, mark=mark_ms, wait=wait_ms,
-            exec_n=ec, exec_ms=et * 1e3, comp_n=cc, comp_ms=ct * 1e3,
-            trace_n=lc, trace_ms=lt * 1e3, xfer_ms=tt * 1e3, lock_ms=dt * 1e3,
+            exec_n=ec, exec_ms=et * NS_TO_MS, comp_n=cc, comp_ms=ct * NS_TO_MS,
+            trace_n=lc, trace_ms=lt * NS_TO_MS, xfer_ms=tt * NS_TO_MS,
+            lock_ms=dt * NS_TO_MS,
         ))
         print(f"  iter {it}: wall {wall_ms:8.2f} ms  "
               f"[issue {host_issue_ms:7.2f} | mark_step {mark_ms:8.2f} | wait {wait_ms:7.2f}]  "
-              f"ExecuteTime {et * 1e3:8.2f} ms x{ec}  compiles {cc}")
+              f"ExecuteTime {et * NS_TO_MS:8.3f} ms x{ec}  compiles {cc}")
 
     r = rows[len(rows) // 2]
 
@@ -140,17 +153,19 @@ def main():
     print(f"    wait_device_ops()              {r['wait']:9.2f} ms   "
           f"{100 * r['wait'] / r['wall']:5.1f}%")
     print()
-    print(f"  torch-xla ExecuteTime            {r['exec_ms']:9.2f} ms  "
+    print("  torch-xla counters (accumulators are nanoseconds; converted here):")
+    print(f"    ExecuteTime                    {r['exec_ms']:9.3f} ms  "
           f"({r['exec_n']} execution(s))")
-    print(f"  torch-xla LazyTracing            {r['trace_ms']:9.2f} ms  "
+    print(f"    LazyTracing                    {r['trace_ms']:9.3f} ms  "
           f"({r['trace_n']} traced ops)")
-    print(f"  torch-xla TransferToDeviceTime   {r['xfer_ms']:9.2f} ms")
-    print(f"  torch-xla DeviceLockWait         {r['lock_ms']:9.2f} ms")
-    print(f"  torch-xla CompileTime            {r['comp_ms']:9.2f} ms  "
+    print(f"    TransferToDeviceTime           {r['xfer_ms']:9.3f} ms")
+    print(f"    DeviceLockWait                 {r['lock_ms']:9.3f} ms")
+    print(f"    CompileTime                    {r['comp_ms']:9.3f} ms  "
           f"({r['comp_n']} compiles — must be 0)")
     print()
     print(f"  device time (neuron-explorer)    {DEVICE_MS_FROM_PROFILE:9.3f} ms  "
           f"{100 * DEVICE_MS_FROM_PROFILE / r['wall']:5.2f}%")
+    print(f"    ^ {DEVICE_MS_SOURCE}")
 
     print()
     print(SEP)

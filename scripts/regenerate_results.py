@@ -65,9 +65,13 @@ STAGES = [
      [sys.executable, "scripts/profile_nki_call_cost.py", "--calls", "28",
       "--outdir", "STAGE/prof_n28"], []),
 
+    # --outdir-base RAW so the per-configuration profiles land in the artifact tree rather than
+    # /tmp, and so extract-device-metrics can find them at the end.
     ("fusion-sweep",
-     [sys.executable, "scripts/run_device_profile_sweep.py", "--calls", "1", "28"], []),
-    ("fusion-analysis", [sys.executable, "scripts/analyse_fusion_barrier.py"], []),
+     [sys.executable, "scripts/run_device_profile_sweep.py", "--calls", "1", "28",
+      "--outdir-base", "RAW"], []),
+    ("fusion-analysis",
+     [sys.executable, "scripts/analyse_fusion_barrier.py", "--profile-base", "RAW"], []),
 
     ("insitu-baseline",
      [sys.executable, "scripts/profile_model_device_time.py", "--mode", "baseline",
@@ -75,10 +79,11 @@ STAGES = [
     ("insitu-kernelized",
      [sys.executable, "scripts/profile_model_device_time.py", "--mode", "kernelized",
       "--outdir", "RAW/prof_model_kernelized"], []),
+    # No --wall-* here on purpose: the summary reads wall_times.json from each profile dir, so it
+    # pairs this run's walls with this run's device times instead of a carried-over constant.
     ("insitu-summary",
      [sys.executable, "scripts/sum_model_device_time.py",
-      "RAW/prof_model_baseline", "RAW/prof_model_kernelized",
-      "--wall-baseline", "46.65", "--wall-kernelized", "146.65", "--nki-calls", "169"], []),
+      "RAW/prof_model_baseline", "RAW/prof_model_kernelized", "--nki-calls", "169"], []),
 
     ("fused-mlp-nki",
      [sys.executable, "scripts/profile_fused_mlp_vs_torch.py", "--impl", "nki", "--calls", "28",
@@ -87,6 +92,20 @@ STAGES = [
      [sys.executable, "scripts/profile_fused_mlp_vs_torch.py", "--impl", "torch", "--calls", "28",
       "--outdir", "RAW/prof_mlp_torch"], []),
     ("fused-mlp-boundary", [sys.executable, "scripts/spike_nkilib_mlp.py"], []),
+
+    # LAST: extract the device metrics out of every profile into one small JSON. The NTFF traces
+    # are hundreds of MB and are gitignored; this extraction is a few KB and is what every
+    # device-time claim in the project actually rests on, so it is the artifact that must be
+    # committed. Runs last because it consumes what the profile stages produced.
+    ("extract-device-metrics",
+     [sys.executable, "scripts/summarise_device_profiles.py",
+      "RAW/prof_n28", "RAW/prof_model_baseline", "RAW/prof_model_kernelized",
+      "RAW/prof_mlp_nki", "RAW/prof_mlp_torch",
+      "RAW/prof_silu_nki_n1", "RAW/prof_silu_torch_n1",
+      "RAW/prof_silu_nki_n28", "RAW/prof_silu_torch_n28",
+      "RAW/prof_rmsnorm_nki_n1", "RAW/prof_rmsnorm_torch_n1",
+      "RAW/prof_rmsnorm_nki_n28", "RAW/prof_rmsnorm_torch_n28",
+      "--json-out", "STAGE/device_metrics.json"], []),
 ]
 
 

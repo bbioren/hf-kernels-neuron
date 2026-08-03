@@ -68,9 +68,15 @@ def main():
     ap.add_argument("dirs", nargs="+")
     ap.add_argument("--calls", type=int, default=28,
                     help="calls per graph, for the per-call column")
+    ap.add_argument("--json-out", default=None,
+                    help="write the extracted per-profile metrics here. This is the AUDITABLE "
+                         "artifact: every device-time claim in this project comes from these "
+                         "numbers, and they are a few KB, whereas the NTFF traces they are "
+                         "extracted from are hundreds of MB and are gitignored.")
     args = ap.parse_args()
 
     rows = []
+    extracted = []
     for d in args.dirs:
         root = Path(d)
         if not root.exists():
@@ -94,6 +100,18 @@ def main():
             m = read_profile(neff, ntff)
             if m:
                 rows.append((root.name, m))
+                extracted.append({
+                    "profile_dir": root.name,
+                    "neff": neff.name,
+                    "ntff": ntff.name,
+                    "metrics": {k: m.get(k) for k in FIELDS},
+                })
+
+    if args.json_out:
+        Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.json_out).write_text(json.dumps(extracted, indent=2) + "\n")
+        print(f"\nwrote {args.json_out} ({len(extracted)} profile(s)) — "
+              f"this is the auditable artifact; the NTFF traces are gitignored")
 
     if not rows:
         print("no profiles read")

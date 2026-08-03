@@ -77,6 +77,9 @@ def main():
     ap.add_argument("--bytes-per-elem", type=int, default=2, help="2 for bfloat16")
     ap.add_argument("--ops", nargs="+", default=["silu", "rmsnorm"])
     ap.add_argument("--calls", nargs="+", type=int, default=[1, 28])
+    ap.add_argument("--profile-base", default="/tmp",
+                    help="where run_device_profile_sweep.py wrote its profile dirs. Must match the "
+                         "--outdir-base used there.")
     args = ap.parse_args()
 
     tile = args.rows * args.cols * args.bytes_per_elem
@@ -97,7 +100,7 @@ def main():
     for n in args.calls:
         for op in args.ops:
             for impl in ("nki", "torch"):
-                m = load(f"/tmp/prof_{op}_{impl}_n{n}")
+                m = load(f"{args.profile_base.rstrip('/')}/prof_{op}_{impl}_n{n}")
                 if not m:
                     print(f"{op}/{impl}/n{n:<3} — no profile")
                     continue

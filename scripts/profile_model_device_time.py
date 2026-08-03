@@ -32,7 +32,9 @@ Then:
 
 import argparse
 import functools
+import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -51,7 +53,15 @@ os.environ["NEURON_RT_INSPECT_DEVICE_PROFILE"] = "1"
 os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"] = OUTDIR
 os.environ.setdefault("NEURON_RT_VISIBLE_CORES", "0")
 
-Path(OUTDIR).mkdir(parents=True, exist_ok=True)
+# CLEAR the output directory first. sum_model_device_time.py SUMS device time across every NEFF it
+# finds here, so a leftover NEFF from a previous run is silently double-counted — which is exactly
+# what happened once: a re-run reported 2 NEFFs, device time exactly 2x, and a device share of 16.9%
+# instead of 8.4%. Nothing errored. The producer owns this directory, so the producer clears it.
+_out = Path(OUTDIR)
+if _out.exists():
+    shutil.rmtree(_out)
+_out.mkdir(parents=True)
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 sys.path.insert(0, str(Path(__file__).parent.parent / "tests"))
 
@@ -104,6 +114,7 @@ def main():
     # Call counts are already established by scripts/measure_mfu.py (169/step, zero fallbacks),
     # so this run only needs wall time plus the emitted NEFFs. Keeping the counter out avoids
     # patching kernel modules while a profile is being captured.
+    walls = []
     with torch.no_grad():
         for i in range(args.iters):
             t0 = time.perf_counter()
@@ -111,8 +122,28 @@ def main():
             xm.mark_step()
             xm.wait_device_ops()
             ms = (time.perf_counter() - t0) * 1e3
+            walls.append(round(ms, 3))
             print(f"  iter {i}: wall {ms:9.2f} ms{'  (compile)' if i == 0 else ''}")
             del out
+
+    # Emit this run's steady-state wall time alongside the NEFFs, so sum_model_device_time.py can
+    # pair THIS run's walls with THIS run's device times. Previously the walls were passed on the
+    # command line, which let a constant carried over from a previous host sit next to fresh device
+    # numbers in the same artifact — right by luck here, wrong in principle.
+    steady = sorted(walls[1:]) if len(walls) > 1 else walls
+    med = steady[len(steady) // 2] if steady else None
+    meta = {
+        "mode": args.mode,
+        "seq": args.seq,
+        "batch": args.batch,
+        "layers": CFG["num_hidden_layers"],
+        "wall_ms_all": walls,
+        "wall_ms_steady": steady,
+        "wall_ms_median": med,
+        "note": "iter 0 excluded from steady — it includes the compile",
+    }
+    (Path(OUTDIR) / "wall_times.json").write_text(json.dumps(meta, indent=2) + "\n")
+    print(f"\n  steady-state wall {steady} ms, median {med} ms -> wall_times.json")
 
     neffs = sorted(Path(OUTDIR).rglob("*.neff"))
     ntffs = sorted(Path(OUTDIR).rglob("*.ntff"))

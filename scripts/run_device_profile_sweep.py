@@ -36,6 +36,12 @@ def main():
     ap.add_argument("--ops", nargs="+", default=["silu", "rmsnorm"])
     ap.add_argument("--impls", nargs="+", default=["nki", "torch"])
     ap.add_argument("--calls", nargs="+", type=int, default=[1, 28])
+    ap.add_argument("--outdir-base", default="/tmp",
+                    help="where per-configuration profile dirs go. Default /tmp is fine for "
+                         "throwaway runs, but pass results/raw so the profiles land in the "
+                         "artifact tree and survive the host — /tmp on a rented instance is the "
+                         "least durable location available, and this project has lost artifacts "
+                         "to it once already.")
     args = ap.parse_args()
 
     jobs = [(op, impl, n) for n in args.calls for op in args.ops for impl in args.impls]
@@ -44,7 +50,7 @@ def main():
 
     outdirs, failures = [], []
     for i, (op, impl, n) in enumerate(jobs, 1):
-        outdir = f"/tmp/prof_{op}_{impl}_n{n}"
+        outdir = f"{args.outdir_base.rstrip('/')}/prof_{op}_{impl}_n{n}"
         outdirs.append(outdir)
         print(f"\n[{i}/{len(jobs)}] {op} {impl} calls={n} -> {outdir}", flush=True)
         subprocess.run(["rm", "-rf", outdir], check=False)
