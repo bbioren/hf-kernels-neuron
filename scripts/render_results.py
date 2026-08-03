@@ -97,8 +97,28 @@ def main():
     L.append("")
     proj = ins["projected_with_dispatch_fixed"]
     L.append(f"So the slowdown is overwhelmingly a **framework bug, not a property of the "
-             f"approach**. With dispatch fixed the projection is ~{proj['step_ms']:.0f} ms/step, "
+             f"approach**. With dispatch fixed the projection was ~{proj['step_ms']:.0f} ms/step, "
              f"about **{proj['slowdown_vs_baseline']}x** slower — {proj['status']}.")
+    L.append("")
+    bf = ms["mfu-both-fixes"]
+    L.append("**That projection has since been partly realised.** Both dispatch caches are now "
+             "identified and fixed, and the slowdown is measured rather than projected:")
+    L.append("")
+    L.append("| stage | seq | baseline ms | kernelized ms | slowdown | MFU | added ms/call |")
+    L.append("|---|---|---|---|---|---|---|")
+    for r in bf["rows"]:
+        L.append(f"| {r['stage']} | {r['seq']} | {r['baseline_ms']} | {r['kernelized_ms']} | "
+                 f"{r['slowdown']}x | {r['mfu_kernelized_pct']}% | {r['added_ms_per_call']} |")
+    L.append(f"| device floor | | | | | | {bf['device_floor_ms_per_call']} |")
+    L.append("")
+    pg = bf["progression"]
+    L.append(f"**{pg['added_ms_per_call'][0]} -> {pg['added_ms_per_call'][1]} -> "
+             f"{pg['added_ms_per_call'][2]} ms per call.** {pg['finding_24_speedup']}x from the first "
+             f"fix, {pg['b12_speedup']}x from the second, **{pg['combined_speedup']}x together**. "
+             f"Now within {pg['within_x_of_device_floor']}x of the device floor, and "
+             f"{pg['remaining_that_is_still_dispatch_pct']}% of what remains is still dispatch.")
+    L.append("")
+    L.append(bf["supersedes_projection"])
     L.append("")
     if "robustness" in ins:
         L.append(ins["robustness"])
@@ -222,6 +242,43 @@ def main():
              f"{hv['wall_ms']:.0f} ms wall against {dp['device_total_time_ms']} ms device is a "
              f"~{hv['wall_ms'] / dp['device_total_time_ms']:.0f}x ratio, which eliminates every "
              f"device-side explanation simultaneously.")
+    L.append("")
+
+    # --- the speedup ----------------------------------------------------------------------
+    at = ms["attention-nki-vs-torch"]
+    L.append("## The speedup: flash attention, seq 2048-3072")
+    L.append("")
+    L.append(at["why_this_candidate"])
+    L.append("")
+    L.append(at["config"])
+    L.append("")
+    L.append("| seq | NKI ms/layer | torch ms/layer | NKI/torch | NKI HBM MB | torch HBM MB "
+             "| score matrix MB |")
+    L.append("|---|---|---|---|---|---|---|")
+    for r in at["rows"]:
+        verdict = f"**{1 / r['nki_over_torch']:.2f}x FASTER**" if r["nki_over_torch"] < 1 \
+            else f"{r['nki_over_torch']:.2f}x slower"
+        L.append(f"| {r['seq']} | {r['nki_ms_per_layer']} | {r['torch_ms_per_layer']} | {verdict} | "
+                 f"{r['nki_hbm_mb_per_layer']} | {r['torch_hbm_mb_per_layer']} | "
+                 f"{r['score_matrix_mb']} |")
+    L.append("")
+    w = at["speedup_window"]
+    L.append(f"**A speedup exists: up to {w['best_speedup']}x at seq {w['upper_seq']}.** {w['note']}")
+    L.append("")
+    L.append(f"*Accuracy.* {at['accuracy']}")
+    L.append("")
+    L.append(f"*Why there is a lower edge.* {at['lower_edge_explanation']}")
+    L.append("")
+    L.append(f"*Why there is an upper edge, which I first got backwards.* "
+             f"{at['upper_edge_explanation']}")
+    L.append("")
+    L.append(f"*Reproduction.* {at['methodology_note']}")
+    L.append("")
+    L.append(f"*Porting cost.* {at['porting_cost_note']}")
+    L.append("")
+    L.append(f"*Dependency.* {at['dispatch_fixes_are_load_bearing']}")
+    L.append("")
+    L.append(f"*Not done.* {at['not_done']}")
     L.append("")
 
     # --- kernel quality -------------------------------------------------------------------

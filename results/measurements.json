@@ -187,6 +187,54 @@
     },
 
     {
+      "id": "op-registry-cache",
+      "what": "Open item B12 ANSWERED: is the per-call create_computation rebuild cacheable? It is 91% of what remains after Finding #24.",
+      "root_cause": "torch_xla/core/xla_op_registry.py::Op holds `self._computations = dict()`, keyed on pickle.dumps([shapes, kwargs]), and its own docstring asks callers to register ops globally 'in order to amortize the lowering cost'. nki/framework/_torch_xla.py applies @xla_hlo_call INSIDE TorchXlaKernel.__call__, so every kernel invocation constructs a fresh Op with a fresh empty memo. The cache is not cold by accident — it is newly created, and therefore always empty, on every call.",
+      "same_shape_as_24": "Finding #24 was 'target resolution runs while building the cache key, so a cache hit still pays the subprocess'. This is 'the computation memo lives on an object recreated per call'. Both are a cache that exists and a code path that defeats it, and neither is a property of per-layer kernel dispatch on Neuron.",
+      "why_the_key_is_sound": "The lowering closure captures config = nir.build_config(). nir comes from self._cached_compile_to_bir(frontend, converted_inputs, compile_opts), which is ALREADY memoised on self._generate_cache_key(converted_inputs, compile_opts). Same key implies same nir implies same config implies same closure. Two guards: the Op is cached only when NKI's compile cache is enabled (with NKI_DISABLE_COMPILE_CACHE set, nir is rebuilt per call and could differ), and a null key from unhashable arguments falls through to the original uncached path.",
+      "variants": [
+        {"variant": "baseline (post-#24)", "ms_per_call": 0.5278, "speedup": null, "cos_sim": 0.9999424815177917},
+        {"variant": "Op registry cached", "ms_per_call": 0.1828, "speedup": 2.887, "cos_sim": 0.9999424815177917},
+        {"variant": "baseline again (control)", "ms_per_call": 0.4943, "speedup": null, "cos_sim": 0.9999424815177917}
+      ],
+      "control_drift_pct": 6.34,
+      "cache": {"hit": 86, "miss": 1, "uncacheable": 0, "distinct_keys": 1},
+      "nki_source_sha256_16": "5f8521daa38d96a2",
+      "script": "scripts/probe_op_registry_cache.py, scripts/nki_dispatch_fixes.py",
+      "command": "python scripts/probe_op_registry_cache.py",
+      "commit": "9e1a089",
+      "status": "in_repo",
+      "artifact": "results/raw/op-registry-cache/op_cache.json, results/raw/op-registry-cache/stdout.log",
+      "notes": "Cosine similarity is bit-identical to 16 digits across all three variants, not merely above a threshold. The baseline is re-run LAST as a control so ordering cannot explain the result. The probe reports cache hit counts so a timing win cannot be credited to the cache without evidence the cache was used. It also refuses to patch an NKI version it does not recognise: the patch reimplements TorchXlaKernel.__call__, so five structural landmarks are asserted in the installed source first. This is a verified answer to a question, NOT a shipped fix — it is a runtime monkeypatch."
+    },
+    {
+      "id": "mfu-both-fixes",
+      "what": "MFU with BOTH dispatch fixes applied — Finding #24 and B12. These are the numbers that say what the approach costs once the framework bugs are out of the way.",
+      "rows": [
+        {"stage": "no fixes", "seq": 512, "baseline_ms": 43.06, "kernelized_ms": 8873.67, "slowdown": 206.07, "mfu_kernelized_pct": 0.02, "added_ms_per_call": 52.2522},
+        {"stage": "#24 only", "seq": 512, "baseline_ms": 44.36, "kernelized_ms": 146.67, "slowdown": 3.31, "mfu_kernelized_pct": 1.45, "added_ms_per_call": 0.6054},
+        {"stage": "#24 + B12", "seq": 512, "baseline_ms": 43.94, "kernelized_ms": 71.32, "slowdown": 1.62, "mfu_kernelized_pct": 2.98, "added_ms_per_call": 0.162},
+        {"stage": "#24 only", "seq": 2048, "baseline_ms": 109.64, "kernelized_ms": 226.16, "slowdown": 2.06, "mfu_kernelized_pct": 4.76, "added_ms_per_call": 0.6894},
+        {"stage": "#24 + B12", "seq": 2048, "baseline_ms": 117.78, "kernelized_ms": 161.04, "slowdown": 1.37, "mfu_kernelized_pct": 6.69, "added_ms_per_call": 0.256}
+      ],
+      "device_floor_ms_per_call": 0.0495,
+      "progression": {
+        "added_ms_per_call": [52.2522, 0.6054, 0.162],
+        "finding_24_speedup": 86.3,
+        "b12_speedup": 3.7,
+        "combined_speedup": 322.5,
+        "within_x_of_device_floor": 3.3,
+        "remaining_that_is_still_dispatch_pct": 69
+      },
+      "supersedes_projection": "The 1.15-1.18x figure recorded elsewhere is a PROJECTION that assumed the dispatch gap went to zero. 1.62x at seq 512 and 1.37x at seq 2048 are MEASURED, and they sit between the old 3.31x and that projection — which is what the projection predicted, since B12 removes about two thirds of the dispatch term rather than all of it.",
+      "script": "scripts/measure_mfu.py, scripts/compare_fix_stages.py",
+      "command": "python scripts/measure_mfu.py --preset 0.6b --seq {512,2048} --fix-op-registry",
+      "commit": "9e1a089",
+      "status": "in_repo",
+      "artifact": "results/raw/mfu-512-both-fixes/mfu_512_both.json, results/raw/mfu-2048-both-fixes/mfu_2048_both.json, results/fix_progression.json",
+      "notes": "The full-model run reports 2361 Op-cache hits against 5 misses, so the fix is demonstrably active rather than inferred from the timing. Amortisation still holds and is now stronger: 1.62x at seq 512 falls to 1.37x at seq 2048, because call count is fixed by model depth so a longer sequence means more work per call rather than more calls."
+    },
+    {
       "id": "fix-verification",
       "what": "Finding #24 fix, two independent methods, one process, baseline re-run last as control",
       "variants": [
@@ -386,6 +434,33 @@
     },
 
     {
+      "id": "attention-nki-vs-torch",
+      "what": "THE SPEEDUP. nkilib flash attention (attention_cte) vs the compiler's eager attention, device time, swept over sequence length.",
+      "why_this_candidate": "Findings #25/#26 produced a criterion — a kernel wins when it replaces a region the compiler would NOT otherwise fuse well AND there is real arithmetic to restructure — and then found no candidate meeting it. Attention is the first that passes both halves non-incidentally: flash attention is an ALGORITHMIC restructuring (online softmax, never materialising the [heads,S,S] score matrix), which a compiler does not derive because it fuses elementwise chains rather than re-deriving algorithms; and there are two matmuls per head with causal compute-skipping. Critically, attention_cte states it runs 'with 1D SPMD grid for LNC2 or without grid' — the exact property the fused MLP lacked, so #26's verdict does not carry over.",
+      "config": "Qwen3-0.6B head geometry: 16 q heads, 8 kv heads (GQA group 2), head_dim 128, bf16, causal, batch 1, single logical core. 4 layers per graph with DISTINCT K/V per layer so neither side can amortise one weight load (the trap the first fused-MLP measurement fell into).",
+      "rows": [
+        {"seq": 512, "nki_ms_per_layer": 0.2463, "torch_ms_per_layer": 0.1225, "nki_over_torch": 2.01, "nki_hbm_mb_per_layer": 8.39, "torch_hbm_mb_per_layer": 3.16, "score_matrix_mb": 8.4, "nki_mbu_pct": 4.8, "torch_mbu_pct": 3.6},
+        {"seq": 1024, "nki_ms_per_layer": 0.4939, "torch_ms_per_layer": 0.4269, "nki_over_torch": 1.16, "nki_hbm_mb_per_layer": 16.78, "torch_hbm_mb_per_layer": 13.12, "score_matrix_mb": 33.6, "nki_mbu_pct": 4.7, "torch_mbu_pct": 4.3},
+        {"seq": 2048, "nki_ms_per_layer": 1.1438, "torch_ms_per_layer": 1.6902, "nki_over_torch": 0.68, "nki_hbm_mb_per_layer": 33.55, "torch_hbm_mb_per_layer": 279.86, "score_matrix_mb": 134.2, "nki_mbu_pct": 4.1, "torch_mbu_pct": 23.1},
+        {"seq": 3072, "nki_ms_per_layer": 1.8484, "torch_ms_per_layer": 3.9062, "nki_over_torch": 0.47, "nki_hbm_mb_per_layer": 50.33, "torch_hbm_mb_per_layer": 748.7, "score_matrix_mb": 302.0, "nki_mbu_pct": 3.8, "torch_mbu_pct": 26.8},
+        {"seq": 4096, "nki_ms_per_layer": 2.8295, "torch_ms_per_layer": 1.5784, "nki_over_torch": 1.79, "nki_hbm_mb_per_layer": 67.11, "torch_hbm_mb_per_layer": 395.05, "score_matrix_mb": 536.9, "nki_mbu_pct": 3.3, "torch_mbu_pct": 35.0}
+      ],
+      "speedup_window": {"lower_seq": 2048, "upper_seq": 3072, "best_speedup": 2.11,
+                         "note": "A WINDOW, not a threshold. Same kernel is 2.01x slower at seq 512 and 2.11x faster at seq 3072."},
+      "accuracy": "cos_sim 1.000010 (seq 512) to 1.001040 (seq 4096) against a CPU fp32 reference, on the FIRST run. max_abs 0.0006-0.0010. torch shows the same pattern at each length, so the comparison is fair.",
+      "porting_cost_note": "Worked FIRST TRY against the HF-native layout: tp_q=True, tp_k=True, tp_out=False maps straight onto (batch*heads, seq, head_dim), and GQA is expressed natively as batch_size_kv < batch_size with no K/V replication. This is the first nkilib kernel in the project that dropped into the Kernel Hub's calling convention without a fight — a data point about porting cost as well as performance. Contrast Finding #13 (RoPE, undocumented) and #17/#18 (MLP, wrong weight layout plus a compile boundary).",
+      "lower_edge_explanation": "At seq 512 torch moves 3.16 MB/layer, BELOW the 6.29 MB it costs merely to read q,k,v and write the output once. That is only possible if the compiler fused the whole chain and kept the score matrix resident — so at short sequences the compiler already achieves flash attention's central advantage, and the kernel pays an HBM round-trip at its custom-call boundary to buy something it does not get. Same fusion-barrier mechanism as Finding #25, from the opposite direction.",
+      "upper_edge_explanation": "The 4096 reversal is on the TORCH side and my first hypothesis was backwards. I read it as the NKI kernel running out of single-core SBUF (K and V are 8.4 MB each; attention_cte only sections K/V above 10K tokens) — plausible, matched Finding #26, and blamed the kernel. The traffic column contradicts it: torch's HBM per layer goes 279.86 -> 748.70 -> 395.05 MB across seq 2048 -> 3072 -> 4096, DROPPING 47% while the score matrix grows from 302 to 537 MB. At 3072 it moves 2.5x the score matrix; at 4096 it moves 0.74x, less than one copy. Meanwhile NKI is exactly linear at every point (16.78 MB per 1024 tokens) and exactly on its time trend. Nothing degraded on the kernel side — the COMPILER got better, presumably switching attention strategy above a threshold. Checkable by diffing HLO either side of it; not done, so stated as what the traffic supports rather than confirmed.",
+      "methodology_note": "The 2048-4096 region was measured TWICE in separate runs, with 3072 added the second time. It reproduces to four significant figures (NKI 1.1420/1.1438 at 2048, 2.8299/2.8295 at 4096), so the reversal is not noise. The wrong SBUF explanation survived only until the traffic column was read — a one-number benchmark would have produced a confident wrong answer.",
+      "dispatch_fixes_are_load_bearing": "Both dispatch fixes are applied for this measurement. At 0.53 ms/call of overhead the seq-2048 win (1.14 ms/layer device) would have been invisible, so Findings #24 and #28 are what make an attention swap worth doing at all.",
+      "not_done": "The kernel is called directly, NOT wired into the Kernel Hub. transformers has an attention interface that is the right interception point. Also: 4 chained layers is a microbenchmark, not a model — in situ attention sits between QKV and O projections that force HBM boundaries anyway, so the boundary should cost LESS than it does here, but that is unmeasured.",
+      "script": "scripts/profile_attention_nki_vs_torch.py, scripts/run_attention_seq_sweep.py",
+      "command": "python scripts/run_attention_seq_sweep.py --seqs 512 1024 2048 3072 4096 --calls 4",
+      "commit": "pending",
+      "status": "in_repo",
+      "artifact": "results/raw/attn-sweep/sweep.json, results/raw/attn-sweep-confirm/sweep.json, results/raw/attn-sweep/device_metrics.json, results/raw/attn-sweep-confirm/device_metrics.json"
+    },
+    {
       "id": "fused-mlp-vs-torch",
       "what": "nkilib fused MLP vs torch (3 matmuls + silu), device time, distinct weights per block",
       "rows": [
@@ -516,9 +591,10 @@
       "status": "closed 2026-07-29, see the compiler-flag-control and device-time-under-flags measurements"
     },
     {
-      "item": "Is the per-call create_computation rebuild cacheable?",
-      "detail": "91.6% of the remaining regression. Not attempted: inside torch_xla's op-registry path, and a wrong guess could be silently incorrect rather than error.",
-      "priority": "high"
+      "item": "CLOSED — is the per-call create_computation rebuild cacheable?",
+      "detail": "Yes. It was 91% of what remained after Finding #24, and it is the same bug as #24: torch_xla's Op class already memoises the built computation, and NKI applies @xla_hlo_call inside TorchXlaKernel.__call__ so a fresh Op with an empty memo is created per call. Registering once per compile-cache key gives 0.528 -> 0.183 ms/call with bit-identical output, and takes the model-level slowdown from 3.31x to 1.62x at seq 512 and 1.37x at seq 2048. See the op-registry-cache and mfu-both-fixes measurements. What remains open is the UPSTREAM change: this is verified as a runtime monkeypatch, not shipped, and it needs an owner in the same way the #24 fix does.",
+      "priority": "closed",
+      "status": "closed 2026-07-29; upstream ownership still needed"
     },
     {
       "item": "Can a NKI custom call participate in compiler fusion?",

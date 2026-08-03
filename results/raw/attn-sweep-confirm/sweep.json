@@ -1,0 +1,73 @@
+{
+  "calls_per_graph": 4,
+  "rows": [
+    {
+      "seq": 2048,
+      "impl": "nki",
+      "device_ms": 4.5753,
+      "per_layer_ms": 1.14383,
+      "hbm_mb": 134.2,
+      "hbm_mb_per_layer": 33.55,
+      "mbu_pct": 4.1,
+      "active_pct": 97.8,
+      "acts": 2560
+    },
+    {
+      "seq": 2048,
+      "impl": "torch",
+      "device_ms": 6.7607,
+      "per_layer_ms": 1.69016,
+      "hbm_mb": 1119.4,
+      "hbm_mb_per_layer": 279.86,
+      "mbu_pct": 23.1,
+      "active_pct": 99.8,
+      "acts": 11264
+    },
+    {
+      "seq": 3072,
+      "impl": "nki",
+      "device_ms": 7.3936,
+      "per_layer_ms": 1.84841,
+      "hbm_mb": 201.3,
+      "hbm_mb_per_layer": 50.33,
+      "mbu_pct": 3.8,
+      "active_pct": 98.3,
+      "acts": 5376
+    },
+    {
+      "seq": 3072,
+      "impl": "torch",
+      "device_ms": 15.6248,
+      "per_layer_ms": 3.90619,
+      "hbm_mb": 2994.8,
+      "hbm_mb_per_layer": 748.7,
+      "mbu_pct": 26.8,
+      "active_pct": 100.0,
+      "acts": 25344
+    },
+    {
+      "seq": 4096,
+      "impl": "nki",
+      "device_ms": 11.3181,
+      "per_layer_ms": 2.82952,
+      "hbm_mb": 268.4,
+      "hbm_mb_per_layer": 67.11,
+      "mbu_pct": 3.3,
+      "active_pct": 98.2,
+      "acts": 9216
+    },
+    {
+      "seq": 4096,
+      "impl": "torch",
+      "device_ms": 6.3134,
+      "per_layer_ms": 1.57836,
+      "hbm_mb": 1580.2,
+      "hbm_mb_per_layer": 395.05,
+      "mbu_pct": 35.0,
+      "active_pct": 99.9,
+      "acts": 10752
+    }
+  ],
+  "crossover_seq": 2048,
+  "failures": []
+}

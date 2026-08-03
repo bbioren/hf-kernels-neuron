@@ -11,28 +11,61 @@
 
 ## The correction that prompted this document
 
-You said there should not be a slowdown. **You are right, and my reporting has been leading with
-the wrong number.**
+You said there should not be a slowdown, and that we should see a speedup. **Both are right, and my
+reporting had been leading with the wrong number and testing the wrong kernels.** Two things have
+changed since that feedback.
 
-The figure that travelled — "kernelizing Qwen3 is 208x slower" — is real but it is *pre-fix*. It was
-caused by a one-line bug in NKI's dispatch path, not by the integration. And the figure that
-replaced it — "2.5–2.7x slower on device" — is real but comes from a chained microbenchmark that is
-deliberately NKI's worst case.
+### 1. The slowdown was two caching bugs, and both are now fixed and measured
 
-Measured in a real forward pass, the honest decomposition is:
+The figure that travelled — "kernelizing Qwen3 is 208x slower" — is real but *pre-fix*, caused by a
+one-line bug in NKI's dispatch path. Fixing it left 3.31x. Finding the second bug of the same kind
+leaves **1.62x at seq 512 and 1.37x at seq 2048**:
 
-| term | ms/step | share of the gap |
+| stage | added cost per kernel call | model slowdown (seq 512) |
 |---|---|---|
-| **dispatch** — framework overhead, per kernel call | **91.608** | **91.6%** |
-| **device** — forfeited compiler fusion | 8.392 | 8.4% |
-| total gap vs baseline | 100.0 | 100% |
+| as shipped | 52.25 ms | 206x |
+| + memoise `_detect_target` (Finding #24) | 0.605 ms | 3.31x |
+| + register the XLA computation once (Finding #28) | **0.162 ms** | **1.62x** |
+| device floor — what no dispatch fix can remove | 0.0495 ms | — |
 
-So: **there is no structural slowdown.** There is a framework bug worth 102x per call that is
-already fixed and verified, a second caching bug of the same kind that accounts for most of what
-remains, and an ~8% device cost from replacing ops the compiler was already fusing. With the
-dispatch path fixed the projection is **~1.18x slower** — near parity, not a regression.
+**322x** off the per-call overhead, from two one-line changes. Both are the same bug: a cache exists
+in the framework and the surrounding code path defeats it. Neither is a property of per-layer kernel
+dispatch on Neuron.
 
-Everything below is the evidence for that, the design it sits on, and what I got wrong on the way.
+### 2. There IS a speedup — on the right kernel, at the right sequence length
+
+The three kernels I had been measuring — RMSNorm, RoPE, SiLU — *cannot* produce a speedup, and that is
+now a proven statement rather than a disappointing result. They are small, memory-bound, and the
+compiler already fuses them into their neighbours: across a 28-op chain, torch's marginal HBM traffic
+is ~0 MB/call because the chain collapses into a single pass, while the NKI kernels sit at exactly the
+unfused floor of 6.29 MB/call. **The kernels are optimal and still lose, because you cannot beat not
+touching memory.**
+
+So I tested the candidate the analysis actually favoured: `nkilib`'s flash attention kernel. Device
+time, Qwen3-0.6B head geometry, causal, single core:
+
+| seq | NKI flash | torch eager | result | torch HBM/layer vs NKI |
+|---|---|---|---|---|
+| 512 | 0.2463 ms | 0.1225 ms | 2.01x slower | 0.4x |
+| 1024 | 0.4939 ms | 0.4269 ms | 1.16x slower | 0.8x |
+| **2048** | **1.1438 ms** | **1.6902 ms** | **1.48x FASTER** | **8.3x** |
+| **3072** | **1.8484 ms** | **3.9062 ms** | **2.11x FASTER** | **14.9x** |
+| 4096 | 2.8295 ms | 1.5784 ms | 1.79x slower | 5.9x |
+
+Flash attention is an *algorithmic* restructuring — it never materialises the `[heads, S, S]` score
+matrix — and a compiler does not derive that; it fuses elementwise chains, it does not re-derive the
+algorithm. Below seq ~1500 the compiler can keep the score matrix resident and there is nothing to
+win. Above it, the `S²` matrix stops fitting and the kernel wins by up to 2.11x.
+
+It is a **window, not a threshold**, and the upper edge is the more interesting half: at 4096 torch's
+traffic *drops 47%* while its score matrix grows, so the compiler switches strategy there and becomes
+competitive again. The window closes because the compiler improves, not because the kernel degrades.
+
+### What this changes
+
+The recommendation is no longer "the mechanism works but there is nothing to gain." It is:
+**point the mechanism at attention, fix the two dispatch caches, and state the sequence range.** §4
+and §7b are the evidence; §8 is what is still not done.
 
 ---
 
@@ -418,11 +451,80 @@ excellent *mechanism* demonstrations and cannot be wins — they are small, memo
 fused. Judge a candidate by **whether it replaces a region the compiler would otherwise fuse**, not
 by how many models call the op.
 
-The uncomfortable corollary, and the sharpest result here: **the ops the Kernel Hub is best at
-intercepting have the least to gain from it.** 115 RMSNorm registrations, 95 RoPE model files, one
-decoration covering every `ACT2FN` activation — all small, memory-bound, already fused. Reach and
-benefit are inversely correlated. That argues for pointing the mechanism at coarser ops, not for
-abandoning it.
+The uncomfortable corollary: **the ops the Kernel Hub is best at intercepting have the least to gain
+from it.** 115 RMSNorm registrations, 95 RoPE model files, one decoration covering every `ACT2FN`
+activation — all small, memory-bound, already fused. Reach and benefit are inversely correlated.
+
+That is an argument for aiming the mechanism differently, not for abandoning it, and §7b is what it
+looks like when you do: **attention is both widely intercepted and genuinely improvable**, and it is
+where the 1.48–2.11x lives. The priority list that follows from this is attention first, dispatch
+caches second (they are what makes an attention swap worth doing at all), and the small ops kept only
+as mechanism proof and fallback coverage.
+
+---
+
+## 7b. Where the speedup is
+
+Findings #25 and #26 produced a criterion, and then found no candidate that met it:
+
+> A kernel wins when it replaces a region the compiler would **not** otherwise fuse well, **and**
+> there is real arithmetic to restructure.
+
+| candidate | replaces a region the compiler doesn't fuse? | real arithmetic? | measured |
+|---|---|---|---|
+| RMSNorm, RoPE, SiLU | no — already fused | no — memory-bound | 2.5–2.7x slower (chained) |
+| fused MLP | yes | yes | 2.99x slower — needs an SPMD grid it isn't given |
+| **flash attention** | **yes — flash is algorithmic, not a fusion** | **yes — 2 matmuls, causal skipping** | **1.48–2.11x FASTER, seq 2048–3072** |
+
+Attention is the first candidate that passes both halves, and it passes them for a reason that is not
+incidental. Flash attention avoids materialising the score matrix by restructuring the computation
+around an online softmax. That is a different algorithm, not a fusion of the same one, and a compiler
+will not find it. `attention_cte` additionally skips the upper-triangle score tiles entirely under
+causal masking, rather than computing them and masking to `-inf`.
+
+It also **worked first try** against the HF-native layout: `tp_q=True, tp_k=True, tp_out=False` maps
+straight onto `(batch·heads, seq, head_dim)`, GQA is expressed natively as `batch_size_kv <
+batch_size` with no K/V replication, and it runs with no SPMD grid — the exact property the fused MLP
+lacked. Correctness was `cos_sim 1.000010` against a CPU fp32 reference on the first run. This is the
+first nkilib kernel in the project that dropped into the Kernel Hub's calling convention without a
+fight, and that is a data point about porting cost as well as performance.
+
+### Why there is a lower edge
+
+At seq 512 torch moves **3.16 MB/layer** — *below* the 6.29 MB it costs merely to read q, k, v and
+write the output once. The only way that is possible is that the compiler fused the whole chain and
+kept the score matrix resident. So at short sequences the compiler is already achieving flash
+attention's central advantage, and the kernel pays an HBM round-trip at its custom-call boundary to
+buy something it does not get. That is the same fusion-barrier mechanism as §4, arrived at from the
+opposite direction.
+
+### Why there is an upper edge, which I initially got backwards
+
+My first reading of the 4096 reversal was that the NKI kernel had run out of single-core SBUF — K and V
+are 8.4 MB each at that length and `attention_cte` only sections K/V above 10K tokens. Tidy, and it
+matched an existing finding.
+
+The traffic column says it is wrong. Torch's HBM traffic per layer goes 279.86 → 748.70 → **395.05** MB
+across seq 2048 → 3072 → 4096: it *drops 47%* while the score matrix it is supposedly materialising
+grows from 302 MB to 537 MB. At 3072 it moves 2.5x the score matrix; at 4096 it moves 0.74x — less than
+one copy. Meanwhile NKI's traffic is exactly linear at every point (16.78 MB per 1024 tokens) and its
+time is exactly on trend.
+
+**Nothing degraded on the kernel side. The compiler got better.** The leading explanation is that XLA
+switches attention strategy above some threshold; that is checkable by diffing the HLO either side of
+it, which has not been done, so it is stated as what the traffic supports rather than as confirmed.
+
+Worth recording how close this came to shipping the other way round: the SBUF story was plausible,
+matched a prior finding, and blamed the kernel. It survived only because the sweep records traffic per
+configuration rather than just time. A one-number benchmark would have produced a confident wrong
+answer.
+
+### How to quote this
+
+The same kernel is 2.01x slower at seq 512 and 2.11x faster at seq 3072. **Any figure from this section
+without its sequence length is misleading**, which is the mistake sticking point #18 records this
+project already making once. And the window has an upper edge as well as a lower one — that is the part
+most likely to be dropped in retelling.
 
 ---
 
@@ -482,8 +584,23 @@ automatically rather than depending on someone remembering that it was once a qu
   artifacts *are* committed under `results/raw/` — see [§7a](#7a-was-any-of-this-a-compiler-flag-artifact)
   and the reproduction table in [`results/README.md`](../results/README.md) — but a re-run is a
   reproduction, not a recovery. Where an artifact and a transcribed number differ, both are stated.
-- **The ~1.15–1.18x figure is a projection**, computed from the in-situ decomposition. Not measured.
-  It assumes the dispatch gap goes to zero, so it is an upper bound on what fixing dispatch buys.
+- **The ~1.15–1.18x figure is a projection**, computed from the in-situ decomposition, and it is now
+  partly superseded: it assumed dispatch went to *zero*, and the measured numbers with both fixes are
+  1.62x (seq 512) and 1.37x (seq 2048). Those sit between the old 3.31x and the projection, which is
+  what the projection predicted, since Finding #28 removes about two thirds of the dispatch term
+  rather than all of it. Quote the measured pair, not the projection.
+- **Neither dispatch fix is shipped.** Both are runtime monkeypatches, verified accuracy-neutral on
+  this stack, with the NKI source fingerprinted so they refuse to apply to a version they were not
+  written against. The deliverable is the diagnosis and the verification, not a deployable patch.
+- **The attention win is a 4-layer microbenchmark, not a model.** Device time for chained attention
+  layers with distinct K/V. In situ, attention sits between QKV and O projections that force HBM
+  boundaries anyway, so the custom-call boundary should cost *less* than it does here — but that has
+  not been measured, and Finding #25 made exactly this error in the opposite direction.
+- **The attention kernel is not wired into the Kernel Hub.** It is called directly. transformers has
+  an attention interface that is the right interception point, and mapping `attention_cte` onto it is
+  the obvious next step, but it was not done.
+- **Where XLA's attention strategy switches is unknown.** It sets the upper edge of the speedup window
+  and therefore the size of the opportunity. Diffing the HLO either side of seq 4096 would answer it.
 - **Whether `create_computation` is cacheable is unknown.** Not attempted, deliberately.
 - **No backward kernels.** All three are `has_backward=False`; training falls back.
 - **No `torch.compile` support.** Now testable (Finding #23 explains what actually fails); not tested,

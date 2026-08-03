@@ -54,6 +54,8 @@ These are the primary references we used. Critically, they describe different la
 | 25 | Each NKI call is an optimisation barrier — the compiler can't fuse across it. Kernels are provably optimal (marginal traffic 1.00x the unfused floor); the loss is the forfeited fusion | Critical | **2.5–2.7x in a chained microbenchmark, but 8.4% of the regression in situ.** Decides the last ~18% after #24's residual |
 | 26 | **The fused MLP — the one kernel that could win — loses by 2.8–3.0x on device too, at both shapes it can run single-core. `nkilib` kernels need an SPMD grid; #18 is a design boundary, not a bug** | **Critical** | **Answers "where would a speedup come from?": nowhere, in this configuration.** Also explains why RMSNorm/SiLU had to be tutorial-derived — no standalone versions exist in nki-library |
 | 27 | **The device gap is not a compiler-flag artifact.** NKI is invariant across `{unset, --target trn2, ±--lnc 1/2, -O2}`: 1.02x on wall clock, 1.05x on device, and marginal traffic pinned at **1.00x the unfused floor** under every setting | **Critical** | **Closed.** Not "no better flag found" — the quantity a flag would have to move is already at its theoretical minimum, so #25 and #26 are structural. Both probes are harness stages, so a compiler upgrade re-tests it |
+| 28 | **B12 answered: the residual is a SECOND bypassed cache.** `torch_xla`'s `Op` already memoises the built computation; NKI applies `@xla_hlo_call` inside `__call__`, so a fresh `Op` with an empty memo is built per call. 0.53 → 0.18 ms/call, bit-identical output | **Critical** | **Closed.** Model slowdown 3.31x → **1.62x** (seq 512) and 2.06x → **1.37x** (seq 2048). 52.25 → 0.605 → 0.162 ms/call, 322x total. Two upstream asks now, both one line, both in NKI's dispatch path |
+| 29 | **A SPEEDUP EXISTS.** `nkilib` flash attention (`attention_cte`) beats the compiler's eager attention by **1.48x at seq 2048 and 2.11x at seq 3072** on device; it loses 2.01x at seq 512 and 1.79x at 4096. A WINDOW, not a threshold | **Critical** | **First winning candidate**, and for the reason #25's criterion predicted: flash is an algorithmic restructuring the compiler does not derive. Worked first try against the HF layout. The window's upper edge is the compiler *improving* at 4096 (its traffic drops 47% while the score matrix grows), not the kernel degrading |
 
 ---
 
@@ -2079,3 +2081,223 @@ is the thing to check first.
    call fusible — so the compiler can see through it — is a compiler change, and it is the one change
    that would move the 6.29 MB. That remains the open question (B14), and this finding sharpens it from
    "can fusion happen?" to "the 6.29 MB/call is the exact quantity a fusible custom call would remove."
+
+---
+
+## 28. B12 answered — the residual is a second bypassed cache, and the slowdown drops to 1.37-1.62x [CRITICAL]
+
+Finding #24 removed ~52 ms/call and left ~0.53 ms/call, which the in-situ decomposition showed was
+91% of the remaining regression. That residual was deliberately not attacked: cProfile put it inside
+`torch_xla`'s op-registry path, and a wrong guess there could be silently incorrect rather than raise.
+
+Reading the source answered it before any measurement, and the answer is **Finding #24's shape a
+second time: a cache exists and the code path throws it away.**
+
+`torch_xla/core/xla_op_registry.py` defines `Op`, which holds
+
+```python
+self._computations = dict()      # keyed on pickle.dumps([shapes, kwargs])
+```
+
+and whose own docstring says: *"Python based XLA operations should be preferably registered globally,
+in order to amortize the lowering cost."*
+
+`nki/framework/_torch_xla.py::TorchXlaKernel.__call__` does the opposite:
+
+```python
+@xla_hlo_call                       # -> xla_call -> xla_op_registry.register -> Op(...)
+def nki_custom_call(*tensors):
+    ...
+xla_result = nki_custom_call(*input_tensors)
+```
+
+The decorator runs **inside** `__call__`, so every kernel invocation constructs a brand-new `Op` with
+a brand-new empty `_computations`. The cache is not cold by accident; it is newly created, and
+therefore always empty, on every call.
+
+Put beside #24, the pair is striking:
+
+| | the cache | how it is defeated |
+|---|---|---|
+| #24 | `func._nki_compile_cache` | target resolution runs while building the cache *key*, so a hit still pays the subprocess |
+| B12 | `Op._computations` | the memo lives on an object that is recreated per call |
+
+Neither is a property of per-layer kernel dispatch on Neuron. Both are one misplaced line.
+
+### Why the key is sound, which is what separates a fix from a guess
+
+The lowering closure captures `config = nir.build_config()`. `nir` comes from
+`self._cached_compile_to_bir(frontend, converted_inputs, compile_opts)`, already memoised on
+`self._generate_cache_key(converted_inputs, compile_opts)`. So same key ⟹ same `nir` ⟹ same `config`
+⟹ same closure. **The key is not a judgement about what is safe to share; it is the key NKI already
+uses for the object the closure is built from.** Two guards make that concrete: the Op is cached only
+when NKI's compile cache is enabled (with `NKI_DISABLE_COMPILE_CACHE`, `nir` is rebuilt per call and
+could differ), and a null key from unhashable arguments falls through to the original path.
+
+### Verified in the shape of #24's verification
+
+| variant | ms/call | speedup | cos_sim |
+|---|---|---|---|
+| baseline (post-#24) | 0.5278 | — | 0.9999424815177917 |
+| Op registry cached | 0.1828 | **2.89x** | 0.9999424815177917 |
+| baseline again (control) | 0.4943 | — | 0.9999424815177917 |
+
+86 hits, 1 miss, 1 distinct key. Cosine similarity is **bit-identical to 16 digits**, not merely above
+a threshold. The baseline is re-run last, so ordering cannot explain it. And the probe reports cache
+hit counts, so a timing win cannot be credited to the cache without evidence the cache was used —
+2361 hits against 5 misses on the full model.
+
+It also refuses to patch an NKI it does not recognise. The patch reimplements
+`TorchXlaKernel.__call__`, so five structural landmarks are asserted in the installed source first and
+the source hash is printed for the record (`5f8521daa38d96a2`).
+
+### Model-level effect, which is the number that matters
+
+| stage | seq | baseline | kernelized | slowdown | MFU | added ms/call |
+|---|---|---|---|---|---|---|
+| no fixes | 512 | 43.06 | 8873.67 | 206.07x | 0.02% | 52.2522 |
+| #24 only | 512 | 44.36 | 146.67 | 3.31x | 1.45% | 0.6054 |
+| **#24 + B12** | 512 | 43.94 | **71.32** | **1.62x** | 2.98% | 0.1620 |
+| #24 only | 2048 | 109.64 | 226.16 | 2.06x | 4.76% | 0.6894 |
+| **#24 + B12** | 2048 | 117.78 | **161.04** | **1.37x** | 6.69% | 0.2560 |
+| device floor | | | | | | 0.0495 |
+
+**52.25 → 0.605 → 0.162 ms/call.** 86.3x from #24, another 3.7x from B12, **322.5x together.** The
+cost is now within 3.3x of the device floor, and 69% of what remains is still dispatch.
+
+### What this does to the project's own framing
+
+The ~1.15–1.18x figure was a **projection** that assumed dispatch went to zero. 1.62x and 1.37x are
+**measured**, and they sit between the old 3.31x and that projection — which is exactly what the
+projection predicted, since B12 removes about two thirds of the dispatch term rather than all of it.
+The claim that the slowdown was a framework bug rather than a property of the approach is now
+demonstrated rather than argued.
+
+### What to do
+
+1. **Two upstream asks now, not one, and they are the same kind.** #24: memoise `_detect_target`.
+   B12: register the lowering once per compile-cache key. Both are small, both are in NKI's dispatch
+   path, both are accuracy-neutral by measurement.
+2. **Stop quoting 3.31x.** It is the one-fix number. 1.62x at seq 512 and 1.37x at seq 2048 are
+   current.
+3. **Neither of these is shipped.** Both are runtime monkeypatches verified on this stack. The
+   deliverable is the diagnosis and the verification, not a patch anyone can deploy.
+
+---
+
+## 29. A SPEEDUP EXISTS: NKI flash attention beats the compiler at seq >= 2048 [CRITICAL — this is the answer to "we should see a speedup"]
+
+Every previous candidate in this project lost, and Findings #25 and #26 explained why with a criterion:
+
+> A kernel wins when it replaces a region the compiler would **not** otherwise fuse well, **and**
+> there is real arithmetic to restructure.
+
+RMSNorm, RoPE and SiLU fail both halves — small, memory-bound, already fused, so an opaque custom call
+*removes* an optimisation. The fused MLP passes the second half and loses 2.99x single-core for lack of
+an SPMD grid. What had not been tested was the one candidate the criterion actually favours.
+
+### Why attention is different, stated before measuring
+
+1. **Flash attention is an algorithmic restructuring, not a fusion.** It never materialises the
+   `[heads, S, S]` score matrix, using online softmax with running max/sum instead. A compiler fuses
+   elementwise chains; it does not re-derive the algorithm. So this is not something the compiler is
+   already doing.
+2. **There is real arithmetic.** Two matmuls per head, and under causal masking half the score tiles
+   can be skipped entirely rather than computed and masked to `-inf`. `attention_cte` does skip them.
+3. **It runs single-core.** `nkilib/core/attention/attention_cte.py` states it "can be invoked with 1D
+   SPMD grid for LNC2 **or without grid**". That is precisely the property the fused MLP lacked, so
+   #26's verdict does not automatically carry over.
+
+It also worked **first try** against the HF-native layout — `tp_q=True, tp_k=True, tp_out=False` maps
+directly onto `(batch·heads, seq, head_dim)`, GQA is expressed natively as `batch_size_kv < batch_size`
+with no K/V replication, and correctness was `cos_sim 1.000010` against a CPU fp32 reference. Contrast
+Finding #13's RoPE (undocumented) and #17/#18's MLP (wrong weight layout, compile boundary). This is
+the first nkilib kernel that dropped into the Kernel Hub's calling convention without a fight.
+
+### The result
+
+Device time, single logical core, Qwen3-0.6B head geometry (16 q heads, 8 kv heads, `head_dim` 128),
+causal, 4 layers per graph with distinct K/V per layer:
+
+| seq | NKI ms/layer | torch ms/layer | NKI/torch | NKI MB/layer | torch MB/layer | score matrix |
+|---|---|---|---|---|---|---|
+| 512 | 0.2463 | 0.1225 | 2.01x slower | 8.39 | 3.16 | 8.4 MB |
+| 1024 | 0.4939 | 0.4269 | 1.16x slower | 16.78 | 13.12 | 33.6 MB |
+| **2048** | **1.1438** | **1.6902** | **1.48x FASTER** | 33.55 | 279.86 | 134.2 MB |
+| **3072** | **1.8484** | **3.9062** | **2.11x FASTER** | 50.33 | 748.70 | 302.0 MB |
+| 4096 | 2.8295 | 1.5784 | 1.79x slower | 67.11 | 395.05 | 536.9 MB |
+
+The 2048–4096 region was measured twice, in separate runs, with 3072 added the second time. It
+reproduces to four significant figures (NKI 1.1420/1.1438 at 2048, 2.8299/2.8295 at 4096), so nothing
+below is noise.
+
+**The crossover is between 1024 and 2048, and the traffic column explains it.** At seq 512 torch moves
+3.16 MB/layer — *below* the 6.29 MB it costs merely to read q, k, v and write the output once. The only
+way that is possible is that the compiler fused the whole chain and kept the score matrix resident, so
+**flash attention's central advantage is something XLA on Neuron was already achieving at short
+sequences**, and the kernel spends an HBM round-trip at its boundary to buy something it does not get.
+That is the same fusion-barrier story as #25, arrived at from a different direction.
+
+As `S` grows the score matrix grows as `S²` while flash's working set grows as `S`. At seq 3072 torch
+moves 748.70 MB/layer against NKI's 50.33 — **14.9x more** — and its MBU has risen from 3.6% to 26.8%.
+The compiler has stopped being able to keep the scores resident, and the kernel wins by 2.11x.
+
+**NKI's side of the table is textbook flash attention.** Traffic is exactly linear in sequence length —
+16.78 MB per 1024 tokens, at every point, with no inflection — and time grows smoothly. The kernel does
+what it says it does.
+
+### The seq-4096 reversal is on the TORCH side, and my first hypothesis was backwards
+
+The 4096 row breaks the trend, and my initial reading was that the NKI kernel had run out of single-core
+SBUF: at seq 4096 K and V are 8.4 MB each, `attention_cte` only sections K/V above 10K tokens, and a
+spill would produce exactly a superlinear cost. That would have been Finding #26 recurring, and it was
+a tidy story.
+
+**The traffic column says it is wrong.** Torch's HBM traffic per layer goes 279.86 → 748.70 → **395.05**
+MB as sequence goes 2048 → 3072 → 4096. It *drops by 47%* while the score matrix it is supposedly
+materialising *grows* from 302 MB to 537 MB. At 3072 torch moves 2.5x the score matrix, consistent with
+materialising it and passing over it several times. At 4096 it moves 0.74x the score matrix — **less than
+one copy**, which is only possible if it stopped materialising it.
+
+Meanwhile NKI at 4096 is exactly on its own linear trend (67.11 MB = 4 × 16.78) and its time is exactly
+on trend too. **Nothing degraded on the NKI side. The compiler got better.**
+
+The leading explanation is that XLA has a threshold above which it switches attention strategy — a
+blocked or tiled decomposition rather than a materialised score matrix — and above that threshold it is
+competitive again. That is checkable by dumping the HLO for the two configurations and diffing the
+fusion structure, which has not been done, so it is stated as the explanation the traffic supports
+rather than as a confirmed mechanism.
+
+It is worth recording how close this came to being published the other way round. The SBUF story was
+plausible, matched an existing finding, and would have blamed the kernel. The traffic column contradicts
+it, and the only reason the contradiction surfaced is that the sweep records traffic per configuration
+rather than just time. **A one-number benchmark would have produced a confident wrong answer here.**
+
+### What this changes about the recommendation
+
+This is the first candidate that wins, and it wins for the reason the criterion predicted. The
+recommendation moves from "the mechanism works and no speedup is available" to something sharper and
+more useful:
+
+1. **Point Kernel Hub interception at attention, not at RMSNorm/RoPE/activations.** The uncomfortable
+   corollary of Finding #25 still holds — reach and benefit are inversely correlated, and the ops the
+   Hub intercepts most widely have the least to gain — but attention is both widely intercepted
+   (transformers has an attention interface) and genuinely improvable.
+2. **State the sequence length with the claim, and state that it is a WINDOW.** 2.01x slower at seq 512,
+   1.48x faster at 2048, 2.11x faster at 3072, 1.79x slower at 4096 — all the same kernel. Quoting any
+   one of those without `seq` is the mistake sticking point #18 records. And the window has an upper
+   edge as well as a lower one, which is the part most likely to be dropped in retelling.
+3. **The upper edge is the more interesting half.** The window closes because the *compiler* improves at
+   4096, not because the kernel degrades. So the size of the opportunity depends on where XLA's own
+   attention strategy switches, which nobody on this project knew was a threshold at all. Find it
+   properly: dump HLO either side of it.
+4. **The dispatch fixes are load-bearing for this result.** At 0.53 ms/call of overhead the 2048 win
+   (1.14 ms/layer device) would have been invisible. #24 and B12 are what make an attention kernel worth
+   swapping at all — which is the concrete argument for fixing them upstream.
+5. **Measure multi-core.** Still the largest gap, and `attention_cte` shards batch across LNC2 cores, so
+   it is the configuration this kernel was built for and the numbers above are its handicapped case.
+6. **Do not over-read a 4-layer microbenchmark.** This is device time for chained attention layers with
+   distinct K/V, not a model. In situ, attention sits between QKV and O projections that force HBM
+   boundaries anyway, so the custom-call boundary costs less than it does here — the in-situ effect
+   should be *better* than this, but it has not been measured. Finding #25 made the opposite mistake in
+   the opposite direction; the lesson is the same.

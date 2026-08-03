@@ -2,7 +2,7 @@
 
 **GENERATED FILE — do not edit.** Source of truth is [`measurements.json`](measurements.json); regenerate with `python scripts/render_results.py`.
 
-Rendered 2026-08-03 19:24 UTC from commit `6dcbf9b`.
+Rendered 2026-08-03 20:40 UTC from commit `9e1a089`.
 
 ## Read this before quoting any number
 
@@ -12,9 +12,9 @@ The trn2 instance used for the ORIGINAL measurements expired on 2026-08-02. Ever
 
 Every number below carries a `status`:
 
-- **`transcribed`** (3 of 20) — Number is recorded here from the run's stdout, which was captured in the git commit message at the listed SHA. The raw artifact (JSON/log/NEFF) is NOT in the repo — see _artifact_loss.
-- **`reproduced`** (15 of 20) — Original number is transcribed AND an independent re-run on the replacement instance is committed under results/raw/. The committed artifact carries the re-run's value, which is recorded alongside. See _reproduction for the agreement.
-- **`in_repo`** (2 of 20) — Raw artifact is committed under results/raw/ and is the source of the number quoted here.
+- **`transcribed`** (3 of 23) — Number is recorded here from the run's stdout, which was captured in the git commit message at the listed SHA. The raw artifact (JSON/log/NEFF) is NOT in the repo — see _artifact_loss.
+- **`reproduced`** (15 of 23) — Original number is transcribed AND an independent re-run on the replacement instance is committed under results/raw/. The committed artifact carries the re-run's value, which is recorded alongside. See _reproduction for the agreement.
+- **`in_repo`** (5 of 23) — Raw artifact is committed under results/raw/ and is the source of the number quoted here.
 
 ### The whole set was re-run on a second instance
 
@@ -51,7 +51,22 @@ Kernelizing Qwen3-0.6B costs **100 ms/step**, and that splits:
 | dispatch (framework overhead) | 91.608 | **91.6%** |
 | device (forfeited compiler fusion) | 8.392 | 8.4% |
 
-So the slowdown is overwhelmingly a **framework bug, not a property of the approach**. With dispatch fixed the projection is ~55 ms/step, about **1.18x** slower — PROJECTION, not measured.
+So the slowdown is overwhelmingly a **framework bug, not a property of the approach**. With dispatch fixed the projection was ~55 ms/step, about **1.18x** slower — PROJECTION, not measured.
+
+**That projection has since been partly realised.** Both dispatch caches are now identified and fixed, and the slowdown is measured rather than projected:
+
+| stage | seq | baseline ms | kernelized ms | slowdown | MFU | added ms/call |
+|---|---|---|---|---|---|---|
+| no fixes | 512 | 43.06 | 8873.67 | 206.07x | 0.02% | 52.2522 |
+| #24 only | 512 | 44.36 | 146.67 | 3.31x | 1.45% | 0.6054 |
+| #24 + B12 | 512 | 43.94 | 71.32 | 1.62x | 2.98% | 0.162 |
+| #24 only | 2048 | 109.64 | 226.16 | 2.06x | 4.76% | 0.6894 |
+| #24 + B12 | 2048 | 117.78 | 161.04 | 1.37x | 6.69% | 0.256 |
+| device floor | | | | | | 0.0495 |
+
+**52.2522 -> 0.6054 -> 0.162 ms per call.** 86.3x from the first fix, 3.7x from the second, **322.5x together**. Now within 3.3x of the device floor, and 69% of what remains is still dispatch.
+
+The 1.15-1.18x figure recorded elsewhere is a PROJECTION that assumed the dispatch gap went to zero. 1.62x at seq 512 and 1.37x at seq 2048 are MEASURED, and they sit between the old 3.31x and that projection — which is what the projection predicted, since B12 removes about two thirds of the dispatch term rather than all of it.
 
 The split has now been computed from FOUR independent wall-time pairs across two physical instances: 46.65/146.65, 47.52/144.19, 50.138/144.65 and 54.783/153.43. Device share lands at 8.4%, 8.6%, 8.9% and 8.5%; the projection at 1.18x, 1.18x, 1.17x and 1.15x. The conclusion does not depend on which pair is used.
 
@@ -135,6 +150,36 @@ The override is set to whatever _detect_target() returns on the host, never hard
 
 Step 2 vs step 3 is the decisive comparison: 1459 ms wall against 0.609 ms device is a ~2396x ratio, which eliminates every device-side explanation simultaneously.
 
+## The speedup: flash attention, seq 2048-3072
+
+Findings #25/#26 produced a criterion — a kernel wins when it replaces a region the compiler would NOT otherwise fuse well AND there is real arithmetic to restructure — and then found no candidate meeting it. Attention is the first that passes both halves non-incidentally: flash attention is an ALGORITHMIC restructuring (online softmax, never materialising the [heads,S,S] score matrix), which a compiler does not derive because it fuses elementwise chains rather than re-deriving algorithms; and there are two matmuls per head with causal compute-skipping. Critically, attention_cte states it runs 'with 1D SPMD grid for LNC2 or without grid' — the exact property the fused MLP lacked, so #26's verdict does not carry over.
+
+Qwen3-0.6B head geometry: 16 q heads, 8 kv heads (GQA group 2), head_dim 128, bf16, causal, batch 1, single logical core. 4 layers per graph with DISTINCT K/V per layer so neither side can amortise one weight load (the trap the first fused-MLP measurement fell into).
+
+| seq | NKI ms/layer | torch ms/layer | NKI/torch | NKI HBM MB | torch HBM MB | score matrix MB |
+|---|---|---|---|---|---|---|
+| 512 | 0.2463 | 0.1225 | 2.01x slower | 8.39 | 3.16 | 8.4 |
+| 1024 | 0.4939 | 0.4269 | 1.16x slower | 16.78 | 13.12 | 33.6 |
+| 2048 | 1.1438 | 1.6902 | **1.47x FASTER** | 33.55 | 279.86 | 134.2 |
+| 3072 | 1.8484 | 3.9062 | **2.13x FASTER** | 50.33 | 748.7 | 302.0 |
+| 4096 | 2.8295 | 1.5784 | 1.79x slower | 67.11 | 395.05 | 536.9 |
+
+**A speedup exists: up to 2.11x at seq 3072.** A WINDOW, not a threshold. Same kernel is 2.01x slower at seq 512 and 2.11x faster at seq 3072.
+
+*Accuracy.* cos_sim 1.000010 (seq 512) to 1.001040 (seq 4096) against a CPU fp32 reference, on the FIRST run. max_abs 0.0006-0.0010. torch shows the same pattern at each length, so the comparison is fair.
+
+*Why there is a lower edge.* At seq 512 torch moves 3.16 MB/layer, BELOW the 6.29 MB it costs merely to read q,k,v and write the output once. That is only possible if the compiler fused the whole chain and kept the score matrix resident — so at short sequences the compiler already achieves flash attention's central advantage, and the kernel pays an HBM round-trip at its custom-call boundary to buy something it does not get. Same fusion-barrier mechanism as Finding #25, from the opposite direction.
+
+*Why there is an upper edge, which I first got backwards.* The 4096 reversal is on the TORCH side and my first hypothesis was backwards. I read it as the NKI kernel running out of single-core SBUF (K and V are 8.4 MB each; attention_cte only sections K/V above 10K tokens) — plausible, matched Finding #26, and blamed the kernel. The traffic column contradicts it: torch's HBM per layer goes 279.86 -> 748.70 -> 395.05 MB across seq 2048 -> 3072 -> 4096, DROPPING 47% while the score matrix grows from 302 to 537 MB. At 3072 it moves 2.5x the score matrix; at 4096 it moves 0.74x, less than one copy. Meanwhile NKI is exactly linear at every point (16.78 MB per 1024 tokens) and exactly on its time trend. Nothing degraded on the kernel side — the COMPILER got better, presumably switching attention strategy above a threshold. Checkable by diffing HLO either side of it; not done, so stated as what the traffic supports rather than confirmed.
+
+*Reproduction.* The 2048-4096 region was measured TWICE in separate runs, with 3072 added the second time. It reproduces to four significant figures (NKI 1.1420/1.1438 at 2048, 2.8299/2.8295 at 4096), so the reversal is not noise. The wrong SBUF explanation survived only until the traffic column was read — a one-number benchmark would have produced a confident wrong answer.
+
+*Porting cost.* Worked FIRST TRY against the HF-native layout: tp_q=True, tp_k=True, tp_out=False maps straight onto (batch*heads, seq, head_dim), and GQA is expressed natively as batch_size_kv < batch_size with no K/V replication. This is the first nkilib kernel in the project that dropped into the Kernel Hub's calling convention without a fight — a data point about porting cost as well as performance. Contrast Finding #13 (RoPE, undocumented) and #17/#18 (MLP, wrong weight layout plus a compile boundary).
+
+*Dependency.* Both dispatch fixes are applied for this measurement. At 0.53 ms/call of overhead the seq-2048 win (1.14 ms/layer device) would have been invisible, so Findings #24 and #28 are what make an attention swap worth doing at all.
+
+*Not done.* The kernel is called directly, NOT wired into the Kernel Hub. transformers has an attention interface that is the right interception point. Also: 4 chained layers is a microbenchmark, not a model — in situ attention sits between QKV and O projections that force HBM boundaries anyway, so the boundary should cost LESS than it does here, but that is unmeasured.
+
 ## Are the kernels any good? (Finding #25)
 
 Device time only, dispatch excluded by construction. **Chained microbenchmark — NKI's worst case, see the caveat at the top.**
@@ -186,7 +231,7 @@ Upstream coverage: 115 RMSNorm registrations, 95 RoPE model files, 1 SiLU decora
 ## Open items
 
 - **[closed]** CLOSED — is any of this a compiler-flag artifact? — Was the top open item, on the theory that a bad compiler default could be the entire slowdown. Closed in both halves. Dispatch: NKI wall time is invariant across {unset, --target trn2, +--lnc 1, +--lnc 2, +-O2} at 1.02x spread. Device: NKI device time is invariant at 1.05x spread and NKI marginal HBM traffic is 6.29 MB/call — exactly the unfused floor — under every setting, so there is no headroom for a flag to find. Both probes run as harness stages, so a future stack change re-tests it automatically rather than requiring someone to remember.
-- **[high]** Is the per-call create_computation rebuild cacheable? — 91.6% of the remaining regression. Not attempted: inside torch_xla's op-registry path, and a wrong guess could be silently incorrect rather than error.
+- **[closed]** CLOSED — is the per-call create_computation rebuild cacheable? — Yes. It was 91% of what remained after Finding #24, and it is the same bug as #24: torch_xla's Op class already memoises the built computation, and NKI applies @xla_hlo_call inside TorchXlaKernel.__call__ so a fresh Op with an empty memo is created per call. Registering once per compile-cache key gives 0.528 -> 0.183 ms/call with bit-identical output, and takes the model-level slowdown from 3.31x to 1.62x at seq 512 and 1.37x at seq 2048. See the op-registry-cache and mfu-both-fixes measurements. What remains open is the UPSTREAM change: this is verified as a runtime monkeypatch, not shipped, and it needs an owner in the same way the #24 fix does.
 - **[medium]** Can a NKI custom call participate in compiler fusion? — Decides whether the last ~18% after the dispatch fix is recoverable.
 - **[medium]** Does a kernel spanning a fused region beat the compiler on that region? — The fused MLP answers this for single-core (no, by ~3x). Unmeasured multi-core with an SPMD grid, which is the configuration the kernel was built for.
 

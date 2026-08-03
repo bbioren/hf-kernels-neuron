@@ -1,0 +1,218 @@
+[
+  {
+    "profile_dir": "prof_attn_nki_s2048_n4",
+    "neff": "neff_235867911429133_vnc_0.neff",
+    "ntff": "235867911429133_vnc_0.ntff",
+    "calls": 4,
+    "metrics": {
+      "total_time": 0.001207117281,
+      "total_active_time_percent": 0.9687703799843125,
+      "mbu_estimated_percent": 0.03882284893208767,
+      "hbm_read_bytes": 25165824,
+      "hbm_write_bytes": 8388608,
+      "tensor_engine_active_time_percent": 0.47885565147501197,
+      "vector_engine_active_time_percent": 0.5709061529042927,
+      "scalar_engine_active_time_percent": 0.5218077745338814,
+      "gpsimd_engine_active_time_percent": 0.41058014892258016,
+      "activate_instruction_count": 640
+    }
+  },
+  {
+    "profile_dir": "prof_attn_nki_s2048_n4",
+    "neff": "neff_8014060331989_vnc_0.neff",
+    "ntff": "8014060331989_vnc_0.ntff",
+    "calls": 4,
+    "metrics": {
+      "total_time": 0.004575327018,
+      "total_active_time_percent": 0.9778527474426748,
+      "mbu_estimated_percent": 0.040970826049553793,
+      "hbm_read_bytes": 100663296,
+      "hbm_write_bytes": 33554432,
+      "tensor_engine_active_time_percent": 0.5005002326589981,
+      "vector_engine_active_time_percent": 0.6071021798162538,
+      "scalar_engine_active_time_percent": 0.5487970752957445,
+      "gpsimd_engine_active_time_percent": 0.4309381058978111,
+      "activate_instruction_count": 2560
+    }
+  },
+  {
+    "profile_dir": "prof_attn_torch_s2048_n4",
+    "neff": "neff_1024759619935858_vnc_0.neff",
+    "ntff": "1024759619935858_vnc_0.ntff",
+    "calls": 4,
+    "metrics": {
+      "total_time": 0.006760654437,
+      "total_active_time_percent": 0.9979077579013881,
+      "mbu_estimated_percent": 0.23088413478485176,
+      "hbm_read_bytes": 576782384,
+      "hbm_write_bytes": 542638080,
+      "tensor_engine_active_time_percent": 0.5391798434123342,
+      "vector_engine_active_time_percent": 0.8058475595135852,
+      "scalar_engine_active_time_percent": 0.9079287348345121,
+      "gpsimd_engine_active_time_percent": 0.1614582195440943,
+      "activate_instruction_count": 11264
+    }
+  },
+  {
+    "profile_dir": "prof_attn_torch_s2048_n4",
+    "neff": "neff_161547384373622_vnc_0.neff",
+    "ntff": "161547384373622_vnc_0.ntff",
+    "calls": 4,
+    "metrics": {
+      "total_time": 0.001689093194,
+      "total_active_time_percent": 0.9966315955684326,
+      "mbu_estimated_percent": 0.24108807312125557,
+      "hbm_read_bytes": 150011920,
+      "hbm_write_bytes": 141557760,
+      "tensor_engine_active_time_percent": 0.5378928114963443,
+      "vector_engine_active_time_percent": 0.8892246267614764,
+      "scalar_engine_active_time_percent": 0.8096550639466966,
+      "gpsimd_engine_active_time_percent": 0.1815537378809662,
+      "activate_instruction_count": 2816
+    }
+  },
+  {
+    "profile_dir": "prof_attn_nki_s3072_n4",
+    "neff": "neff_244388566065923_vnc_0.neff",
+    "ntff": "244388566065923_vnc_0.ntff",
+    "calls": 4,
+    "metrics": {
+      "total_time": 0.007393649281,
+      "total_active_time_percent": 0.9826051255459869,
+      "mbu_estimated_percent": 0.03803025818171109,
+      "hbm_read_bytes": 150994944,
+      "hbm_write_bytes": 50331648,
+      "tensor_engine_active_time_percent": 0.5534554209266666,
+      "vector_engine_active_time_percent": 0.6758587652840549,
+      "scalar_engine_active_time_percent": 0.681399930876705,
+      "gpsimd_engine_active_time_percent": 0.3975830424570013,
+      "activate_instruction_count": 5376
+    }
+  },
+  {
+    "profile_dir": "prof_attn_nki_s3072_n4",
+    "neff": "neff_607701720925456_vnc_0.neff",
+    "ntff": "607701720925456_vnc_0.ntff",
+    "calls": 4,
+    "metrics": {
+      "total_time": 0.001913128677,
+      "total_active_time_percent": 0.9776238088348932,
+      "mbu_estimated_percent": 0.03674378969405994,
+      "hbm_read_bytes": 37748736,
+      "hbm_write_bytes": 12582912,
+      "tensor_engine_active_time_percent": 0.5460362058019582,
+      "vector_engine_active_time_percent": 0.6532264865527391,
+      "scalar_engine_active_time_percent": 0.6596183080475564,
+      "gpsimd_engine_active_time_percent": 0.3854138866164725,
+      "activate_instruction_count": 1344
+    }
+  },
+  {
+    "profile_dir": "prof_attn_torch_s3072_n4",
+    "neff": "neff_214416947022032_vnc_0.neff",
+    "ntff": "214416947022032_vnc_0.ntff",
+    "calls": 4,
+    "metrics": {
+      "total_time": 0.00392776053,
+      "total_active_time_percent": 0.9984578313892266,
+      "mbu_estimated_percent": 0.27370008788051975,
+      "hbm_read_bytes": 391184400,
+      "hbm_write_bytes": 378535936,
+      "tensor_engine_active_time_percent": 0.4892286172548304,
+      "vector_engine_active_time_percent": 0.86988104618486,
+      "scalar_engine_active_time_percent": 0.8188056467383463,
+      "gpsimd_engine_active_time_percent": 0.14397537036200114,
+      "activate_instruction_count": 6336
+    }
+  },
+  {
+    "profile_dir": "prof_attn_torch_s3072_n4",
+    "neff": "neff_825372526336213_vnc_0.neff",
+    "ntff": "825372526336213_vnc_0.ntff",
+    "calls": 4,
+    "metrics": {
+      "total_time": 0.01562475892,
+      "total_active_time_percent": 0.9996367111947734,
+      "mbu_estimated_percent": 0.26769563028565674,
+      "hbm_read_bytes": 1522597952,
+      "hbm_write_bytes": 1472200704,
+      "tensor_engine_active_time_percent": 0.5017767186772056,
+      "vector_engine_active_time_percent": 0.8321863730874127,
+      "scalar_engine_active_time_percent": 0.900082881406787,
+      "gpsimd_engine_active_time_percent": 0.11726023987831231,
+      "activate_instruction_count": 25344
+    }
+  },
+  {
+    "profile_dir": "prof_attn_nki_s4096_n4",
+    "neff": "neff_223311941320977_vnc_0.neff",
+    "ntff": "223311941320977_vnc_0.ntff",
+    "calls": 4,
+    "metrics": {
+      "total_time": 0.011318065649,
+      "total_active_time_percent": 0.9818798132684342,
+      "mbu_estimated_percent": 0.0331249054719636,
+      "hbm_read_bytes": 201326592,
+      "hbm_write_bytes": 67108864,
+      "tensor_engine_active_time_percent": 0.5677092732332498,
+      "vector_engine_active_time_percent": 0.6872033927181898,
+      "scalar_engine_active_time_percent": 0.7503618849171777,
+      "gpsimd_engine_active_time_percent": 0.34432721923152365,
+      "activate_instruction_count": 9216
+    }
+  },
+  {
+    "profile_dir": "prof_attn_nki_s4096_n4",
+    "neff": "neff_484530139819241_vnc_0.neff",
+    "ntff": "484530139819241_vnc_0.ntff",
+    "calls": 4,
+    "metrics": {
+      "total_time": 0.002995746153,
+      "total_active_time_percent": 0.9721309601227751,
+      "mbu_estimated_percent": 0.031286851054883366,
+      "hbm_read_bytes": 50331648,
+      "hbm_write_bytes": 16777216,
+      "tensor_engine_active_time_percent": 0.545912945047851,
+      "vector_engine_active_time_percent": 0.6466693541640676,
+      "scalar_engine_active_time_percent": 0.7081558014772155,
+      "gpsimd_engine_active_time_percent": 0.32503342949298286,
+      "activate_instruction_count": 2304
+    }
+  },
+  {
+    "profile_dir": "prof_attn_torch_s4096_n4",
+    "neff": "neff_865019339362552_vnc_0.neff",
+    "ntff": "865019339362552_vnc_0.ntff",
+    "calls": 4,
+    "metrics": {
+      "total_time": 0.006313433469,
+      "total_active_time_percent": 0.9992588066346185,
+      "mbu_estimated_percent": 0.34957030983084375,
+      "hbm_read_bytes": 801177616,
+      "hbm_write_bytes": 779026432,
+      "tensor_engine_active_time_percent": 0.5001791133945661,
+      "vector_engine_active_time_percent": 0.9043913504491863,
+      "scalar_engine_active_time_percent": 0.825033409408056,
+      "gpsimd_engine_active_time_percent": 0.12443011886595998,
+      "activate_instruction_count": 10752
+    }
+  },
+  {
+    "profile_dir": "prof_attn_torch_s4096_n4",
+    "neff": "neff_918467041163321_vnc_0.neff",
+    "ntff": "918467041163321_vnc_0.ntff",
+    "calls": 4,
+    "metrics": {
+      "total_time": 0,
+      "total_active_time_percent": 0,
+      "mbu_estimated_percent": 0,
+      "hbm_read_bytes": null,
+      "hbm_write_bytes": null,
+      "tensor_engine_active_time_percent": null,
+      "vector_engine_active_time_percent": null,
+      "scalar_engine_active_time_percent": null,
+      "gpsimd_engine_active_time_percent": null,
+      "activate_instruction_count": null
+    }
+  }
+]
