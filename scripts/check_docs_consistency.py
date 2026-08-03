@@ -37,15 +37,76 @@ def md_files():
     return sorted(p for p in ROOT.rglob("*.md") if ".git" not in str(p))
 
 
+def slugs(text: str):
+    """GitHub's heading anchors for a markdown document.
+
+    GitHub lowercases the heading, strips everything that is not alphanumeric, space, hyphen or
+    underscore, then replaces spaces with hyphens. Reimplemented rather than approximated because a
+    near-miss anchor is exactly the failure this is here to catch: an anchor that is a PREFIX of the
+    real slug looks right and silently does not resolve.
+    """
+    out = set()
+    for line in text.splitlines():
+        m = re.match(r"^(#{1,6})\s+(.*?)\s*$", line)
+        if not m:
+            continue
+        h = m.group(2)
+        h = re.sub(r"`([^`]*)`", r"\1", h)          # inline code keeps its text
+        h = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", h)  # links keep their label
+        h = re.sub(r"[*_~]", "", h)                 # emphasis markers vanish
+        s = re.sub(r"[^\w\- ]", "", h.lower()).replace(" ", "-")
+        out.add(s)
+    return out
+
+
+def strip_code(text: str) -> str:
+    """Blank out fenced blocks and inline code spans, preserving line count.
+
+    Link syntax inside backticks is an EXAMPLE of a link, not a link. Docs in this repo discuss
+    markdown and shell syntax constantly, and without this the anchor check flags its own
+    documentation — which it did, on the sticking point describing the check.
+
+    Line count is preserved so reported line numbers stay correct.
+    """
+    def blank(m):
+        return re.sub(r"[^\n]", " ", m.group(0))
+    text = re.sub(r"```.*?```", blank, text, flags=re.S)
+    text = re.sub(r"`[^`\n]*`", blank, text)
+    return text
+
+
 def check_links():
+    """Files AND in-document anchors.
+
+    The anchor half was added after a same-document link was written as a shortened form of a long
+    heading. Because the original check split on '#' and tested only the path, a pure-anchor link
+    resolved to the containing directory, which exists — so every broken anchor passed. A check that
+    cannot fail is not a check.
+    """
     print("=== links ===")
     bad = 0
+    slug_cache = {}
     for doc in md_files():
-        for label, target in re.findall(r"\[([^\]]+)\]\(([^)]+)\)", doc.read_text()):
-            if target.startswith(("http", "#", "mailto")):
+        text = strip_code(doc.read_text())
+        for label, target in re.findall(r"\[([^\]]+)\]\(([^)]+)\)", text):
+            if target.startswith(("http", "mailto")):
                 continue
-            if not (doc.parent / target.split("#")[0]).exists():
-                print(f"  BROKEN {doc.relative_to(ROOT)}: [{label}]({target})")
+            path, _, frag = target.partition("#")
+            dest = doc if not path else (doc.parent / path)
+            if path and not dest.exists():
+                print(f"  BROKEN FILE {doc.relative_to(ROOT)}: [{label}]({target})")
+                bad += 1
+                continue
+            if not frag or dest.suffix != ".md" or not dest.exists():
+                continue
+            if dest not in slug_cache:
+                # Headings are read from the RAW text: `code` in a heading contributes its
+                # content to the slug, so stripping it here would produce wrong slugs.
+                slug_cache[dest] = slugs(dest.read_text())
+            if frag.lower() not in slug_cache[dest]:
+                near = [s for s in slug_cache[dest] if s.startswith(frag.lower()[:40])]
+                hint = f" (did you mean #{near[0]}?)" if near else ""
+                print(f"  BROKEN ANCHOR {doc.relative_to(ROOT)}: [{label}]({target}){hint}")
                 bad += 1
     print("  ok" if not bad else f"  {bad} broken")
     return bad

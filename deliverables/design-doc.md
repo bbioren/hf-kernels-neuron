@@ -160,21 +160,32 @@ recorded it in Week 2 and did not let it inform what I expected from the Week 4 
 ### Method
 
 Qwen3-0.6B, full 28 layers, bf16, forward only, single logical core, `NEURON_CC_FLAGS` unset.
+That last choice is not an oversight and is checked in [§7a](#7a-was-any-of-this-a-compiler-flag-artifact).
 
 **Denominator stated explicitly**, because Trn2 has two conventions plus an LNC subtlety:
 632 TFLOPS/device (TensorEngine bf16) ÷ 2 for LNC2 = **316 TFLOPS per core**. The published 667
 figure includes VectorEngine and ScalarEngine. FLOPs per step are computed explicitly
 (670.42 GFLOP), not estimated.
 
+**Every row below has been re-run on a second physical instance** with a version-matched stack. The
+re-run column is that run. Absolute step times land a few percent higher on the replacement host; the
+*ratios* are what reproduce, several to three significant figures.
+
 ### MFU
 
-| configuration | step ms | MFU | vs baseline |
-|---|---|---|---|
-| baseline, seq 512 | 42.04 | 5.05% | — |
-| all 3 kernels, seq 512, **before the fix** | 8753.65 | 0.02% | 208x slower |
-| all 3 kernels, seq 512, **after the fix** | 141.43 | 1.50% | 3.36x slower |
-| baseline, seq 2048 | 108.76 | 9.90% | — |
-| all 3 kernels, seq 2048, after the fix | 223.99 | 4.81% | **2.06x slower** |
+| configuration | step ms | MFU | vs baseline | re-run step ms | re-run ratio |
+|---|---|---|---|---|---|
+| baseline, seq 512 | 42.04 | 5.05% | — | 44.36 | — |
+| all 3 kernels, seq 512, **before the fix** | 8753.65 | 0.02% | 208x slower | 8873.67 | 206x |
+| all 3 kernels, seq 512, **after the fix** | 141.43 | 1.50% | 3.36x slower | 146.67 | 3.31x |
+| baseline, seq 2048 | 108.76 | 9.90% | — | 109.65 | — |
+| all 3 kernels, seq 2048, after the fix | 223.99 | 4.81% | **2.06x slower** | 226.16 | **2.06x** |
+
+The seq-2048 row is the most encouraging measurement here and the easiest to skim past. Call count is
+fixed by model depth, so a longer sequence means more work per call, not more calls. 2.59x more
+baseline work costs only 1.16x more per call — so the residual overhead is near-*fixed*, and the
+penalty nearly halves just by moving to a longer sequence. At production sequence lengths it matters
+proportionally less again.
 
 ### Root cause of the 208x
 
@@ -196,12 +207,12 @@ subprocess in full.**
 
 Verified fix, two independent methods, in one process, baseline re-run last as a control:
 
-| variant | ms/call | speedup | cos_sim |
-|---|---|---|---|
-| baseline (no override) | 51.74 | — | 0.999938 |
-| `NEURON_PLATFORM_TARGET_OVERRIDE=trn2` | 0.50 | **102.8x** | 0.999938 |
-| `lru_cache(_detect_target)` | 0.49 | **105.5x** | 0.999938 |
-| baseline again (control) | 51.43 | — | 0.999938 |
+| variant | ms/call | speedup | cos_sim | re-run ms/call | re-run speedup |
+|---|---|---|---|---|---|
+| baseline (no override) | 51.74 | — | 0.999938 | 52.11 | — |
+| `NEURON_PLATFORM_TARGET_OVERRIDE=trn2` | 0.50 | **102.8x** | 0.999938 | 0.49 | **105.3x** |
+| `lru_cache(_detect_target)` | 0.49 | **105.5x** | 0.999938 | 0.47 | **110.5x** |
+| baseline again (control) | 51.43 | — | 0.999938 | 52.07 | — |
 
 Cosine similarity is identical to six decimal places across all four, so neither fix changes what
 gets compiled. The override is set to whatever `_detect_target()` returns *on the host*, never a
@@ -222,6 +233,19 @@ Profiling a real forward pass and summing device time across the emitted NEFFs:
 
 **Dispatch 91.608 ms (91.6%), device 8.392 ms (8.4%).** Per call: dispatch 0.5421 ms, device
 0.0497 ms — dispatch is ~11x larger.
+
+This split has now been computed from **four independent wall-time pairs across two physical
+instances** — 46.65/146.65, 47.52/144.19, 50.138/144.65 and 54.783/153.43 — giving device shares of
+8.4%, 8.6%, 8.9% and 8.5%, and projections of 1.18x, 1.18x, 1.17x and 1.15x. The conclusion does not
+depend on which pair is used.
+
+**Which is worth spelling out, because the two inputs have very different precision and it is the
+imprecise one the headline leans on.** Device time repeats to ~0.3% across those runs (baseline
+14.318 / 14.329 / 14.330 ms; kernelized 22.676 / 22.696 / 22.722 / 22.740) because it is a hardware
+trace of a fixed NEFF. Wall time swings 17% (baseline 46.65 to 54.78 ms) because it includes host
+scheduling. So **the ~8.4 ms device gap is the solid number**; the percentage and the projection
+inherit the wall noise and are honestly quoted as ranges — 8.4–8.9% device, 1.15–1.18x projected —
+rather than as point estimates.
 
 The dispatch residual is the same class of bug as the first one, two orders of magnitude smaller:
 cProfile puts it in `create_computation` rebuilding the XLA computation and its HLO protobufs *on
@@ -254,6 +278,26 @@ into one pass.
 For memory-bound ops fusion *is* the optimisation, so a swapped kernel competes against not touching
 memory at all. In the chained microbenchmark that is 2.5–2.7x; in a real model, where these ops sit
 between matmuls, it is the 8.4% above.
+
+The chain-length dependence confirms this from a second direction. Comparing NKI against torch at
+both call counts:
+
+| op | N=1 | N=28 |
+|---|---|---|
+| SiLU | 1.91x | 2.72x |
+| RMSNorm | 2.37x | 2.56x |
+
+The ratio *grows* with chain length, which is what a fusion explanation predicts and a
+kernel-quality explanation does not: a longer chain gives torch more to fuse and leaves NKI
+unchanged. It also confirms N=28 is the worst case rather than the typical one. (N=1 is not the fair
+number either — at N=1 the comparison is dominated by the custom call's 12.58 MB of fixed NEFF setup
+traffic. The marginal-traffic regression, not either ratio, is the instrument that separates fixed
+from per-call cost, which is why it is the one above.)
+
+This comparison was invisible until a bug was fixed: the summariser keyed profile pairs on op name
+alone, so the N=1 and N=28 directories collided and whichever came last in the argument list won. It
+happened to be N=28 for both, so the published ratios were right — by argument order, not by
+construction.
 
 ### The fused MLP, which should have been the win
 
@@ -382,17 +426,64 @@ abandoning it.
 
 ---
 
+## 7a. Was any of this a compiler-flag artifact?
+
+No — and the reason is stronger than "we tried some flags."
+
+This was the project's top open item, and it deserved to be: every measurement ran with
+`NEURON_CC_FLAGS` unset, and a bad compiler default would be the cheapest possible explanation for
+the whole slowdown. It is also the most plausible *technical* form of the objection that there should
+not be a slowdown at all. So it was checked in two halves.
+
+**Wall clock.** Five settings — `{unset, --target trn2, +--lnc 1, +--lnc 2, +-O2}` — one subprocess
+and one isolated compile cache each, so no setting can inherit another's NEFF. NKI's own time moves
+by **1.02x** across all five (13.82–14.15 ms). No setting rescues it.
+
+The first version of this probe thresholded on whether the NKI/torch *ratio* moved, saw a 1.53x
+spread, and read that as "flags matter." Reading the columns separately reverses it: the spread is
+one setting (`--lnc 1`) making *torch* 2.3x slower, which flatters the ratio without helping NKI at
+all. A ratio can move because its denominator moved. The probe now reports both spreads.
+
+**Device time**, which is the half that matters, because Findings #25 and #26 are device-time claims
+and the wall-clock probe is ~97% dispatch by construction (0.494 ms/call *is* the post-fix dispatch
+floor). Same five settings, profiling at N=1 and N=28 so marginal traffic can be solved for:
+
+| `NEURON_CC_FLAGS` | NKI ms | torch ms | ratio | NKI MB/call | vs unfused floor |
+|---|---|---|---|---|---|
+| (unset) | 0.608 | 0.224 | 2.72x | 6.29 | 1.00x |
+| `--target trn2` | 0.608 | 0.224 | 2.71x | 6.29 | 1.00x |
+| `--target trn2 --lnc 1` | 0.580 | 0.429 | 1.35x | 6.29 | 1.00x |
+| `--target trn2 --lnc 2` | 0.608 | 0.224 | 2.71x | 6.29 | 1.00x |
+| `--target trn2 -O2` | 0.608 | 0.224 | 2.71x | 6.29 | 1.00x |
+
+NKI device time spread **1.05x**. NKI marginal traffic spread **1.00x** — pinned at exactly the
+unfused floor under every setting.
+
+**Why this is the strong form.** The weak result would be "five settings tried, none better," which
+leaves a sixth open and invites the reviewer to suggest one. The actual finding is that *the quantity
+a better setting would have to move is already at its theoretical minimum.* NKI moves one tile in and
+one tile out per call — 6.29 MB for a `[512, 3072]` bf16 tile — which is the least an unfusable
+operation can move. There is no headroom for a flag to find. The device gap is structural: an opaque
+custom call cannot be fused into its neighbours, and compiler flags do not reach that.
+
+**The 1.35x row is a trap.** It is the best ratio in the table and it is not an improvement: NKI
+barely moves (0.608 → 0.580) while torch gets 91% slower (0.224 → 0.429). Reading it as progress is
+exactly the mistake the first wall-clock probe made.
+
+Both probes now run as harness stages, so a future SDK or compiler change re-tests this
+automatically rather than depending on someone remembering that it was once a question.
+
+---
+
 ## 8. What is not done
 
-- **Raw artifacts are missing.** The trn2 instance expired and every artifact lived in `/tmp` on it.
-  Numbers survive in commit messages; scripts survive. `make results` regenerates everything into
-  `results/raw/`. See [`results/raw/README.md`](../results/raw/README.md).
-- **No run has confirmed the results are independent of compiler flags.** `NEURON_CC_FLAGS` was
-  unset throughout. This is the one config choice that could invalidate the device comparisons, and
-  it is the most plausible technical form of "there shouldn't be a slowdown." Now *instrumented*:
-  `scripts/probe_compiler_flags.py` runs as the fourth stage of `make results` and reports whether
-  the NKI/torch ratio moves across `{unset, --target trn2, +--lnc 1, +--lnc 2, +-O2}`.
-- **The ~1.18x figure is a projection**, computed from the in-situ decomposition. Not measured.
+- **The original raw artifacts are gone.** The first trn2 instance expired and every artifact lived
+  in `/tmp` on it. Every measurement has since been re-run on a replacement instance and those
+  artifacts *are* committed under `results/raw/` — see [§7a](#7a-was-any-of-this-a-compiler-flag-artifact)
+  and the reproduction table in [`results/README.md`](../results/README.md) — but a re-run is a
+  reproduction, not a recovery. Where an artifact and a transcribed number differ, both are stated.
+- **The ~1.15–1.18x figure is a projection**, computed from the in-situ decomposition. Not measured.
+  It assumes the dispatch gap goes to zero, so it is an upper bound on what fixing dispatch buys.
 - **Whether `create_computation` is cacheable is unknown.** Not attempted, deliberately.
 - **No backward kernels.** All three are `has_backward=False`; training falls back.
 - **No `torch.compile` support.** Now testable (Finding #23 explains what actually fails); not tested,

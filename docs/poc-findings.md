@@ -53,6 +53,7 @@ These are the primary references we used. Critically, they describe different la
 | 24 | **THE ROOT CAUSE: `_detect_target()` forks `neuron-ls` on every kernel invocation, ~52 ms, outside the compile cache. One `lru_cache` = 102x/call, MFU 0.02% → 1.50%** | **Critical** | **Fix verified, accuracy-neutral. Residual ~0.59 ms/call in `create_computation` is 91.6% of what's left** |
 | 25 | Each NKI call is an optimisation barrier — the compiler can't fuse across it. Kernels are provably optimal (marginal traffic 1.00x the unfused floor); the loss is the forfeited fusion | Critical | **2.5–2.7x in a chained microbenchmark, but 8.4% of the regression in situ.** Decides the last ~18% after #24's residual |
 | 26 | **The fused MLP — the one kernel that could win — loses by 2.8–3.0x on device too, at both shapes it can run single-core. `nkilib` kernels need an SPMD grid; #18 is a design boundary, not a bug** | **Critical** | **Answers "where would a speedup come from?": nowhere, in this configuration.** Also explains why RMSNorm/SiLU had to be tutorial-derived — no standalone versions exist in nki-library |
+| 27 | **The device gap is not a compiler-flag artifact.** NKI is invariant across `{unset, --target trn2, ±--lnc 1/2, -O2}`: 1.02x on wall clock, 1.05x on device, and marginal traffic pinned at **1.00x the unfused floor** under every setting | **Critical** | **Closed.** Not "no better flag found" — the quantity a flag would have to move is already at its theoretical minimum, so #25 and #26 are structural. Both probes are harness stages, so a compiler upgrade re-tests it |
 
 ---
 
@@ -1683,6 +1684,11 @@ Device time only, from `neuron-explorer` `total_time`, for identical work comput
 chained applications of the op, same shape, dtype and compiler defaults (`NEURON_CC_FLAGS` unset, as
 everywhere else in this project). Wall-clock dispatch cost is excluded by construction.
 
+*The "compiler defaults" qualifier used to be a live caveat here. It is now discharged by
+[Finding #27](#27-the-device-gap-is-not-a-compiler-flag-artifact-and-the-reason-is-structural-critical--closes-the-last-thing-that-could-have-invalidated-25-and-26):
+NKI device time varies by 1.05x across five flag settings and its marginal traffic is pinned at the
+unfused floor under all of them, so nothing below is a configuration artifact.*
+
 | config | device ms | ms/call | HBM r+w | MBU | active |
 |--------|-----------|---------|---------|-----|--------|
 | silu / NKI / N=28 | 0.607 | 0.0217 | 188.7 MB | 43.2% | 95.1% |
@@ -1975,3 +1981,101 @@ weight-layout mismatch has been quantified rather than described.
 4. **Do not read this as "NKI kernels are slow."** These kernels are correct to six decimals and are
    presumably good at what they were built for. Nothing here measures them in their intended
    configuration, and this document should not be cited as if it did.
+
+---
+
+## 27. The device gap is not a compiler-flag artifact, and the reason is structural [CRITICAL — closes the last thing that could have invalidated #25 and #26]
+
+Every performance measurement in this project ran with `NEURON_CC_FLAGS` unset. That was recorded as a
+caveat from the start, and it was the right caveat: a bad compiler default would be the cheapest
+possible explanation for the entire slowdown, and it is the most plausible *technical* form of the
+reviewers' objection that there should not be a slowdown at all. It stayed open for two sessions
+because it needed hardware.
+
+It is now closed, in two halves, and the second half gives a stronger answer than "we tried some
+flags and none helped."
+
+### Half one: wall clock
+
+Five settings — `{unset, --target trn2, +--lnc 1, +--lnc 2, +-O2}` — 28 chained SiLU applications on a
+`[512, 3072]` bf16 tile. One subprocess and one isolated compile cache per setting, so no setting can
+be served a NEFF another setting compiled.
+
+| `NEURON_CC_FLAGS` | NKI ms | torch ms | ratio |
+|---|---|---|---|
+| (unset) | 14.096 | 0.728 | 19.37x |
+| `--target trn2` | 14.061 | 0.764 | 18.39x |
+| `--target trn2 --lnc 1` | 13.821 | 1.708 | 8.09x |
+| `--target trn2 --lnc 2` | 14.019 | 0.726 | 19.32x |
+| `--target trn2 -O2` | 14.152 | 1.023 | 13.83x |
+
+Spread: ratio 2.39x, **NKI 1.02x**, torch 2.35x.
+
+**The first version of this probe got the answer wrong**, and how it did is worth keeping. It
+thresholded on whether the NKI/torch *ratio* moved. The ratio spread was 1.53x on its first run, which
+reads as "flags matter, re-run everything." But the columns separately say the opposite: NKI is flat
+at 13.8–14.2 ms while torch varies by 2.35x, and the whole ratio spread comes from `--lnc 1` making
+*torch* slower. **A ratio can move because its denominator moved.** The probe now reports both spreads
+and concludes on whether NKI itself responds.
+
+**Scope limit, which the probe prints itself.** 13.82 ms for 28 calls is 0.494 ms/call, and that *is*
+the post-fix dispatch floor (Finding #24). So this run is ~97% dispatch and only a few percent device.
+It establishes that the *dispatch* cost is flag-invariant. It says almost nothing about the
+device-time claims in #25 and #26, which are the ones the recommendation rests on.
+
+### Half two: device time, which is the half that matters
+
+Same five settings, but profiling device time at **N=1 and N=28**, so marginal traffic per call can be
+solved for rather than inferred.
+
+| `NEURON_CC_FLAGS` | NKI ms | torch ms | ratio | NKI MB/call | vs unfused floor |
+|---|---|---|---|---|---|
+| (unset) | 0.608 | 0.224 | 2.72x | 6.29 | 1.00x |
+| `--target trn2` | 0.608 | 0.224 | 2.71x | 6.29 | 1.00x |
+| `--target trn2 --lnc 1` | 0.580 | 0.429 | 1.35x | 6.29 | 1.00x |
+| `--target trn2 --lnc 2` | 0.608 | 0.224 | 2.71x | 6.29 | 1.00x |
+| `--target trn2 -O2` | 0.608 | 0.224 | 2.71x | 6.29 | 1.00x |
+
+NKI device time spread **1.05x**. NKI marginal traffic spread **1.00x**.
+
+### Why this is the strong form of the result
+
+The weak version would be: *five settings were tried and none was better.* That leaves a sixth setting
+open, and it invites a reviewer to reasonably ask whether the right one was missed.
+
+The actual finding is different in kind. **The quantity a better setting would have to move is already
+at its theoretical minimum.** The unfused floor for a `[512, 3072]` bf16 tile is two tiles — one read
+in, one write out — which is 6.29 MB, and NKI's marginal traffic is exactly 6.29 MB under every
+setting. That is the least an operation that cannot fuse into its neighbours can possibly move. There
+is no headroom for a flag to find, so the absence of a better setting is not evidence about the search;
+it is a consequence of the measurement.
+
+The device gap is therefore **structural**: a NKI kernel reaches the compiler as an opaque custom call,
+the compiler cannot fuse across it, and compiler flags do not reach that. Findings #25 and #26 stand as
+measured.
+
+### The 1.35x row is a trap
+
+It is the best ratio in the table and it is not an improvement. NKI barely moves (0.608 → 0.580) while
+torch gets 91% slower (0.224 → 0.429). Reading it as progress would repeat exactly the mistake the
+first wall-clock probe made — twice in one investigation, from the same cause: **a ratio is two
+numbers, and a change in it does not say which one moved.**
+
+This is also the second time in this project that `--lnc 1` has looked like an improvement and been an
+artifact of degrading the baseline. If anyone quotes a favourable NKI/torch ratio under `--lnc 1`, that
+is the thing to check first.
+
+### What to do
+
+1. **Close the open item and say what closed it.** Both probes are now harness stages
+   (`compiler-flag-control`, `compiler-flag-control-device`), so an SDK or compiler upgrade re-tests
+   this automatically instead of depending on someone remembering it was once a question. That matters
+   more than the answer: the answer is true of this compiler version.
+2. **Stop qualifying #25 and #26 with "on compiler defaults."** The qualification was honest and is now
+   discharged. Replace it with the actual result, which is stronger.
+3. **When reporting any ratio in this project, report both terms.** Two separate wrong readings came
+   from watching a ratio and not its parts. This is now enforced in the probes rather than remembered.
+4. **Do not read this as "no compiler work could help."** It says no *flag* helps. Making a NKI custom
+   call fusible — so the compiler can see through it — is a compiler change, and it is the one change
+   that would move the 6.29 MB. That remains the open question (B14), and this finding sharpens it from
+   "can fusion happen?" to "the 6.29 MB/call is the exact quantity a fusible custom call would remove."

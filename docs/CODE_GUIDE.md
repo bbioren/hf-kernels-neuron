@@ -125,7 +125,8 @@ device-side explanation at once.
 | script | question |
 |---|---|
 | `diagnose_torch_compile.py` | is `torch.compile` broken here? (no — only `torch_neuronx`-overridden ops) |
-| `probe_compiler_flags.py` | **does the NKI/torch ratio depend on `NEURON_CC_FLAGS`?** Not yet run — needs hardware |
+| `probe_compiler_flags.py` | does the NKI/torch **wall-clock** gap depend on `NEURON_CC_FLAGS`? No — NKI invariant at 1.02x across 5 settings. ~97% dispatch by construction, so it cannot answer the device question |
+| `probe_device_time_under_flags.py` | the device half. No setting makes NKI faster, and NKI marginal traffic stays pinned at the unfused floor under all 5 — so the device gap is structural, not a config artifact |
 | `probe_nki_versions.py` | `nki` 0.5.0 vs bundled `neuronxcc.nki` |
 | `probe_nki05_api.py` | what NKI 0.5.0 offers after `nl.arange` was removed |
 | `probe_neuron_device_path.py` | can `use_kernels=True` reach `"neuron"`? (no) |
@@ -138,9 +139,12 @@ device-side explanation at once.
 | script | purpose |
 |---|---|
 | `run_all_tests.py` | all 5 suites, one subprocess each so a crash can't mask the others |
-| `regenerate_results.py` | 21 stages → `results/raw/`. **This is how you rebuild the evidence** |
+| `regenerate_results.py` | 24 stages → `results/raw/`. **This is how you rebuild the evidence** |
 | `render_results.py` | `measurements.json` → `results/README.md`. Runs anywhere |
-| `sync_to_trn2.sh` | rsync local → trn2 |
+| `check_measurement_provenance.py` | every measurement's named artifact must exist **and be committable**. Caught a blanket `*.log` that would have made ten provenance claims false |
+| `check_docs_consistency.py` | broken links, unqualified figures, README drift from `measurements.json` |
+| `sync_to_trn2.sh` | rsync local → trn2. **Push only.** Uses `--delete` and excludes `results/raw/`, which is load-bearing: it once removed 19 stages' artifacts |
+| `fetch_results_from_trn2.sh` | rsync trn2 → local. Separate script because the correct flags differ in each direction |
 | `run_detached.sh` | run under `nohup`; needed because full-model compiles exceed the SSH timeout |
 
 ### Superseded — kept deliberately, marked in their docstrings

@@ -403,3 +403,37 @@ belief about the filesystem, held on one machine.
 This is the fourth bug this session in one family: an output written somewhere nobody verified
 (#19 deleted by a sync, #20 double-counted from a dirty directory, #21 written to a literal `RAW/`,
 #22 excluded by an ignore rule). All four were invisible to the exit code.
+
+---
+
+## 23. A link check that could not fail [cost: ~10 min, one silently broken anchor]
+
+**What happened.** `check_docs_consistency.py` verifies that every markdown link resolves. Its
+implementation split each target on `#` and tested that the *path* part exists. For a link into
+another file that is correct. For a same-document anchor — `[label](#some-heading)`, with nothing
+before the `#` — the path part is the empty string, so it tested whether the containing directory
+exists, which it always does. **Every anchor link in the project passed, unconditionally, including a
+broken one.**
+
+(Writing that sentence broke the check a second time: the example link above is inside backticks, and
+the checker was matching link syntax inside code spans. It now blanks fenced blocks and inline code
+before scanning, preserving line numbers. A checker for documentation has to tolerate documentation
+about itself.)
+
+The broken one was mine, written minutes earlier: I linked to a shortened form of a long heading. The
+real GitHub slug includes the whole heading, brackets and all, so my anchor was a 68-character prefix
+of a 150-character slug. It looks correct in the source and does not resolve.
+
+**Why the shape is worth naming.** This is the same failure as sticking point #22 one level up. There,
+`check_measurement_provenance.py` verified that artifacts existed on disk, which is not the claim a
+provenance status makes. Here, the link checker verified something true by construction rather than the
+thing it was written to check. Both passed. Both were reassuring and empty.
+
+**Fix.** The checker now parses every heading, reproduces GitHub's slug rules, and validates the
+fragment against them. When a fragment is a near-miss it prints the correct slug, which is what
+actually made this a 30-second fix rather than a hunt.
+
+**Generalisable rule:** *for every check, construct the failure it is supposed to catch and confirm it
+catches it.* Both of this session's two new checks were verified against a deliberate break — removing
+the `!*.log` negation, and the prefix anchor — and both times the negative control was the only reason
+I knew the check worked. A green check is evidence only if red is reachable.
