@@ -1,6 +1,34 @@
-"""Experiment: does graph mode amortize the ~53 ms per-invocation NKI cost?
+"""SUPERSEDED — the question below was answered, and it was the wrong question.
 
-THIS IS THE MOST IMPORTANT OPEN QUESTION IN THE PROJECT.
+Kept because the reasoning it embodies was wrong in an instructive way, and because the guard it
+introduced (refuse to report a NKI result unless a plain-PyTorch control compiles first) is the
+reason it did not emit a false finding.
+
+WHAT WAS WRONG WITH IT
+1. `torch.compile` is not broken on this stack, which this script concluded from one error message.
+   `add`/`mul`/`relu` all compile on XLA tensors. Only ops that `torch_neuronx` replaces with XLA
+   user computations fail, because their dispatch predicate accepts a `FakeTensor` and then rejects
+   it. See Finding #23 and `scripts/diagnose_torch_compile.py`.
+2. `torch.compile` was never the right instrument. torch-xla is *already* a lazy graph runtime, so
+   "would graph mode amortise this" is answerable by counting device executions and needs no
+   `torch.compile` at all. `scripts/probe_neff_count.py` does that: 28 NKI calls already share one
+   HLO graph and one device execution (196 nodes) and still cost 28x. Graph batching was never the
+   lever, because the cost was on the host before `mark_step`.
+3. The premise that the ~53 ms was a framework-boundary cost was itself wrong. It is an uncached
+   `neuron-ls` subprocess forked per invocation — Finding #24, fixed, 102x per call.
+
+WHERE TO LOOK INSTEAD
+  scripts/probe_neff_count.py           does graph batching happen? (yes, and it does not help)
+  scripts/probe_where_is_the_time.py    host vs device split (99.9% host, before mark_step)
+  scripts/probe_inside_one_call.py      cProfile attribution to the subprocess
+  scripts/probe_target_override_fix.py  the verified fix
+  scripts/diagnose_torch_compile.py     what is actually wrong with torch.compile here
+
+--- original docstring below, unedited ---
+
+Experiment: does graph mode amortize the ~53 ms per-invocation NKI cost?
+
+THIS WAS BELIEVED TO BE THE MOST IMPORTANT OPEN QUESTION IN THE PROJECT.
 
 Finding #20 established that every `@nki.jit` invocation from eager PyTorch/XLA costs ~53 ms
 of fixed overhead, independent of problem size. At that price the entire 42 ms baseline

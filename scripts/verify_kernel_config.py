@@ -6,6 +6,9 @@ This is what the project doc specifically asked for in Week 1:
 
 This uses the transformers-side API (the path a real user takes with
 from_pretrained(..., use_kernels=True, kernel_config=...)).
+
+Usage — on trn2, from the repo root:
+    python scripts/verify_kernel_config.py
 """
 
 import sys

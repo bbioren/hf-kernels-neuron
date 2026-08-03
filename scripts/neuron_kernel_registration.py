@@ -23,6 +23,13 @@ This module is the Week 3 integration artifact. It does three separable things:
 Why the shim rather than a real patch: modifying the shared venv would be
 irreproducible for a customer and would misrepresent the integration's true state.
 The gap is the finding; hiding it would remove the PoC's value.
+
+Usage — prints the mapping and the proposed upstream diff (runs anywhere, no hardware):
+    python scripts/neuron_kernel_registration.py
+    make registration
+
+Imported as a library by the e2e tests and by scripts/measure_mfu.py, which call
+`kernelize_for_neuron(model)` because `use_kernels=True` cannot reach Neuron (Finding #9).
 """
 
 from __future__ import annotations

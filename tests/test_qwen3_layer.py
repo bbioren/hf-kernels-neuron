@@ -1,10 +1,17 @@
-"""Test NeuronRMSNorm with a real Qwen3 model layer via kernelize().
+"""SUPERSEDED by tests/test_qwen3_neuron_e2e.py. Kept for history; not in the test suite.
 
-This is the end-to-end validation: load an actual Qwen3 model (small variant),
-swap in NeuronRMSNorm via the Kernel Hub mechanism, and confirm the output
-matches the original.
+This was the Week 2 end-to-end check: load a small Qwen3, swap in NeuronRMSNorm via the Kernel Hub
+mechanism, and confirm the output matches. It covers RMSNorm only, and it predates the execution
+guards added after Finding #8, so it can pass while the kernel silently falls back to PyTorch.
 
-Run on trn2:
+`tests/test_qwen3_neuron_e2e.py` replaces it: all three kernels, call counters asserting the NKI
+branch actually ran, and a logits comparison against a reference. That is the suite in
+`scripts/run_all_tests.py`; this file is deliberately excluded from it.
+
+Not deleted because it is the artifact that made the RMSNorm-only integration path reviewable, and
+because the diff between it and the current suite is a compact illustration of what the guards added.
+
+Run on trn2 (historical interest only):
     python tests/test_qwen3_layer.py
 """
 

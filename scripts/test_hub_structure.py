@@ -2,6 +2,10 @@
 
 If this works, it means you can publish an NKI kernel to the Hub by simply
 uploading Python files in the right directory structure. No kernel-builder needed.
+
+Usage — runs anywhere, no Neuron hardware needed (it only checks layout and loading):
+    python scripts/test_hub_structure.py
+    make probe
 """
 import json
 import sys

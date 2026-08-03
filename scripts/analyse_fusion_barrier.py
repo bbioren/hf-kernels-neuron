@@ -19,6 +19,13 @@ traffic per call is well ABOVE the floor, the kernel itself is moving more data 
 
 These have opposite implications for the recommendation, so the distinction is worth being precise
 about rather than reporting "2.6x slower" and leaving the cause open.
+
+Reads the profiles left by scripts/run_device_profile_sweep.py; run that first.
+
+Usage — on trn2, from the repo root:
+    python scripts/run_device_profile_sweep.py --calls 1 28   # produces the profiles
+    python scripts/analyse_fusion_barrier.py                  # this script
+    make fusion                                               # both, in order
 """
 
 import argparse
