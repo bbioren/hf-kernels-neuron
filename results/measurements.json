@@ -340,8 +340,9 @@
   "open_items": [
     {
       "item": "No run has confirmed the results are independent of compiler flags",
-      "detail": "NEURON_CC_FLAGS was unset for every measurement. Setting --target trn2 --lnc {1,2} explicitly has not been tried. This should be the first thing re-run on a fresh instance, because a config artifact would undermine the device-time comparisons specifically.",
-      "priority": "high"
+      "detail": "NEURON_CC_FLAGS was unset for every measurement. A config artifact is the one thing that could invalidate the device-time comparisons in Findings #25 and #26, and it is also the most plausible technical form of the reviewers' objection that there should not be a slowdown. Now INSTRUMENTED rather than merely noted: scripts/probe_compiler_flags.py sweeps {unset, --target trn2, +--lnc 1, +--lnc 2, +-O2}, one subprocess and one isolated compile cache per setting, and reports whether the NKI/torch RATIO moves. It runs as the fourth stage of `make results`, so a fresh instance answers this before spending an hour on measurements that a bad default would invalidate. Verdict threshold: ratio spread <1.25x closes the item.",
+      "priority": "high",
+      "status": "instrumented, awaiting hardware"
     },
     {
       "item": "Is the per-call create_computation rebuild cacheable?",

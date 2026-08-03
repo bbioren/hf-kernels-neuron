@@ -2,7 +2,7 @@
 
 **GENERATED FILE — do not edit.** Source of truth is [`measurements.json`](measurements.json); regenerate with `python scripts/render_results.py`.
 
-Rendered 2026-08-03 16:52 UTC from commit `ac527f7`.
+Rendered 2026-08-03 16:55 UTC from commit `b68a706`.
 
 ## Read this before quoting any number
 
@@ -115,7 +115,7 @@ Upstream coverage: 115 RMSNorm registrations, 95 RoPE model files, 1 SiLU decora
 
 ## Open items
 
-- **[high]** No run has confirmed the results are independent of compiler flags — NEURON_CC_FLAGS was unset for every measurement. Setting --target trn2 --lnc {1,2} explicitly has not been tried. This should be the first thing re-run on a fresh instance, because a config artifact would undermine the device-time comparisons specifically.
+- **[high]** No run has confirmed the results are independent of compiler flags — NEURON_CC_FLAGS was unset for every measurement. A config artifact is the one thing that could invalidate the device-time comparisons in Findings #25 and #26, and it is also the most plausible technical form of the reviewers' objection that there should not be a slowdown. Now INSTRUMENTED rather than merely noted: scripts/probe_compiler_flags.py sweeps {unset, --target trn2, +--lnc 1, +--lnc 2, +-O2}, one subprocess and one isolated compile cache per setting, and reports whether the NKI/torch RATIO moves. It runs as the fourth stage of `make results`, so a fresh instance answers this before spending an hour on measurements that a bad default would invalidate. Verdict threshold: ratio spread <1.25x closes the item.
 - **[high]** Is the per-call create_computation rebuild cacheable? — 91.6% of the remaining regression. Not attempted: inside torch_xla's op-registry path, and a wrong guess could be silently incorrect rather than error.
 - **[medium]** Can a NKI custom call participate in compiler fusion? — Decides whether the last ~18% after the dispatch fix is recoverable.
 - **[medium]** Does a kernel spanning a fused region beat the compiler on that region? — The fused MLP answers this for single-core (no, by ~3x). Unmeasured multi-core with an SPMD grid, which is the configuration the kernel was built for.

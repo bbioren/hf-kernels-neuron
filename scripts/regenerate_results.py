@@ -38,6 +38,11 @@ STAGES = [
     ("smoke", [sys.executable, "scripts/smoke_device.py"], []),
     ("tests", [sys.executable, "scripts/run_all_tests.py"], []),
 
+    # Run the flag control EARLY: if the NKI/torch ratio turns out to depend on
+    # NEURON_CC_FLAGS, every device-time measurement below needs re-running under the better
+    # setting, and it is better to learn that in minute five than at the end.
+    ("compiler-flag-control", [sys.executable, "scripts/probe_compiler_flags.py"], []),
+
     ("mfu-baseline-and-kernelized-512-fixed",
      [sys.executable, "scripts/measure_mfu.py", "--preset", "0.6b", "--seq", "512",
       "--fix-target-detection", "--json-out", "RAW/mfu_512_fixed.json"], []),
