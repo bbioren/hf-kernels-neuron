@@ -299,9 +299,11 @@ forward that is ~76 ms of host-side overhead per step. Two consequences:
 - Residual after the fix is ~0.59 ms/call against 0.02 ms of device time, in `create_computation`
   rebuilding the XLA computation and HLO protobufs per call — same class of bug, 100x smaller
   (blocker 10). On dispatch grounds break-even needs a kernel to save >0.59 ms/call and all three of
-  ours are 15–30x short. **But Finding #25 supersedes this as the binding constraint:** with dispatch
-  excluded the kernels are still 2.5–2.7x slower on device, because each swap costs a compiler fusion.
-  So closing the dispatch residual does not reach parity, and blocker 11 is what matters.
+  ours are 15–30x short. Finding #25 adds a second cost underneath: with dispatch excluded the kernels
+  are 2.5–2.7x slower on device **in a chained microbenchmark**, because each swap costs a compiler
+  fusion. But that benchmark is deliberately NKI's worst case — in a real forward pass the device term
+  is only **8.4%** of the regression against 91.6% dispatch, so blocker 10 (dispatch) is the binding
+  constraint and blocker 11 (fusion) decides the last ~18%.
 - RoPE confirmed engaged at seq 512 (28/28, zero fallbacks), so the `% 128` guard is not
   silently disabling it.
 - **The Week 3 prediction about SiLU was right on the conclusion and wrong on the reasoning.**
@@ -464,6 +466,22 @@ These docs accumulate findings that become the final PoC. Update them as you wor
 | `docs/nki-library-porting-analysis.md` | Deep analysis of nki-library kernel structure | When you investigate a new kernel from nki-library |
 | `docs/upstream-fixes.md` | The asks we're making of other teams, with exact locations + patches | When a blocker is found, root-caused, verified, or filed |
 | `deliverables/week-N.md` | Weekly deliverable writeup | End of each week |
+| **`results/measurements.json`** | **Single source of truth for every quantitative claim: value, producing script, exact command, commit SHA, provenance status** | **Immediately after any measurement. Then run `make results-render`** |
+| **`docs/CODE_GUIDE.md`** | Reading order through the code for a reviewer, plus the inverse index mapping each script to the number it produced | When a script is added, superseded, or changes what it measures |
+| **`deliverables/design-doc.md`** | The review artifact: what was built, the result, the recommendation | When a headline number or the recommendation changes |
+
+### Rules for results, learned the hard way (sticking point #17)
+
+- **Never write measurement artifacts to `/tmp`.** Write them under `results/raw/`. An output path is
+  a durability decision, and `/tmp` on a rented instance is the least durable option available. The
+  first round of measurements lost every raw artifact when the instance expired; only the numbers
+  survived, because they had been pasted into commit messages.
+- **`results/measurements.json` is the source of truth and `results/README.md` is generated.** Never
+  hand-edit the README — run `make results-render`. This exists so a number cannot drift between the
+  machine-readable and human-readable copies.
+- **Tag a number with the configuration it is true of.** A ratio from a chained microbenchmark and a
+  ratio from a real forward pass are different claims. Sticking point #18 is what happens when the
+  more dramatic one is quoted without that qualifier.
 
 ## What to Always Be Tracking
 

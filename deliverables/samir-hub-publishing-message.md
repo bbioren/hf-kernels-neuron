@@ -13,7 +13,8 @@ long version below works as a doc or email if he wants detail.
   "probably also ours to fix."
 - **v3 (this one)** has the finding that is actually worth his time, and it *does* concern the
   mechanism — but for a properly established reason rather than a guessed one. With dispatch excluded
-  entirely, our kernels are still 2.5-2.7x slower on device, because a NKI custom call is opaque to
+  entirely, our kernels are 2.5-2.7x slower on device **in a chained microbenchmark** (our worst case;
+  in a real forward pass the device term is 8.4% of the gap), because a NKI custom call is opaque to
   the Neuron compiler and each swap costs a fusion the compiler was already performing. Our kernels
   are provably optimal (marginal traffic exactly at the unfused floor), so this is a property of
   per-layer swapping on a backend with a fusing compiler, not of our code.

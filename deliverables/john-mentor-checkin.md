@@ -2,14 +2,28 @@
 
 **Status: DRAFT, NOT SENT.** Review before sending.
 
-**REWRITTEN TWICE.** Three earlier versions are wrong and should not be sent. (1) Asked John to decide
-Week 4/5 scope — resolved by getting done. (2) Led with "the kernels are 208x slower for structural
-reasons" and asked for a stack where `torch.compile` works — the conclusion was wrong and the ask is
-withdrawn. (3) Led with the one-line NKI caching bug worth 102x and implied fixing dispatch was the
-path to parity — the bug is real but Finding #25 shows dispatch is no longer the binding constraint.
+> **SUPERSEDED — send [`design-doc.md`](design-doc.md) instead.**
+>
+> John and Pinak asked to see the code and results directly, so the review artifact is now
+> `deliverables/design-doc.md`, with [`results/README.md`](../results/README.md) for the numbers and
+> [`docs/CODE_GUIDE.md`](../docs/CODE_GUIDE.md) for the code. This file is kept as the record of how
+> the message evolved, which is itself part of the story.
+>
+> **One correction matters, because this draft still gets it wrong below.** The header used to say the
+> fusion barrier is "2.5-2.7x on device with dispatch excluded, which no plumbing work fixes." That
+> over-claims. Those figures come from a *chained microbenchmark*, which is deliberately NKI's worst
+> case. Measured in a real forward pass the split is **91.6% dispatch, 8.4% device** — so dispatch is
+> the binding constraint after all, and plumbing work takes it from 3.36x to a projected ~1.18x. Do
+> not quote the 2.5-2.7x figure from this file.
 
-Current version leads with both: the dispatch bug (fix it, 102x, one decorator) *and* the fusion
-barrier (2.5-2.7x on device with dispatch excluded, which no plumbing work fixes). The top ask is now a
+**REWRITTEN TWICE, then superseded.** Three earlier versions are wrong and should not be sent.
+(1) Asked John to decide Week 4/5 scope — resolved by getting done. (2) Led with "the kernels are 208x
+slower for structural reasons" and asked for a stack where `torch.compile` works — the conclusion was
+wrong and the ask is withdrawn. (3) Led with the one-line NKI caching bug worth 102x and implied fixing
+dispatch was the path to parity — which, after the in-situ measurement, is roughly right after all.
+
+The version below leads with both the dispatch bug (fix it, 102x, one decorator) *and* the fusion
+barrier, but sizes the fusion barrier from the microbenchmark rather than in situ. The top ask is now a
 compiler question, not a dispatch one.
 
 ---
@@ -90,10 +104,12 @@ had assumed. Detail below rather than a quiet doc edit.
 >   torch RMSNorm         0.637              6.4 MB     ~0.00 MB
 > ```
 >
-> **NKI is 2.5-2.7x slower on device, with dispatch excluded entirely.** And it isn't the kernels —
-> their marginal traffic is *exactly* the theoretical floor for an op that can't fuse (one read in,
-> one write out, nothing spilled). Torch's traffic is independent of call count, which is only
-> possible if the compiler fused the whole chain into one pass.
+> **NKI is 2.5-2.7x slower on device here, with dispatch excluded entirely — but note this is a
+> chained microbenchmark, which is our worst case; see the correction at the top of this file and the
+> in-situ figure further down.** And it isn't the kernels — their marginal traffic is *exactly* the
+> theoretical floor for an op that can't fuse (one read in, one write out, nothing spilled). Torch's
+> traffic is independent of call count, which is only possible if the compiler fused the whole chain
+> into one pass.
 >
 > So a NKI custom call is an **optimisation barrier**. The compiler can't fuse across it, and every
 > swap forces a HBM round-trip where the data used to stay resident. For memory-bound ops fusion

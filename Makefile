@@ -11,7 +11,7 @@ PIP := $(VENV)/bin/pip
 
 .PHONY: help venv install verify demo test test-nki test-e2e test-all probe mfu mfu-unfixed \
         mfu-amortisation rootcause fusion insitu profile experiments registration sync lint clean \
-        versions results results-render
+        versions results results-render check-docs
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -22,6 +22,9 @@ results: ## Re-run EVERY measurement, writing raw artifacts into results/raw/ (3
 
 results-render: ## Regenerate results/README.md from results/measurements.json (runs anywhere)
 	python3 scripts/render_results.py
+
+check-docs: ## Verify doc links, number qualifiers, and results sync (runs anywhere)
+	python3 scripts/check_docs_consistency.py
 
 insitu: ## Finding #26 in-situ split: how much of the regression is device vs dispatch
 	$(PYTHON) scripts/profile_model_device_time.py --mode baseline \

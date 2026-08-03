@@ -204,3 +204,73 @@ Had the scale been closer to plausible it would have gone into a finding. Worth 
 general rule: when a derived number is impossible, the units are the first thing to check, and a
 sanity range on any computed timing catches this class of error for free. Cross-check against
 `metrics_report()`, which formats the same values with explicit units.
+
+---
+
+## 17. Every raw measurement artifact was lost when the instance expired [unrecoverable, ~2 h to mitigate]
+
+**What happened.** The trn2 instance used for all measurements expired. Every raw artifact lived in
+`/tmp` on that host and went with it:
+
+- `measure_mfu.py --json-out` result files
+- `neuron-explorer view --output-format summary-json` output
+- NEFF / NTFF device-profile pairs (the evidence behind Findings #25 and #26)
+- detached run logs from `scripts/run_detached.sh`
+
+**Why it did not lose the project.** Each run's stdout had been pasted into the git commit message at
+the time, and every producing script is committed. So the numbers survive and are reproducible. What
+does *not* survive is auditability: a reviewer cannot open a file and check a figure, they have to
+take a commit message's word for it or re-run an hour of measurements.
+
+**Cost.** Roughly two hours to build the mitigation — `results/measurements.json` with per-number
+provenance, `scripts/render_results.py` to generate the human-readable summary from it, and
+`scripts/regenerate_results.py` to rebuild the raw tree in-repo next time. None of that work would
+have been needed had the artifacts been written to the repo in the first place, which costs nothing.
+
+**Why it was missed, and this is the annoying part.** The project explicitly tracked the risk that
+"47 commits exist only on one laptop." It did not notice the sharper version of the same risk one
+layer down: **the evidence lived on a machine with a shorter lifetime than the laptop.** Ephemerality
+was being reasoned about at the wrong level.
+
+**What would have prevented it.** Writing artifacts under `results/raw/` from the first measurement
+instead of `/tmp`. Every script already took an `--outdir` or `--json-out`; the default was simply
+pointed at the wrong place. One line per script.
+
+**Generalisable rule:** *an output path is a durability decision.* `/tmp` on a rented host is the
+least durable location available, and it is also the default that every tutorial and profiling guide
+uses, so it takes deliberate thought to avoid. On borrowed hardware, treat the repo as the only real
+filesystem.
+
+**Who else this affects.** Anyone profiling on ephemeral Neuron instances. The profiling workflow's
+own documented example writes to `./output` in the working directory, which on a cloud instance is
+usually as ephemeral as `/tmp`. Worth a line in the profiling guide.
+
+---
+
+## 18. Reporting the most dramatic true number rather than the most representative one [cost: reviewer trust]
+
+Not a debugging sticking point, but it cost more than most of the ones above and is the failure a
+reviewer noticed before I did.
+
+**What happened.** Three separate figures for the same phenomenon were all true and all
+differently misleading:
+
+| figure | true of | misleading because |
+|---|---|---|
+| 208x slower | the pre-fix state | a one-line bug caused it; it says nothing about the approach |
+| 2.5–2.7x slower on device | a chained microbenchmark | that benchmark is deliberately NKI's worst case |
+| 8.4% device / 91.6% dispatch | a real forward pass | this is the representative one, and it arrived last |
+
+Each time I led with the newest and most dramatic, and each time the framing was corrected by a
+later measurement. The reviewers' pushback — "there shouldn't be a slowdown" — was correct, and it
+was correct against a number I had put in front of them.
+
+**What would have prevented it.** Asking, before quoting any ratio, *what configuration is this
+true of, and is that the configuration anyone cares about?* The chained microbenchmark answer was
+available immediately: 28 identical ops back to back is not a model.
+
+**Mitigation now in place.** `results/README.md` leads with the in-situ split and explicitly names
+the two figures most likely to be quoted out of context, with why. `results/measurements.json` tags
+the microbenchmark rows with a note saying not to cite them without the in-situ figure. That is a
+partial fix — a doc cannot stop a number travelling — but it at least means the correction ships
+alongside the claim.

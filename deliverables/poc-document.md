@@ -444,7 +444,7 @@ More tractable than maintaining hand-ports of 7,000-line kernels, but not free.
 | `torch.compile` fails on most transformers | **not** a broken stack: `add`/`mul`/`relu` compile fine. `torch_neuronx` overrides `silu`, `gelu`, `Embedding`, `Softmax`, `CrossEntropyLoss`, `topk`, `argmax`, `Dropout` with XLA user computations that accept a `FakeTensor` and then reject it, so Dynamo cannot trace them. `torch_xla.compile()` works around it. |
 | Every NKI call forks a subprocess | `_detect_target()` runs `neuron-ls` per invocation, ~52 ms, outside the compile cache. One decorator fixes it (Finding #24). |
 | Every NKI call rebuilds its XLA computation | `create_computation` + pyhlo scribe + 168 protobuf enum lookups per call, ~0.59 ms. The residual after the fix above. |
-| The compiler cannot fuse across a NKI custom call | Each swapped op is forced to round-trip through HBM where the data previously stayed resident across a fused region. 2.5–2.7x on device for memory-bound ops, independent of dispatch cost and of kernel quality (Finding #25). The binding constraint. |
+| The compiler cannot fuse across a NKI custom call | Each swapped op is forced to round-trip through HBM where the data previously stayed resident across a fused region. 2.5–2.7x on device in a **chained microbenchmark** (NKI's worst case); **8.4% of the regression in a real forward pass**. Independent of dispatch cost and of kernel quality (Finding #25). |
 
 Fixing `_backend()` is one line in `torch_neuronx` and resolves the first two at once. It does
 **not** fix device routing — that is Finding 2's separate transformers change. Two distinct
@@ -656,9 +656,10 @@ these shapes are 15–30x short. Amortisation softens that — 4x the sequence l
 penalty, 3.36x → 2.06x — so on dispatch grounds alone the gap looked closable with enough scale plus
 Fix 7.
 
-**Finding #25 removes that escape.** With dispatch excluded entirely, the same kernels are still
-2.5–2.7x slower *on device*, because each swap costs a compiler fusion. So the dispatch arithmetic was
-never the binding constraint, and the amortisation trend — while real — heads toward a ceiling that is
+**Finding #25 narrows that escape.** With dispatch excluded entirely, the same kernels are 2.5–2.7x
+slower *on device* **in a chained microbenchmark**, because each swap costs a compiler fusion. That
+benchmark is NKI's worst case, and in situ the device term is only 8.4% of the regression — so the
+dispatch arithmetic *is* the binding constraint after all, and the amortisation trend heads toward a
 itself below parity. Per-layer swapping of small memory-bound ops cannot win, and that is a statement
 about the operation rather than about the overheads.
 

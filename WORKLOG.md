@@ -1168,3 +1168,138 @@ now separates high-confidence measurements from the two projections (the ~1.18x 
 region-spanning kernel beats the compiler) and says explicitly which claims a reader should push on.
 Given the headline has been revised four times, flagging the load-bearing assumptions is more useful than
 sounding uniformly certain.
+
+---
+
+## SESSION 6 — Review readiness, and a headline correction I should have made myself
+
+Trigger: manager and mentor said **there shouldn't be a slowdown**, and asked to see the code and the
+results. Both halves of that turned out to be fair.
+
+### T24 — They were right, and my reporting was the problem
+
+Re-reading my own numbers rather than defending them: the in-situ split is **91.6% dispatch, 8.4%
+device**. So there is no structural slowdown. There is a framework bug worth 102x per call (fixed and
+verified), a second caching bug of the same kind accounting for most of the rest, and ~8% from
+replacing ops the compiler was already fusing. Projected with dispatch fixed: **~1.18x**.
+
+I had been leading with whichever figure was newest and most dramatic. Three were in circulation, all
+true, all differently misleading:
+
+| figure | true of | why it misleads |
+|---|---|---|
+| 208x slower | pre-fix state | a one-line bug caused it |
+| 2.5–2.7x on device | chained microbenchmark | that benchmark is deliberately NKI's worst case |
+| 8.4% device / 91.6% dispatch | a real forward pass | representative, and it arrived last |
+
+Logged as sticking point #18, because it cost reviewer trust and the fix is a habit rather than a
+tool: before quoting a ratio, ask what configuration it is true of and whether anyone cares about
+that configuration.
+
+### T25 — The instance expired mid-session, taking every raw artifact
+
+All measurement artifacts lived in `/tmp` on trn2: JSON outputs, NEFF/NTFF profile pairs, detached
+logs. Gone. The numbers survived only because each run's stdout had been pasted into a commit message.
+
+So the results were reproducible but not **auditable** — a reviewer could not open a file and check a
+figure. That is exactly what had been asked for.
+
+Sticking point #17. The irritating part: the project explicitly tracked "47 commits exist only on one
+laptop" and missed the sharper version one layer down — the evidence lived on a machine with a
+*shorter lifetime than the laptop*. Ephemerality was being reasoned about at the wrong level.
+
+### T26 — Built the results tree that should have existed from day one
+
+- `results/measurements.json` — 18 measurements, each with value, producing script, exact command,
+  commit SHA, and a provenance status. Every entry currently reads `transcribed` rather than
+  `in_repo`, and the file says so up front instead of implying file-backed numbers.
+- `scripts/render_results.py` — generates `results/README.md` from that JSON, so a number cannot drift
+  between the two. The rendered doc leads with the in-situ split and names the two figures most likely
+  to be quoted out of context.
+- `scripts/regenerate_results.py` — 21 stages, strictly sequential (two Neuron processes contend for
+  cores), writing into `results/raw/<stage>/` with an `index.json` of command, exit code, duration and
+  artifacts. `RAW/` placeholders in each stage's argv resolve into the artifact tree, so `--outdir`
+  and `--json-out` land in the repo rather than `/tmp`.
+- `results/raw/README.md` — states plainly why the directory is empty, and the lesson.
+
+### T27 — Instrumented the one open item I could not run
+
+Every measurement ran with `NEURON_CC_FLAGS` unset. That is the single configuration choice that could
+invalidate the device comparisons, and it is the most plausible technical form of "there shouldn't be
+a slowdown." No hardware, so I could not test it — instead `scripts/probe_compiler_flags.py` sweeps
+`{unset, --target trn2, +--lnc 1, +--lnc 2, +-O2}` and reports whether the NKI/torch **ratio** moves,
+not the absolute times.
+
+Two details that matter for it to be correct: flags are a compile-time input, so each setting runs in
+its own subprocess (changing them in-flight would silently reuse a NEFF built under the previous
+setting), and each gets its own `NEURON_COMPILE_CACHE_URL`. Verdict threshold: ratio spread <1.25x
+closes the item.
+
+Wired in as **stage 4** of `make results`, deliberately early — if the ratio does depend on flags then
+every device measurement after it needs re-running, and that is worth learning in minute five.
+
+### T28 — Design doc and code guide
+
+`deliverables/design-doc.md` opens with the correction rather than defending the old framing, then
+covers the interception mechanism, what was built, performance with the denominator stated, the
+methodology, the findings inventory, the recommendation, and what is not done. §3 answers the direct
+question about why two kernels are tutorial-derived: nkilib has no standalone RMSNorm (always
+quantises) and no activations module at all, so those ops exist only inside fused megakernels. RoPE is
+the one standalone op and it *was* ported.
+
+`docs/CODE_GUIDE.md` gives a reading order (a kernel → the guard harness → a test → the shim → e2e)
+plus an inverse index from every script to the number it produced. The root-cause chain is listed in
+the order it should be read, because the order is the argument.
+
+Verified rather than asserted: a checker confirms every markdown link resolves, all 19 file references
+exist, all 47 load-bearing figures appear in `measurements.json`, and the one projection is labelled
+as such near where it is stated.
+
+### T29 — Tidy
+
+All 54 `.py` files already had docstrings, so the work was narrow: superseded headers on
+`experiment_torch_compile_nki.py` (its premise was wrong three ways) and `tests/test_qwen3_layer.py`
+(predates the execution guards, so it can pass on a silent fallback), usage sections added to four
+scripts, and a docstring on `tests/__init__.py`. Superseded files are kept and marked, not deleted —
+`docs/CODE_GUIDE.md` has a table explaining why each one is still there.
+
+## DECISIONS (session 6)
+
+**D34. Conceded the reviewers' point instead of defending the number.** The 208x and the 2.5–2.7x were
+both defensible in isolation, and defending them would have been easy and wrong. The design doc opens
+by saying my reporting led with the wrong figure. *Rejected:* a "clarification" framing that kept the
+dramatic number and added context underneath it.
+
+**D35. Made `measurements.json` the source of truth and generated the prose from it.** Two copies of a
+number is two chances to be wrong, and this project already had numbers drifting between docs.
+*Rejected:* a hand-maintained results table, which is what every previous doc in this repo used and is
+why the findings index went four findings stale.
+
+**D36. Marked every number `transcribed` rather than quietly presenting them as file-backed.** They are
+commit-message-backed, which is weaker, and a reviewer asking to see results deserves to know which.
+*Rejected:* regenerating artifacts from memory to fill `results/raw/`, which would have been
+fabrication.
+
+**D37. Instrumented the compiler-flag control rather than logging it as a caveat.** It was already
+written down as an open item and had sat there unaddressed, which is the same failure as "a caveat in
+the text is not a caveat in the conclusion." Making it stage 4 of the harness means it answers itself
+on first contact with hardware. *Rejected:* another line in "what is not done."
+
+**D38. Kept superseded scripts and annotated them.** Four scripts and two tests embody reasoning that
+turned out wrong. Deleting them would make the repo look tidier and hide how the conclusions were
+reached, which for a PoC whose main output is methodology is the wrong trade.
+
+## BLOCKED — NEEDS INPUT (session 6)
+
+**B15. A trn2 instance.** Nothing further can be measured or verified without one. First action:
+`./scripts/sync_to_trn2.sh && ssh trn2 'cd hf-kernels-neuron && make results'`. That answers B16 as a
+side effect and repopulates `results/raw/`.
+
+**B16. Does the NKI/torch ratio depend on `NEURON_CC_FLAGS`?** Instrumented, unanswered. If the ratio
+moves, Findings #25 and #26 need re-running under the better setting before being cited.
+
+Still open and unchanged: B9 (sanity-check the recommendation), B10 (who owns `target.py`, do I write
+the CR), B12 (is `create_computation` cacheable — top technical ask), B14 (can a NKI custom call
+participate in fusion), B1 (Hub repo home, Samir).
+
+**And still true: 47 commits exist only on this laptop.**
