@@ -1,0 +1,55 @@
+reading prof_n28 / neff_1008222525555404_vnc_0.neff
+reading prof_model_baseline / neff_815801247337692_vnc_0.neff
+reading prof_model_kernelized / neff_730434852645120_vnc_0.neff
+reading prof_mlp_nki / neff_32732985376424_vnc_0.neff
+reading prof_mlp_nki / neff_487725918414136_vnc_0.neff
+reading prof_mlp_torch / neff_38954112263972_vnc_0.neff
+reading prof_mlp_torch / neff_67377513603250_vnc_0.neff
+reading prof_silu_nki_n1 / neff_147929592235939_vnc_0.neff
+reading prof_silu_torch_n1 / neff_818109277963620_vnc_0.neff
+reading prof_silu_nki_n28 / neff_1008222525555404_vnc_0.neff
+reading prof_silu_torch_n28 / neff_1105848876336768_vnc_0.neff
+reading prof_rmsnorm_nki_n1 / neff_327132105740427_vnc_0.neff
+reading prof_rmsnorm_torch_n1 / neff_190530372464753_vnc_0.neff
+reading prof_rmsnorm_nki_n28 / neff_703703829236062_vnc_0.neff
+reading prof_rmsnorm_torch_n28 / neff_135961602684469_vnc_0.neff
+
+wrote /home/ubuntu/hf-kernels-neuron/results/raw/extract-device-metrics/device_metrics.json (15 profile(s)) — this is the auditable artifact; the NTFF traces are gitignored
+
+==============================================================================================================
+DEVICE TIME COMPARISON  (wall-clock dispatch cost excluded by construction)
+==============================================================================================================
+profile                        calls  device ms   per call  active%    MBU%  HBM r+w MB   acts
+--------------------------------------------------------------------------------------------------------------
+prof_n28                          28      0.607     0.0217    94.6%   43.1%       188.7    112
+prof_model_baseline               28     14.329     0.5118    99.9%   25.9%      2662.4   8038
+prof_model_kernelized             28     22.740     0.8121    98.8%   23.2%      3779.9  16468
+prof_mlp_nki                      28      8.314     0.2969    99.9%   36.5%      2172.6    672
+prof_mlp_nki                      28      3.534     0.1262    99.8%   46.3%      1172.3     24
+prof_mlp_torch                    28      0.122     0.0044    95.4%   27.6%        24.2     24
+prof_mlp_torch                    28      2.777     0.0992    99.7%   53.1%      1058.6   1344
+prof_silu_nki_n1                   1      0.051     0.0515    81.7%   46.6%        18.9      4
+prof_silu_torch_n1                 1      0.027     0.0269    85.6%   32.6%         6.3     24
+prof_silu_nki_n28                 28      0.609     0.0218    95.2%   43.1%       188.7    112
+prof_silu_torch_n28               28      0.224     0.0080    98.2%    3.9%         6.3    672
+prof_rmsnorm_nki_n1                1      0.091     0.0909    90.9%   28.0%        18.9     16
+prof_rmsnorm_torch_n1              1      0.038     0.0384    90.3%   28.4%         7.9     50
+prof_rmsnorm_nki_n28              28      1.626     0.0581    99.1%   16.2%       188.8    448
+prof_rmsnorm_torch_n28            28      0.636     0.0227    94.5%    1.4%         6.4   1400
+
+VERDICT
+  rmsnorm n1 NKI    0.091 ms   torch    0.038 ms   NKI/torch =   2.37x   -> NKI SLOWER on device
+           HBM traffic: NKI 18.9 MB vs torch 7.9 MB (2.40x)
+  rmsnorm n28 NKI    1.626 ms   torch    0.636 ms   NKI/torch =   2.56x   -> NKI SLOWER on device
+           HBM traffic: NKI 188.8 MB vs torch 6.4 MB (29.41x)
+  silu n1  NKI    0.051 ms   torch    0.027 ms   NKI/torch =   1.91x   -> NKI SLOWER on device
+           HBM traffic: NKI 18.9 MB vs torch 6.3 MB (3.00x)
+  silu n28 NKI    0.609 ms   torch    0.224 ms   NKI/torch =   2.72x   -> NKI SLOWER on device
+           HBM traffic: NKI 188.7 MB vs torch 6.3 MB (30.00x)
+
+  How to read this: if NKI is SLOWER on device, fixing the remaining dispatch
+  overhead never yields a speedup and per-layer swapping of these ops is a dead end
+  on merit, not just on plumbing. If NKI is FASTER on device, then dispatch cost is
+  the only thing between here and a win, and Fix 7 is the whole ballgame.
+
+----- stderr -----

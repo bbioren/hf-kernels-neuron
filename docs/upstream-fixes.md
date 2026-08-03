@@ -1,0 +1,587 @@
+# Upstream fixes: what we need from other teams
+
+Consolidated from `docs/poc-findings.md`. Each entry has the exact code location, a
+ready-to-paste patch, the verification status, and who owns it.
+
+**None of these are ours to merge.** All are small. Between them they unblock the entire
+`use_kernels=True` experience on Trainium.
+
+Versions these were verified against: `kernels 0.15.2`, `transformers 5.15.0.dev0`
+(commit `bb3ffb97`), `torch 2.9.1+cu128`, `neuronx-cc 2.26.6360.0+6f180f47`, trn2.3xlarge.
+
+| # | Fix | Owner | Size | Verified? | Findings |
+|---|-----|-------|------|-----------|----------|
+| **0** | **Cache `_detect_target()` — it forks `neuron-ls` on every kernel invocation** | **NKI** | **one decorator** | **Yes — 102x, accuracy-neutral** | **#24** |
+| 1 | Route XLA-on-Neuron to `Device(type="neuron")` | transformers (+ kernels) | ~12 lines, 3 sites | **Yes — demonstrated sufficient** | #9 |
+| 2 | Make `_backend()` report `neuron` | `torch_neuronx` | 1 attribute | Root-caused, fix not built | #7, #12 |
+| 3 | Resolve the `nki` / `neuronxcc.nki` capability split | NKI team | needs a decision | Documented only | #14 |
+| 4 | Add `nkilib` to the `python-depends` allowlist | HF `kernels` | ~6 lines | Feasibility verified | #16 |
+| 5 | Fused MLP divides by zero single-core when `I > 4096` | nki-library | bug fix | **Boundary measured, 10 data points** | #18 |
+| 6 | Make `torch_neuronx`'s op overrides fake-tensor safe | `torch_neuronx` | small per op | Root-caused, reproducer included | #23 |
+| 7 | Scope caching the per-call XLA computation build | NKI / torch-neuronx | unknown | Attributed, not attempted | #24 |
+
+Fixes 1 and 4 are asks to HuggingFace (raise with Samir). Fixes 2 and 6 are internal to Neuron.
+Fixes 0, 3, 5 and 7 go to the NKI / nki-library teams.
+
+**Fix 0 is the highest value in this document and is not specific to the Kernel Hub.** Any code
+invoking NKI kernels per-layer from eager PyTorch is paying ~52 ms per call today.
+
+---
+
+## Fix 0 — Cache `_detect_target()`; it forks `neuron-ls` on every kernel invocation [HIGHEST VALUE, ONE DECORATOR]
+
+### The problem
+
+`nki/framework/compiled.py::_compile_opts()` resolves the hardware target on **every** kernel
+invocation:
+
+```python
+# nki/framework/compiled.py:91
+def _compile_opts(self):
+    opts = CompileOptions(
+        target=resolve_target(self.func, self.target),   # <-- every call
+        lnc=self.lnc,
+        ...
+```
+
+With `NEURON_PLATFORM_TARGET_OVERRIDE` unset and no explicit target, `resolve_target()` falls
+through to:
+
+```python
+# nki/compiler/target.py:111
+def _detect_target() -> str:
+    """Detect hardware target from neuron-ls, falling back to latest (trn3)."""
+    import shutil
+    import subprocess
+
+    if shutil.which("neuron-ls") is None:
+        return "trn3"
+    try:
+        out = subprocess.check_output(
+            ["neuron-ls"], text=True, timeout=10, stderr=subprocess.PIPE
+        )
+        ...
+```
+
+It forks a process and runs `neuron-ls` to ask the hardware what it is. **That costs ~52 ms, and it
+happens on every call.**
+
+### Why the existing compile cache does not help
+
+`compiled.py` does maintain a cache:
+
+```python
+if not get_binary_env_var("NKI_DISABLE_COMPILE_CACHE") and not hasattr(
+    self.func, "_nki_compile_cache"
+):
+    self.func._nki_compile_cache = {}
+```
+
+But `CompileOptions` is what identifies a compiled kernel, so target resolution runs while
+*constructing the cache key*. A cache **hit** still pays the subprocess in full. The compile is
+cached; the decision about what to compile for is not.
+
+### The patch
+
+```python
+# nki/compiler/target.py
+import functools
+
+@functools.lru_cache(maxsize=1)
+def _detect_target() -> str:
+    ...   # body unchanged
+```
+
+Hardware does not change during a process lifetime, so `maxsize=1` is sufficient. `resolve_target()`
+still checks `NEURON_PLATFORM_TARGET_OVERRIDE` and the explicit-target argument first, so
+precedence is unchanged and the env var remains live-togglable.
+
+### Verification status: **measured, both fixes, with controls**
+
+`scripts/probe_target_override_fix.py`. 28 chained NKI calls, median of 3, steady state, baseline
+re-run last as a control, accuracy asserted on every variant:
+
+| variant | per call | speedup | cos_sim |
+|---------|----------|---------|---------|
+| baseline (no override) | 51.74 ms | — | 0.999938 |
+| `NEURON_PLATFORM_TARGET_OVERRIDE=trn2` | 0.50 ms | **102.8x** | 0.999938 |
+| `lru_cache(_detect_target)` | 0.49 ms | **105.5x** | 0.999938 |
+| baseline again (control) | 51.43 ms | — | 0.999938 |
+
+Model level, `scripts/measure_mfu.py --fix-target-detection`, Qwen3-0.6B seq 512:
+
+| | step time | MFU |
+|---|---|---|
+| baseline (no kernels) | 42.04 ms | 5.05% |
+| kernelized, before fix | 8753.65 ms | 0.02% |
+| kernelized, after fix | 141.43 ms | 1.50% |
+
+Accuracy is identical to six decimal places across all variants, so the fix does not change what
+gets compiled. The override in the test is set to whatever `_detect_target()` returns on the host
+rather than a hardcoded string, since a wrong target would compile for the wrong hardware and could
+be silently wrong rather than an error.
+
+### Interim workaround (available to customers today)
+
+```bash
+export NEURON_PLATFORM_TARGET_OVERRIDE=trn2   # must match the actual hardware
+```
+
+Worth confirming with the NKI team whether this is a supported customer-facing setting or internal
+only, before it goes in any documentation.
+
+### What to do
+
+1. File against NKI with `scripts/probe_target_override_fix.py` as the reproducer.
+2. Ask whether Fix 7 (the residual ~0.59 ms/call in `create_computation`) is similarly cacheable —
+   same class of problem, and it is what stands between this integration and parity.
+3. Ask whether `_detect_target`'s fallback is right in the first place: on a host with no
+   `neuron-ls` it silently returns `"trn3"`, which would compile for the wrong generation rather
+   than fail loudly.
+
+---
+
+## Fix 1 — Route XLA-on-Neuron to the `"neuron"` device [HIGHEST VALUE]
+
+### The problem
+
+`use_kernels=True` never selects a `"neuron"` mapping entry. It fails as a **silent no-op**:
+`kernelize()` returns successfully, every layer keeps its original forward, and nothing is
+logged.
+
+Two independent causes:
+
+1. transformers' `kernelize(model, mode)` has no `device` parameter. It derives the device
+   solely from `model.device.type`.
+2. Neuron never reports `"neuron"`. Params on the host give `"cpu"`; moved to the device
+   they give `"xla"`. Nothing maps `"xla"` → `"neuron"`.
+
+And the no-op is invisible because transformers passes a `Device` **object**, while
+`kernels.kernelize` only validates device types given as **strings**:
+
+```python
+# kernels/layer/kernelize.py
+if device is None:            device_type = _find_device(model)
+elif isinstance(device, str): _validate_device_type(device); device_type = Device(type=device)
+else:                         device_type = Device(device.type)      # <- unvalidated
+```
+
+So `Device(type="xla")` passes straight through and matches nothing. (Calling the kernels
+library directly with the *string* `device="xla"` does raise
+`Unsupported device type 'xla'` — which is how we first mis-diagnosed this.)
+
+### Where it goes
+
+We initially proposed patching `kernels._find_device`. **That would not have worked** — the
+transformers wrapper computes the device itself and never calls `_find_device` on this path.
+Our e2e test caught it. Three sites need the same treatment:
+
+**Site A (required — the `use_kernels=True` path)**
+`transformers/integrations/hub_kernels.py::kernelize`
+
+```python
+     device_type = model.device.type
+     if device_type == "cuda" and is_rocm_platform():
+         device_type = "rocm"
++    elif device_type == "xla" and _is_neuron_xla():
++        device_type = "neuron"
+     device = Device(type=device_type)
+```
+
+**Site B (required — the `KernelConfig` path)**
+`transformers/utils/kernel_config.py::infer_device` — same `param.device.type` logic with a
+cuda/rocm refinement and no xla handling.
+
+```python
+     dev_type = param.device.type
+     if dev_type == "cuda":
+         ...
++    elif dev_type == "xla" and _is_neuron_xla():
++        return "neuron"
+     return dev_type
+```
+
+**Site C (recommended — direct kernels-library callers)**
+`kernels/layer/kernelize.py::_find_device`, used when `kernelize(model)` is called with no
+device.
+
+```python
+     dev_type = param.device.type
+     if dev_type == "cuda":
+         ...
++    elif dev_type == "xla" and _is_neuron_xla():
++        return Device(type="neuron")
+     return Device(type=dev_type)
+```
+
+**The shared helper**, needed in transformers and in kernels:
+
+```python
+def _is_neuron_xla() -> bool:
+    try:
+        import torch_xla.core.xla_model as xm
+        return xm.xla_device_hw(xm.xla_device()) == "NEURON"
+    except Exception:
+        return False
+```
+
+Verified on trn2: `xm.xla_device_hw(xm.xla_device())` returns exactly `"NEURON"`. Reliable,
+no new dependency, and it fails closed.
+
+### Also needed: the mapping entries
+
+Site A alone routes correctly but finds nothing to load until `"neuron"` entries exist.
+`"rotary_pos_emb"` already has `cuda` / `rocm` / `xpu` siblings, so this is an addition, not
+a restructure. In `transformers/integrations/hub_kernels.py::_build_kernel_mapping`:
+
+```python
+     _KERNEL_MAPPING = {
+         ...
++        "RMSNorm": {
++            "neuron": LayerRepository(
++                repo_id="<aws-neuron|kernels-community>/rmsnorm",
++                layer_name="NeuronRMSNorm", version=1,
++            )
++        },
++        "SiLU": {
++            "neuron": LayerRepository(
++                repo_id="<...>/silu", layer_name="NeuronSiLU", version=1,
++            )
++        },
+     }
+
+     _FUNCTION_KERNEL_MAPPING = {
+         "rotary_pos_emb": {
+             "cuda": FuncRepository(...), "rocm": {...}, "xpu": {...},
++            "neuron": FuncRepository(
++                repo_id="<...>/rope",
++                func_name="apply_rotary_pos_emb", version=1,
++            ),
+         },
+     }
+```
+
+`repo_id` is blocked on the Hub repo-home decision (Samir).
+
+### Verification status: **demonstrated sufficient**
+
+`enable_neuron_device_detection()` in `scripts/neuron_kernel_registration.py` applies the
+Site A patch in-process (it substitutes a faithful copy of the transformers wrapper with the
+one branch added — nothing on disk is modified). `tests/test_qwen3_neuron_e2e.py` test 2
+then drives the *transformers* entry point:
+
+| | RMSNorm layers swapped | logits cos_sim |
+|---|---|---|
+| stock | **0** | — |
+| with the patch | **9** | 1.000001 |
+
+So this is not a hypothesis. Lead with it when filing.
+
+### What to do
+
+1. Open a transformers issue with the reproduction from
+   `scripts/probe_neuron_device_path.py` (prints the device resolution at each step).
+2. Offer the patch for Sites A and B plus the mapping entries, once `repo_id` is settled.
+3. Open a companion `kernels` issue for Site C.
+4. Raise with Samir first — he can say whether HF wants the helper in `kernels` and imported
+   by transformers, rather than duplicated.
+
+### Interim workaround (in use now)
+
+`kernelize_for_neuron(model)` in `scripts/neuron_kernel_registration.py`: calls the kernels
+library directly with `device="neuron"` and replicates the `_hidden_kernels` attach/detach
+that function kernels require.
+
+---
+
+## Fix 2 — Make `_backend()` report `neuron` on Neuron hosts
+
+### The problem
+
+```
+kernels.utils._backend()  ->  CUDA(version=Version('12.8'))
+```
+
+on a Neuron DLAMI, because the root check is:
+
+```python
+# kernels/backends.py:198
+if hasattr(torch, "neuron"):
+```
+
+and `hasattr(torch, "neuron")` is **False even after `import torch_neuronx`**.
+
+### Why it matters twice
+
+One root cause, two independent breakages:
+
+**(a) Build-variant resolution (#7).** A Hub repo containing
+`build/torch29-neuron-x86_64-linux/` won't resolve — the loader looks for a CUDA variant.
+Our flat layout works only because variant resolution failing falls back to importing the
+repo root. Multi-backend repos (CUDA + Neuron in one package) are impossible until this is
+fixed.
+
+**(b) `python-depends` validation (#12).** `kernels/python_depends.json` **already
+whitelists `nki` under a `neuron` backend section** — HF anticipated NKI kernels. But
+`validate_dependencies()` consults the table for whatever `_backend()` reports, so the neuron
+table is never read. Verified against a real copy of our RoPE kernel:
+
+| `python-depends` | Result |
+|---|---|
+| `[]` | loads |
+| `["nki"]` | `ValueError: unsupported kernel dependency: nki` |
+
+**So a Neuron kernel must under-declare its own dependency in order to load at all.** Ours
+ship `python-depends: []` while importing `nki`. That works only because the DLAMI happens to
+have NKI preinstalled; elsewhere the user gets a bare `ImportError` instead of the intended
+`"requires Python dependency nki. Please install with: pip install nki"`.
+
+### The fix
+
+`torch_neuronx` should set a `torch.neuron` attribute at import time, so `hasattr` succeeds.
+One line in Neuron's own code — no HF change required, which makes it the cheapest item on
+this list.
+
+**Important:** this does **not** fix Fix 1. It changes neither the transformers device
+computation nor `_find_device`'s return value. Two distinct problems; don't let them get
+conflated into one ticket.
+
+### What to do
+
+1. Confirm with the `torch_neuronx` owners that setting `torch.neuron` is acceptable and what
+   it should hold (a bool, a module, a version — HF only checks presence).
+2. File against `torch_neuronx` referencing `kernels/backends.py:198` and
+   `kernels/layer/kernelize.py:307` (`_has_neuron_ops`).
+3. Reproduction: `scripts/probe_hub_packaging.py` (prints `_backend()` and the
+   `python-depends` failure).
+4. Once landed, change our kernels' `metadata.json` to `"python-depends": ["nki"]` and
+   re-run `make probe` to confirm.
+
+---
+
+## Fix 3 — Resolve the `nki` / `neuronxcc.nki` capability split
+
+### The problem
+
+Both import successfully. Neither is a superset. A kernel is pinned to whichever supports its
+idiom, discovered only at compile time.
+
+| Idiom | top-level `nki` | `neuronxcc.nki` |
+|---|---|---|
+| `nl.arange` index tensors + `mask=` | **fails**: `error: failed to resolve name 'nki.language.arange'` | works |
+| `//` on tensor shape values | works (shapes are plain ints) | **fails**: `NotImplementedError: math.trunc() is not supported for scalar` |
+
+Consequence in this repo, verified by swapping imports and re-running both suites:
+
+| Kernel | Idiom | Required package |
+|--------|-------|------------------|
+| `neuron_rmsnorm` | `nl.arange` + mask | `neuronxcc.nki` |
+| `neuron_silu` | `nl.arange` + mask | `neuronxcc.nki` |
+| `neuron_rope` | slicing + `div_ceil` | top-level `nki` |
+
+We genuinely need both packages in one repository.
+
+The nastier part: `hasattr(nl, "arange")` returns **True** under the package where it cannot
+be resolved. There is no import-time feature detection, and the error text never hints that
+the sibling package would work. nki-library source uses top-level `nki` while the public
+tutorials use `neuronxcc.nki`, so anyone porting at scale meets this immediately.
+
+### What to do
+
+This is a question, not a patch. Ask the NKI team:
+
+1. Which package is the supported long-term surface for kernel authors?
+2. Are the capability gaps intentional (deliberate API narrowing) or drift?
+3. If top-level `nki` is the future, can `nl.arange` be made to resolve there? If
+   `neuronxcc.nki` is, can shape values support integer division?
+4. In the meantime, can they publish a compatibility table? The table above is a start.
+
+Lower urgency than 1, 2, and 4 — it's a productivity tax on kernel authors, not a blocker on
+the customer experience. But it will bite any mass-porting effort on day one.
+
+---
+
+## Fix 4 — Add `nkilib` to the `python-depends` allowlist
+
+### Why this is worth asking for
+
+`nkilib` is **already installed** in the Neuron venv
+(`/opt/.../site-packages/nkilib/`), and its production kernels are **directly callable from
+PyTorch/XLA with correct results**. Verified against the installed `rope_hf` — the same
+kernel we hand-ported:
+
+| Calling strategy | Result |
+|---|---|
+| pass preallocated `q_out`/`k_out`, read the **return value** | **q cos_sim 1.000001, k cos_sim 1.000000** |
+| pass preallocated outputs, read the **mutated arguments** | cos_sim **0.000000** — never written |
+
+(Destination-passing is vestigial across the XLA boundary: outputs act as shape/dtype
+templates, results come back via the return value. nki-library's own tests use
+`must_alias_input`, which points a reader at the second strategy and silently gives zeros —
+worth reporting to the nki-library team separately.)
+
+So a thin-wrapper HF kernel works today:
+
+```python
+class NeuronRoPE(nn.Module):
+    def forward(self, q, k, cos, sin, unsqueeze_dim=1):
+        q_out, k_out = torch.empty_like(q), torch.empty_like(k)
+        return rope_hf(q, k, q_out, k_out, cos=cos, sin=sin)   # no vendoring
+```
+
+**The blocker is policy, not code.** And the scale argument is decisive: RoPE needed ~15
+lines inlined; the MLP kernel's dependency closure is **7,249 lines across 22 files**
+(~480x). Hand-porting does not reach the kernels that matter for performance.
+
+### The patch
+
+`kernels/python_depends.json` — `nki` is already there as precedent, so this copies its shape:
+
+```json
+     "neuron": {
+       "nki": {
+         "nix": [],
+         "python": [{ "pkg": "nki", "import": "nki" }]
+       },
++      "nkilib": {
++        "nix": [],
++        "python": [{ "pkg": "nki-library", "import": "nkilib" }]
++      }
+     },
+```
+
+Note the pip package is `nki-library`, the import name is `nkilib`.
+
+Requires Fix 2 to be useful — otherwise the neuron table still isn't consulted.
+
+### The tradeoff to state honestly
+
+A thin wrapper couples the HF kernel repo to both `nkilib` and `neuronx-cc` versions.
+nki-library's README explicitly warns that GitHub `main` is not guaranteed compatible with a
+given compiler version. Vendored kernels don't carry that coupling. Version coupling is more
+tractable than maintaining hand-ports of 7,000-line kernels, but it is a real cost — don't
+present this as free.
+
+### What to do
+
+1. Raise with Samir alongside Fix 1 — same team, same file area.
+2. Bring the numbers: 15 lines vs 7,249, and the verified `cos_sim 1.000001`.
+3. Ask how HF wants version coupling handled (pin in `python-depends`? a floor? nothing?).
+4. Reproduction: `scripts/probe_nkilib_bundled.py` and
+   `scripts/experiment_nkilib_thin_wrapper.py`.
+
+---
+
+## Fix 5 — Fused MLP divides by zero single-core above `intermediate_size = 4096`
+
+### The problem
+
+`nkilib.core.mlp.mlp` fails to compile when launched single-core with
+`intermediate_size > 4096`. Sharp boundary, measured across 10 configurations spanning three
+`hidden_size` values: **passes iff `I <= 4096`**. I=4096 passes; I=4224 fails.
+
+```
+error: 'floordiv' does not allow division by zero
+  nkilib/core/utils/kernel_helpers.py:104   (numerator + denominator - 1) // denominator
+  nkilib/core/utils/tile_info.py:37         get_ceil_quotient(tiled_dim_size, tile_size)
+  nkilib/core/mlp/mlp_cte/mlp_cte_tile_info.py:236
+                                            build_with_subtiling(bxs_dim_size, ..., bxs_dim_subtile_size)
+  nkilib/core/mlp/mlp.py:340                mlp_cte(mlp_params, out, fused_add_out)
+```
+
+Not affected by sequence length (tested S=128/256/512), `force_cte_mode=True`, or
+`mode=PREFILL`.
+
+Likely cause: the CTE sharding heuristic in `mlp_cte_sharding.py` forces
+`shard_on_inter = True` when `intermediate_size > 4096` — exactly our boundary — and with no
+SPMD launch grid the inter-sharding path derives a zero subtile size.
+
+### Why it matters
+
+Every realistic model is excluded: Qwen3-8B (I=12288), Llama-3-8B and Mistral-7B (I=14336).
+Only Qwen3-0.6B-scale configs work. And unlike Finding #17, **a wrapper cannot work around
+this** — it's the kernel's own tile arithmetic.
+
+Nothing documents an `I <= 4096` single-core limit. The documented constraint is
+`H % 128 == 0`, which I=12288 satisfies.
+
+### What to do
+
+1. **File against nki-library** with the boundary table from
+   `scripts/spike_nkilib_mlp.py` (Q4 section reproduces it in ~2 minutes).
+2. Ask the two questions that determine whether the fused MLP is viable for HF at all:
+   - Is single-core operation above `I = 4096` intended to work? If yes, this is a bug in the
+     subtile computation.
+   - If no, can the constraint be asserted explicitly (via `kernel_assert`, like the other
+     documented constraints) rather than failing inside tile math with a divide-by-zero?
+3. **Separately, ask whether an SPMD launch fixes it.** If the kernel works multi-core at
+   I=12288, the real question becomes whether an HF per-layer forward swap can legitimately
+   launch SPMD. That is an architecture question for the HF kernels team and a more
+   interesting one than the weight layout. We did not attempt it — it needs a launch-grid
+   setup outside the per-layer swap model.
+
+### Broader implication worth raising in the same conversation
+
+Week 2 listed "SPMD multi-core assumptions don't fit the per-layer swap model" as a general
+concern. This is that concern with a measured boundary. For RoPE, stripping SPMD was a clean
+and harmless reduction (`num_shards = 1`). For the fused MLP it is not optional — the tiling
+requires the multi-core path at any useful size.
+
+So **SPMD-strippability is per-kernel, and for fused kernels it may not hold at all.** That is
+a structural point about whether the Kernel Hub's one-layer-one-core model can host
+nki-library's fused kernels, and it belongs in the Week 6 recommendation independent of how
+#17 and #18 are resolved.
+
+---
+
+## Not a fix: Finding #17 (weight layout) is a design decision
+
+See `docs/poc-findings.md` #17 for the full analysis. Summarised here because it will come up
+in the same conversations, and because it is the one item where **we should not propose a
+patch** — we should ask a question.
+
+Fused kernels want weights in a different layout than `nn.Linear` provides, and `kernelize()`
+has no parameter-transformation hook. All three HF MLP weights are transposed relative to
+`nkilib.core.mlp.mlp`.
+
+**Note the correction in `docs/poc-findings.md` #17 before quoting this.** We originally said
+non-contiguous views are rejected and the transpose must be materialized. Measured: the kernel
+*accepts* a device-side `.t()` result and is numerically correct, and `is_contiguous()` returns
+True on XLA even after `.t()` — XLA normalizes layout, so `.t()` is a real graph op rather than
+a stride view. The memory cost and the missing hook both stand; whether per-forward transposing
+is expensive depends on whether XLA hoists it, which we have not profiled.
+
+What remains solid: in-place mutation silently breaks `save_pretrained` round-tripping
+(layout-independent), and there is nowhere in the API for a one-time weight transform to live.
+
+The two questions to put to the HF kernels team:
+
+1. Should `kernels` gain a weight-transformation hook — something like
+   `prepare_weights(module)` called once at kernelize time — with a defined contract about
+   whether `state_dict()` reflects original or kernel layout?
+2. Or is the intended pattern that backend kernels accept framework-native layouts and
+   absorb the transpose internally? That's a request to nki-library rather than HF, and is
+   arguably the cleaner division of responsibility since the kernel already knows its tiling.
+
+This blocks *every* fused-kernel port on Neuron, not just the MLP, so it gates Week 5 MoE
+work. It needs an answer before any fusion-API implementation starts.
+
+---
+
+## Filing order
+
+1. **Fix 1** (transformers) — biggest customer impact, and we have a verified patch plus a
+   working demo. Strongest thing to lead with.
+2. **Fix 2** (`torch_neuronx`) — cheapest, entirely within Neuron's control, unblocks two
+   things at once.
+3. **Fix 5** (nki-library) — a concrete bug with a measured boundary, and it *gates* the
+   fused-MLP work outright. Promoted above the #17 question because #17 is moot until #5 is
+   resolved: there is no point designing a weight-transformation contract for a kernel that
+   cannot compile at any useful size.
+4. **Finding #17 question** — still needed before Week 5 MoE work, but sequence it after #5.
+5. **Fix 4** (`nkilib` allowlist) — changes the shape of the whole program, but only becomes
+   useful after Fix 2.
+6. **Fix 3** (import-path split) — real, but a productivity tax rather than a customer blocker.
+
+Bundle 3 and 5 into one nki-library conversation — both are questions for the same team, and
+the SPMD-strippability point connects them.

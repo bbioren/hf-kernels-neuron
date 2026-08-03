@@ -1,0 +1,32 @@
+2026-Aug-03 18:46:20.0631 111442:111478 [0] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):273 CCOM WARN NET/OFI Failed to initialize rdma protocol
+2026-Aug-03 18:46:20.0634 111442:111478 [0] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):416 CCOM WARN NET/OFI aws-ofi-nccl initialization failed
+2026-Aug-03 18:46:20.0636 111442:111478 [0] ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t):78 CCOM WARN NET/OFI Initializing plugin failed
+2026-Aug-03 18:46:20.0639 111442:111478 [0] net_plugin.cc:104 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+impl=torch calls=28  H=1024 I=3072 S=512 B=1 bfloat16
+  weight sets: 28 (one per block, realistic)
+  weights per block: 18.9 MB; total 528 MB
+  inspect dir: /home/ubuntu/hf-kernels-neuron/results/raw/prof_mlp_torch
+  I<=4096 so Finding #18's compile limit does not apply (its own data: H=1024/I=3072 passes at cos_sim 0.999995)
+2026-08-03 18:46:20.000968:  111442  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_15043425248861246014+fad94d7c/model.neff
+  correctness (1 block vs CPU fp32): cos_sim = 0.999979
+2026-08-03 18:46:22.000463:  111442  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_5049536656319722289+fad94d7c/model.neff
+  iter 0: wall   1743.64 ms  ( 62.273 ms/block)  (compile)
+  iter 1: wall      7.22 ms  (  0.258 ms/block)
+  iter 2: wall      6.05 ms  (  0.216 ms/block)
+  iter 3: wall      6.18 ms  (  0.221 ms/block)
+
+  FLOPs per block: 9.66 GFLOP  (28 blocks = 270.6 GFLOP)
+
+  artifacts:
+    NEFF neff_38954112263972_vnc_0.neff  (107 KiB)
+    NEFF neff_67377513603250_vnc_0.neff  (2106 KiB)
+    NTFF 38954112263972_vnc_0.ntff  (682 KiB)
+    NTFF 67377513603250_vnc_0.ntff  (26743 KiB)
+
+----- stderr -----
+/home/ubuntu/hf-kernels-neuron/scripts/profile_fused_mlp_vs_torch.py:102: DeprecationWarning: Use torch_xla.device instead
+  dev = xm.xla_device()
+/home/ubuntu/hf-kernels-neuron/scripts/profile_fused_mlp_vs_torch.py:168: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/profile_fused_mlp_vs_torch.py:189: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()

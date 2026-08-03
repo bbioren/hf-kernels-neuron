@@ -1,4 +1,32 @@
-"""Accuracy test: NeuronRMSNorm vs Qwen3RMSNorm.
+"""DO NOT TRUST THIS TEST'S RESULTS. Superseded by tests/test_rmsnorm_nki.py.
+
+=============================================================================
+WARNING (added 2026-07-29, Week 3): this test never executes the NKI kernel.
+=============================================================================
+
+It builds inputs with `torch.randn(...)`, which produces CPU tensors.
+`NeuronRMSNorm.forward` gates the kernel on `device.type != "cpu"`, so every
+case here takes the PyTorch fallback instead — and `_pytorch_rmsnorm` is
+mathematically identical to `Qwen3RMSNorm.forward`, so it compares the fallback
+against itself and reports `cos_sim = 1.000000, max_diff = 0.00e+00`.
+
+That perfect score was the bug, not the result. `@nki.jit` requires XLA tensors
+and hard-errors on CPU ones, so NKI could not have run here.
+
+The line below is also misleading: it prints "Backend: NKI kernel (NeuronCores)"
+based on `_HAS_NKI` — whether NKI is *importable* — not whether it executed.
+
+The kernel itself turned out to be correct; see `tests/test_rmsnorm_nki.py`,
+which runs on the XLA device and asserts execution via a call counter
+(11/11 pass, max_diff ~1e-4 to 3e-4 on fp32).
+
+This file is retained deliberately as the documented example of the silent
+fallback failure mode. See `docs/poc-findings.md` Finding #8.
+=============================================================================
+
+Original docstring follows.
+
+Accuracy test: NeuronRMSNorm vs Qwen3RMSNorm.
 
 Validates that our NKI kernel produces the same output as the reference
 Qwen3RMSNorm implementation. Target: cosine similarity > 0.999.

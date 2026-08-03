@@ -1,0 +1,25 @@
+2026-Aug-03 18:55:05.0044 116207:116243 [0] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):273 CCOM WARN NET/OFI Failed to initialize rdma protocol
+2026-Aug-03 18:55:05.0047 116207:116243 [0] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):416 CCOM WARN NET/OFI aws-ofi-nccl initialization failed
+2026-Aug-03 18:55:05.0049 116207:116243 [0] ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t):78 CCOM WARN NET/OFI Initializing plugin failed
+2026-Aug-03 18:55:05.0051 116207:116243 [0] net_plugin.cc:104 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+mode=baseline seq=512 batch=1 layers=28
+  inspect dir: /home/ubuntu/hf-kernels-neuron/results/raw/prof_model_baseline
+  NEURON_CC_FLAGS=(unset — compiler defaults)
+2026-08-03 18:55:28.000065:  116207  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_1687893610067250061+fad94d7c/model.neff
+  iter 0: wall   2752.02 ms  (compile)
+  iter 1: wall     54.78 ms
+  iter 2: wall     54.00 ms
+  iter 3: wall     55.23 ms
+
+  steady-state wall [54.0, 54.783, 55.232] ms, median 54.783 ms -> wall_times.json
+
+  1 NEFF(s), 1 NTFF(s) written under /home/ubuntu/hf-kernels-neuron/results/raw/prof_model_baseline
+  (a full model emits several; device time must be SUMMED across them)
+    neff_815801247337692_vnc_0.neff  (4186 KiB)
+
+----- stderr -----
+/home/ubuntu/hf-kernels-neuron/scripts/profile_model_device_time.py:93: DeprecationWarning: Use torch_xla.device instead
+  dev = xm.xla_device()
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+/home/ubuntu/hf-kernels-neuron/scripts/profile_model_device_time.py:122: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()

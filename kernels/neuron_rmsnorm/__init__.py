@@ -8,31 +8,45 @@ Single-file kernel following the transformers PR #46754 pattern:
   - `class layers:` namespace for the Hub loader
 """
 
-import math
-
 import torch
 import torch.nn as nn
 
-# Conditional NKI import — allows testing off-device
+# NKI 0.5.0 (top-level `nki`) is the going-forward surface. The older API bundled inside
+# neuronx-cc (`neuronxcc.nki`) is kept only as a fallback for environments that lack the
+# standalone package.
+#
+# This kernel was originally written against the older API using `nl.arange` index tensors
+# plus `mask=` for ragged tails. Both are gone in 0.5.0: `nl.arange` was removed in favour of
+# `nl.ds` slicing, and `nl.load`/`nl.store` no longer accept `mask`. See Finding #14.
 _HAS_NKI = False
 try:
-    import neuronxcc.nki as nki
-    import neuronxcc.nki.language as nl
+    import nki
+    import nki.language as nl
 
     _HAS_NKI = True
 except ImportError:
-    pass
+    try:
+        import neuronxcc.nki as nki
+        import neuronxcc.nki.language as nl
+
+        _HAS_NKI = True
+    except ImportError:
+        pass
+
+
+# Partition-dimension tile height.
+PARTITION_MAX = 128
 
 
 if _HAS_NKI:
 
     @nki.jit
     def _nki_rmsnorm_kernel(a_tensor, g_tensor, eps_value):
-        """NKI RMSNorm kernel: out = (a / RMS(a)) * g
+        """RMSNorm: out = (a / RMS(a)) * g
 
-        Ported from nki_samples tutorial. Processes 128 rows at a time
-        (partition dimension), applies RMSNorm along the free dimension,
-        and multiplies by the weight vector g.
+        Tiles over rows in the partition dimension and normalizes along the free
+        dimension. Because `nl.load` has no `mask` in NKI 0.5.0, the ragged tail is a
+        separate static-size `nl.ds` tile rather than a masked full-height one.
 
         Args:
             a_tensor: 2D input [rows, hidden_size]
@@ -41,44 +55,46 @@ if _HAS_NKI:
         """
         out_tensor = nl.ndarray(a_tensor.shape, dtype=a_tensor.dtype, buffer=nl.shared_hbm)
 
-        # Tile indices
-        ix = nl.arange(128)[:, None]
-        iw = nl.arange(1)[:, None]
-        iy = nl.arange(a_tensor.shape[1])[None, :]
+        num_rows, num_cols = a_tensor.shape
 
-        num_rows = a_tensor.shape[0]
+        # Load the weight once; reused across every row tile.
+        g_tile = nl.load(g_tensor.reshape((1, num_cols)))
 
-        # Load weight once (shared across all row tiles)
-        g_tile = nl.load(g_tensor.reshape((1, g_tensor.shape[0]))[iw, iy])
+        num_full = num_rows // PARTITION_MAX
+        rem = num_rows % PARTITION_MAX
 
-        # Process 128 rows per iteration
-        for i in nl.affine_range(math.ceil(a_tensor.shape[0] / 128)):
-            # Load input tile
-            a_tile = nl.load(
-                a_tensor[i * 128 + ix, iy], mask=(i * 128 + ix < num_rows)
-            )
-
-            # RMS computation: sqrt(mean(x^2) + eps)
-            in_square = nl.square(a_tile)
-            square_sum = nl.sum(in_square, axis=[1])
-            mean = square_sum / a_tensor.shape[1]
-            mean_plus_eps = nl.add(mean, eps_value)
-            rms_reciprocal = nl.rsqrt(mean_plus_eps)
-
-            # Normalize: x / RMS(x)
-            out_tile = nl.multiply(a_tile, rms_reciprocal)
-
-            # Multiply by weight (broadcast along partition axis)
-            g_bcast = g_tile.broadcast_to((128, g_tensor.shape[0]))
-            out_tile[...] = nl.multiply(
-                out_tile, g_bcast, mask=(i * 128 + ix < num_rows)
-            )
-
-            # Store result
+        # NKI rejects inner function definitions inside a kernel, so the tile body is
+        # inlined in both branches rather than factored out.
+        # The reduction and reciprocal are computed in float32, for two reasons:
+        #   1. Required. `nisa.tensor_scalar_arith` rejects a bf16 per-partition operand
+        #      ("operand0 must be float32"), which is what the [rows, 1] reciprocal is.
+        #   2. Correct. PyTorch's RMSNorm upcasts to float32 for the variance and casts
+        #      back at the end, so this matches the reference more closely than computing
+        #      the reduction in the input dtype did.
+        for i in nl.affine_range(num_full):
+            start = i * PARTITION_MAX
+            a_tile = nl.load(a_tensor[nl.ds(start, PARTITION_MAX), :])
+            mean_sq = nl.mean(nl.square(a_tile, dtype=nl.float32),
+                              axis=[1], keepdims=True, dtype=nl.float32)
+            rms_recip = nl.rsqrt(nl.add(mean_sq, eps_value))
+            normed = nl.multiply(a_tile, rms_recip)
+            g_b = nl.broadcast_to(g_tile, (PARTITION_MAX, num_cols))
             nl.store(
-                out_tensor[i * 128 + ix, iy],
-                value=out_tile,
-                mask=(i * 128 + ix < num_rows),
+                out_tensor[nl.ds(start, PARTITION_MAX), :],
+                value=nl.multiply(normed, g_b, dtype=a_tensor.dtype),
+            )
+
+        if rem > 0:
+            start = num_full * PARTITION_MAX
+            a_tile = nl.load(a_tensor[nl.ds(start, rem), :])
+            mean_sq = nl.mean(nl.square(a_tile, dtype=nl.float32),
+                              axis=[1], keepdims=True, dtype=nl.float32)
+            rms_recip = nl.rsqrt(nl.add(mean_sq, eps_value))
+            normed = nl.multiply(a_tile, rms_recip)
+            g_b = nl.broadcast_to(g_tile, (rem, num_cols))
+            nl.store(
+                out_tensor[nl.ds(start, rem), :],
+                value=nl.multiply(normed, g_b, dtype=a_tensor.dtype),
             )
 
         return out_tensor
@@ -91,6 +107,41 @@ def _pytorch_rmsnorm(hidden_states, weight, eps):
     variance = hidden_states.pow(2).mean(-1, keepdim=True)
     hidden_states = hidden_states * torch.rsqrt(variance + eps)
     return weight * hidden_states.to(input_dtype)
+
+
+_warned: set[str] = set()
+
+
+def _warn_once(reason: str) -> None:
+    """Announce a fallback instead of taking it silently.
+
+    This kernel is the reason Finding #8 exists: it fell back on CPU tensors with no
+    signal of any kind, and an entire accuracy suite passed while never executing NKI.
+    Correct-but-unaccelerated is the failure mode that costs the most time, precisely
+    because nothing looks wrong. So say so, once, with the reason.
+    """
+    import warnings
+
+    if reason not in _warned:
+        _warned.add(reason)
+        warnings.warn(
+            f"neuron_rmsnorm: falling back to eager PyTorch RMSNorm ({reason}). "
+            "The NKI kernel is NOT being used.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+
+def _nki_unsupported_reason(hidden_states: torch.Tensor):
+    """Return None if the NKI kernel can run, else the reason it cannot."""
+    if not _HAS_NKI:
+        return "NKI unavailable"
+    # @nki.jit hard-errors on CPU tensors, so this guard is mandatory.
+    if hidden_states.device.type == "cpu":
+        return "input on CPU; NKI requires XLA/Neuron tensors"
+    if hidden_states.numel() == 0:
+        return "empty tensor"
+    return None
 
 
 class NeuronRMSNorm(nn.Module):
@@ -115,13 +166,15 @@ class NeuronRMSNorm(nn.Module):
         # Flatten to 2D: [batch * seq_len, hidden_size]
         hidden_2d = hidden_states.reshape(-1, hidden_states.shape[-1])
 
-        if _HAS_NKI and hidden_states.device.type != "cpu":
+        reason = _nki_unsupported_reason(hidden_states)
+        if reason is None:
             # Run NKI kernel on NeuronCores
             output_2d = _nki_rmsnorm_kernel(
                 hidden_2d, self.weight, self.variance_epsilon
             )
         else:
-            # PyTorch fallback (CPU or no NKI available)
+            # PyTorch fallback — announced, never silent. See Finding #8.
+            _warn_once(reason)
             output_2d = _pytorch_rmsnorm(
                 hidden_2d, self.weight, self.variance_epsilon
             )

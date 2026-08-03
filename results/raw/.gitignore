@@ -1,0 +1,29 @@
+# Device-profile binaries are NOT committed. They are large and regenerable.
+#
+# Sizes from one full `make results` run:
+#   NTFF traces   ~360 MB  (largest single trace 209 MB)
+#   NEFF binaries  ~10 MB
+#   logs + JSON     1.6 MB   <- this is what gets committed
+#
+# The auditable artifact is results/raw/extract-device-metrics/device_metrics.json: every
+# device-time claim in this project is extracted from the NTFF traces into that file by
+# scripts/summarise_device_profiles.py --json-out. It is a few KB and carries total_time, MBU,
+# active %, HBM bytes and instruction counts per profile — which is all the numbers rest on.
+#
+# Regenerate the binaries with `make results` if you need to re-derive metrics or inspect a trace.
+*.ntff
+*.neff
+*.pb
+
+# LOAD-BEARING NEGATION — do not remove.
+#
+# The repo root .gitignore has a blanket `*.log`, which is right for stray logs and wrong here:
+# each stage's stdout.log IS the artifact. Ten measurements in results/measurements.json name a
+# stdout.log as the file backing their number, and without this line all ten would be recorded as
+# committed while being invisible to anyone who cloned the repo — the same failure as writing
+# artifacts to /tmp, one layer further down.
+#
+# This was not caught by inspection. It was caught by scripts/check_measurement_provenance.py,
+# which now verifies that an artifact is not git-ignored rather than only that it exists on disk.
+# Removing this line will fail that check.
+!*.log

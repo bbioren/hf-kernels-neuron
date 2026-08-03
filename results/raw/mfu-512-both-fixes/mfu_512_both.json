@@ -1,0 +1,58 @@
+{
+  "preset": "0.6b",
+  "batch": 1,
+  "seq": 512,
+  "config": {
+    "hidden_size": 1024,
+    "intermediate_size": 3072,
+    "num_hidden_layers": 28,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 8,
+    "head_dim": 128,
+    "vocab_size": 151936
+  },
+  "flops_forward": 670417551360,
+  "flop_breakdown": {
+    "qkv_proj": 120259084288,
+    "attn_qk": 30064771072,
+    "attn_av": 30064771072,
+    "o_proj": 60129542144,
+    "mlp": 270582939648,
+    "lm_head": 159316443136
+  },
+  "denominator": {
+    "device_tflops_tensorengine": 632.0,
+    "device_tflops_published": 667.0,
+    "logical_cores_per_device": 2,
+    "logical_cores_used": 1
+  },
+  "baseline": {
+    "step_s": 0.04394072299965046,
+    "achieved_tflops": 15.257317258191975,
+    "mfu_per_core_te": 4.828264955124043,
+    "mfu_device_te": 2.4141324775620214,
+    "mfu_per_core_published": 4.5749077235957945
+  },
+  "kernelized": {
+    "step_s": 0.07131794199995056,
+    "achieved_tflops": 9.400405179393212,
+    "mfu_per_core_te": 2.9748117656307635,
+    "mfu_device_te": 1.4874058828153818,
+    "mfu_per_core_published": 2.8187121977191043,
+    "nki_launches_per_step": 169,
+    "all_kernels_engaged": true
+  },
+  "speedup": 0.6161243828331575,
+  "delta_mfu_pp": -1.8534531894932793,
+  "iqr_overlap": false,
+  "fixes": {
+    "target_detection": true,
+    "op_registry": true,
+    "op_registry_cache_stats": {
+      "hit": 2361,
+      "miss": 5,
+      "uncacheable": 0,
+      "distinct_keys": 5
+    }
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "baseline": {
+    "dir": "/home/ubuntu/hf-kernels-neuron/results/raw/prof_model_baseline",
+    "neffs": 1,
+    "device_ms": 14.33,
+    "hbm_mb": 2662.4,
+    "activates": 8038,
+    "wall_ms": 54.783
+  },
+  "kernelized": {
+    "dir": "/home/ubuntu/hf-kernels-neuron/results/raw/prof_model_kernelized",
+    "neffs": 1,
+    "device_ms": 22.696,
+    "hbm_mb": 3779.9,
+    "activates": 16468,
+    "wall_ms": 153.43
+  },
+  "nki_calls_per_step": 169,
+  "wall_gap_ms": 98.647,
+  "device_gap_ms": 8.366,
+  "device_gap_pct": 8.5,
+  "dispatch_gap_ms": 90.281,
+  "dispatch_gap_pct": 91.5,
+  "per_call_device_ms": 0.0495,
+  "per_call_dispatch_ms": 0.5342,
+  "projected_with_dispatch_fixed": {
+    "step_ms": 63.15,
+    "slowdown_vs_baseline": 1.15,
+    "status": "PROJECTION, not measured \u2014 assumes dispatch gap goes to zero"
+  }
+}

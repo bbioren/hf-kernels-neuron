@@ -1,0 +1,93 @@
+2026-Aug-03 18:32:22.0448 103458:103494 [0] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):273 CCOM WARN NET/OFI Failed to initialize rdma protocol
+2026-Aug-03 18:32:22.0450 103458:103494 [0] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):416 CCOM WARN NET/OFI aws-ofi-nccl initialization failed
+2026-Aug-03 18:32:22.0453 103458:103494 [0] ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t):78 CCOM WARN NET/OFI Initializing plugin failed
+2026-Aug-03 18:32:22.0455 103458:103494 [0] net_plugin.cc:104 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+====================================================================================
+INSIDE ONE NKI CALL
+====================================================================================
+2026-08-03 18:32:22.000817:  103458  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_5197417722028701154+fad94d7c/model.neff
+
+1. single call, NO mark_step, NO wait_device_ops
+     call 0:    51.97 ms   (nothing synced)
+     call 1:    52.00 ms   (nothing synced)
+     call 2:    51.97 ms   (nothing synced)
+     call 3:    52.01 ms   (nothing synced)
+     call 4:    53.01 ms   (nothing synced)
+     call 5:    50.77 ms   (nothing synced)
+
+   control, plain torch op, same conditions:
+     call 0:     0.39 ms
+     call 1:     0.04 ms
+     call 2:     0.02 ms
+
+2. cProfile of ONE call, top 25 by cumulative time
+             1264 function calls in 0.053 seconds
+    
+       Ordered by: cumulative time
+       List reduced from 302 to 25 due to restriction <25>
+    
+       ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+            1    0.000    0.000    0.053    0.053 /opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/nn/modules/module.py:1771(_wrapped_call_impl)
+            1    0.000    0.000    0.053    0.053 /opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/nn/modules/module.py:1779(_call_impl)
+            1    0.000    0.000    0.053    0.053 /home/ubuntu/hf-kernels-neuron/kernels/neuron_silu/__init__.py:149(forward)
+            1    0.000    0.000    0.053    0.053 /opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nki/framework/kernel.py:214(__call__)
+            1    0.000    0.000    0.053    0.053 /opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nki/framework/compiled.py:235(__call__)
+            1    0.000    0.000    0.053    0.053 /opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nki/framework/_torch_xla.py:138(__call__)
+            1    0.000    0.000    0.052    0.052 /opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nki/framework/compiled.py:91(_compile_opts)
+            1    0.000    0.000    0.052    0.052 /opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nki/compiler/target.py:30(resolve_target)
+            1    0.000    0.000    0.052    0.052 /opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nki/compiler/target.py:111(_detect_target)
+            1    0.000    0.000    0.052    0.052 /usr/lib/python3.12/subprocess.py:417(check_output)
+            1    0.000    0.000    0.052    0.052 /usr/lib/python3.12/subprocess.py:506(run)
+            1    0.000    0.000    0.051    0.051 /usr/lib/python3.12/subprocess.py:1165(communicate)
+            1    0.000    0.000    0.051    0.051 /usr/lib/python3.12/subprocess.py:2062(_communicate)
+            2    0.000    0.000    0.051    0.026 /usr/lib/python3.12/selectors.py:402(select)
+            2    0.051    0.026    0.051    0.026 {method 'poll' of 'select.poll' objects}
+            1    0.000    0.000    0.001    0.001 /opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch_xla/core/xla_op_registry.py:24(__call__)
+            1    0.000    0.000    0.001    0.001 /opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch_xla/core/xla_builder.py:817(create_computation)
+            1    0.000    0.000    0.000    0.000 /opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch_neuronx/xla_impl/base.py:174(call_func)
+            1    0.000    0.000    0.000    0.000 /usr/lib/python3.12/subprocess.py:807(__init__)
+            1    0.000    0.000    0.000    0.000 /opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch_neuronx/pyhlo/scribe.py:263(__call__)
+            1    0.000    0.000    0.000    0.000 /usr/lib/python3.12/subprocess.py:1791(_execute_child)
+            2    0.000    0.000    0.000    0.000 /opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch_neuronx/pyhlo/scribe.py:256(__init__)
+           56    0.000    0.000    0.000    0.000 /opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch_neuronx/pyhlo/scribe.py:606(__init__)
+            1    0.000    0.000    0.000    0.000 /opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch_neuronx/pyhlo/scribe.py:271(scribe)
+            1    0.000    0.000    0.000    0.000 {built-in method _posixsubprocess.fork_exec}
+    
+    
+
+   same, sorted by TOTAL time (self time, excludes subcalls):
+             1264 function calls in 0.053 seconds
+    
+       Ordered by: internal time
+       List reduced from 302 to 15 due to restriction <15>
+    
+       ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+            2    0.051    0.026    0.051    0.026 {method 'poll' of 'select.poll' objects}
+            1    0.000    0.000    0.000    0.000 {built-in method _posixsubprocess.fork_exec}
+          168    0.000    0.000    0.000    0.000 /opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/google/protobuf/internal/enum_type_wrapper.py:94(__getattr__)
+           56    0.000    0.000    0.000    0.000 /opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch_neuronx/pyhlo/scribe.py:606(__init__)
+            2    0.000    0.000    0.000    0.000 {method 'reshape' of 'torch._C.TensorBase' objects}
+            2    0.000    0.000    0.000    0.000 /opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch_neuronx/pyhlo/scribe.py:256(__init__)
+            1    0.000    0.000    0.051    0.051 /usr/lib/python3.12/subprocess.py:2062(_communicate)
+            1    0.000    0.000    0.000    0.000 {built-in method _XLAC._xla_op_computation_from_module_proto}
+            1    0.000    0.000    0.000    0.000 /usr/lib/python3.12/subprocess.py:807(__init__)
+            1    0.000    0.000    0.000    0.000 {built-in method _XLAC._xla_user_computation}
+            1    0.000    0.000    0.000    0.000 /opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch_neuronx/pyhlo/scribe.py:271(scribe)
+            1    0.000    0.000    0.000    0.000 /usr/lib/python3.12/subprocess.py:1233(poll)
+            1    0.000    0.000    0.000    0.000 {built-in method _XLAC._xla_op_build}
+            1    0.000    0.000    0.000    0.000 /usr/lib/python3.12/subprocess.py:1791(_execute_child)
+            2    0.000    0.000    0.051    0.026 /usr/lib/python3.12/selectors.py:402(select)
+    
+    
+
+----- stderr -----
+/home/ubuntu/hf-kernels-neuron/scripts/probe_inside_one_call.py:64: DeprecationWarning: Use torch_xla.device instead
+  dev = xm.xla_device()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_inside_one_call.py:80: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_inside_one_call.py:92: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_inside_one_call.py:104: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_inside_one_call.py:129: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()

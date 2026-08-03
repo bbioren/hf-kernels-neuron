@@ -1,0 +1,61 @@
+2026-Aug-03 18:32:02.0187 100997:101033 [0] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):273 CCOM WARN NET/OFI Failed to initialize rdma protocol
+2026-Aug-03 18:32:02.0190 100997:101033 [0] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):416 CCOM WARN NET/OFI aws-ofi-nccl initialization failed
+2026-Aug-03 18:32:02.0192 100997:101033 [0] ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t):78 CCOM WARN NET/OFI Initializing plugin failed
+2026-Aug-03 18:32:02.0194 100997:101033 [0] net_plugin.cc:104 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+====================================================================================
+WHERE DOES THE TIME GO? 28 NKI calls, one graph, one device execution
+====================================================================================
+2026-08-03 18:32:03.000849:  100997  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_4068602805350264558+fad94d7c/model.neff
+  iter 0: wall  1445.13 ms  [issue 1444.03 | mark_step     0.43 | wait    0.68]  ExecuteTime    0.904 ms x1  compiles 0
+  iter 1: wall  1438.10 ms  [issue 1436.80 | mark_step     0.38 | wait    0.91]  ExecuteTime    1.062 ms x1  compiles 0
+  iter 2: wall  1445.94 ms  [issue 1444.36 | mark_step     0.39 | wait    1.19]  ExecuteTime    1.259 ms x1  compiles 0
+
+====================================================================================
+BREAKDOWN (median iteration)
+====================================================================================
+  wall time                          1438.10 ms   100.0%
+    host issuing ops (lazy trace)    1436.80 ms    99.9%
+    mark_step()                         0.38 ms     0.0%
+    wait_device_ops()                   0.91 ms     0.1%
+
+  torch-xla counters (accumulators are nanoseconds; converted here):
+    ExecuteTime                        1.062 ms  (1 execution(s))
+    LazyTracing                        0.244 ms  (56 traced ops)
+    TransferToDeviceTime               0.000 ms
+    DeviceLockWait                     0.150 ms
+    CompileTime                        0.000 ms  (0 compiles — must be 0)
+
+  device time (neuron-explorer)        0.609 ms   0.04%
+    ^ prior run, scripts/profile_nki_call_cost.py — NOT measured here
+
+====================================================================================
+INTERPRETATION
+====================================================================================
+  wall - ExecuteTime            =   1437.04 ms  (host-side, outside the execute call)
+  ExecuteTime - device time     =      0.45 ms  (runtime overhead around a 0.609 ms device execution)
+
+  -> The time is on the HOST while issuing ops, before mark_step. Each
+     @nki.jit call is doing expensive host-side work (tracing, lowering, or
+     kernel re-specialisation) at call time. Also plausibly fixable.
+
+  per NKI call: wall 51.36 ms, device 0.0217 ms, ratio 2361x
+
+----- stderr -----
+/home/ubuntu/hf-kernels-neuron/scripts/probe_where_is_the_time.py:74: DeprecationWarning: Use torch_xla.device instead
+  dev = xm.xla_device()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_where_is_the_time.py:90: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_where_is_the_time.py:90: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_where_is_the_time.py:90: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_where_is_the_time.py:112: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_where_is_the_time.py:90: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_where_is_the_time.py:112: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_where_is_the_time.py:90: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_where_is_the_time.py:112: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()

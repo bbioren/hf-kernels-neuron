@@ -1,0 +1,29 @@
+2026-Aug-03 18:44:08.0274 108569:108605 [0] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):273 CCOM WARN NET/OFI Failed to initialize rdma protocol
+2026-Aug-03 18:44:08.0276 108569:108605 [0] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):416 CCOM WARN NET/OFI aws-ofi-nccl initialization failed
+2026-Aug-03 18:44:08.0279 108569:108605 [0] ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t):78 CCOM WARN NET/OFI Initializing plugin failed
+2026-Aug-03 18:44:08.0281 108569:108605 [0] net_plugin.cc:104 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+profiling 28 NKI call(s), tile [512, 3072] bf16
+  inspect dir: /home/ubuntu/hf-kernels-neuron/results/raw/prof_n28
+  NEURON_RT_VISIBLE_CORES=0
+  NEURON_CC_FLAGS=(unset — compiler defaults)
+2026-08-03 18:44:09.000926:  108569  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_5526685130865408494+fad94d7c/model.neff
+  iter 0:   3027.59 ms  ( 108.13 ms/call) (compile)
+  iter 1:   1452.31 ms  (  51.87 ms/call) 
+  iter 2:   1440.86 ms  (  51.46 ms/call) 
+  iter 3:   1447.88 ms  (  51.71 ms/call) 
+
+NEFFs written under: /home/ubuntu/hf-kernels-neuron/results/raw/prof_n28
+    /home/ubuntu/hf-kernels-neuron/results/raw/prof_n28/i-0b05f044388db8080_pid_108569/1785782648211478970/neff_1008222525555404_vnc_0.neff (51 KiB)
+    /home/ubuntu/hf-kernels-neuron/results/raw/prof_n28/i-0b05f044388db8080_pid_108569/1785782648211478970/1008222525555404_vnc_0.ntff (1731 KiB)
+
+----- stderr -----
+/home/ubuntu/hf-kernels-neuron/scripts/profile_nki_call_cost.py:63: DeprecationWarning: Use torch_xla.device instead
+  dev = xm.xla_device()
+/home/ubuntu/hf-kernels-neuron/scripts/profile_nki_call_cost.py:86: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/profile_nki_call_cost.py:86: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/profile_nki_call_cost.py:86: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/profile_nki_call_cost.py:86: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()

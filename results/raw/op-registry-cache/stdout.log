@@ -1,0 +1,60 @@
+2026-Aug-03 20:07:23.0914 118343:118384 [1] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):273 CCOM WARN NET/OFI Failed to initialize rdma protocol
+2026-Aug-03 20:07:23.0917 118343:118384 [1] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):416 CCOM WARN NET/OFI aws-ofi-nccl initialization failed
+2026-Aug-03 20:07:23.0919 118343:118384 [1] ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t):78 CCOM WARN NET/OFI Initializing plugin failed
+2026-Aug-03 20:07:23.0921 118343:118384 [1] net_plugin.cc:104 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+========================================================================================
+IS THE PER-CALL create_computation REBUILD CACHEABLE?  (open item B12)
+========================================================================================
+  TorchXlaKernel.__call__ source sha256[:16] = 5f8521daa38d96a2
+  all 5 structural landmarks present
+  (5 landmarks, so the patch applies to this version)
+
+  The cache being tested already exists, in torch_xla:
+    xla_op_registry.Op.__init__:  self._computations = dict()
+    Op.__call__:                  keyed on pickle.dumps([shapes, kwargs])
+  NKI applies @xla_hlo_call INSIDE __call__, so a fresh Op — with a fresh empty
+  _computations — is constructed on every kernel invocation.
+
+  28 chained NKI calls, median of 3, tile [512, 3072] bf16
+  Finding #24's lru_cache applied throughout, so this is the RESIDUAL
+
+2026-08-03 20:07:24.000186:  118343  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_5197417722028701154+fad94d7c/model.neff
+2026-08-03 20:07:24.000221:  118343  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_4068602805350264558+fad94d7c/model.neff
+  baseline (post-#24)                  14.78 ms total     0.528 ms/call   cos_sim 0.999942
+  with Op registry cached               5.12 ms total     0.183 ms/call   cos_sim 0.999942
+  baseline again (control)             13.84 ms total     0.494 ms/call   cos_sim 0.999942
+
+========================================================================================
+VERDICT
+========================================================================================
+  baseline               0.528 ms/call
+  baseline again         0.494 ms/call   (within 6.3% of the first, so ordering is not the cause)
+  Op registry cached     0.183 ms/call      2.89x faster
+
+  cache behaviour: 86 hit(s), 1 miss(es), 0 uncacheable, 1 key(s)
+  accuracy: baseline 0.999942  cached 0.999942  control 0.999942
+
+  ANSWERED: YES, it is cacheable. 2.89x on the residual, with cosine
+  similarity identical to the baseline at 1e-6, and 86 cache hits
+  against 1 miss — so the computation really was being rebuilt per call and really
+  is reusable.
+
+  This closes open item B12 as a QUESTION. It is not a shipped fix: it is a runtime
+  monkeypatch verified on one kernel and one shape. What it establishes is that the
+  remaining ~91% of the regression is a caching bug of the same kind as #24, in the
+  same dispatch path, and that the upstream change is small — register the lowering
+  once per compile-cache key instead of once per call.
+
+  wrote /home/ubuntu/hf-kernels-neuron/results/raw/op-registry-cache/op_cache.json
+
+----- stderr -----
+/home/ubuntu/hf-kernels-neuron/scripts/probe_op_registry_cache.py:102: DeprecationWarning: Use torch_xla.device instead
+  dev = xm.xla_device()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_op_registry_cache.py:135: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_op_registry_cache.py:140: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_op_registry_cache.py:146: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_op_registry_cache.py:152: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()

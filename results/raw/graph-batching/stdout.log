@@ -1,0 +1,110 @@
+2026-Aug-03 18:31:42.0425 98786:98822 [0] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):273 CCOM WARN NET/OFI Failed to initialize rdma protocol
+2026-Aug-03 18:31:42.0428 98786:98822 [0] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):416 CCOM WARN NET/OFI aws-ofi-nccl initialization failed
+2026-Aug-03 18:31:42.0430 98786:98822 [0] ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t):78 CCOM WARN NET/OFI Initializing plugin failed
+2026-Aug-03 18:31:42.0432 98786:98822 [0] net_plugin.cc:104 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+====================================================================================
+DECISIVE PROBE: are N NKI calls one graph execution, or N?
+====================================================================================
+  N_CALLS = 28, tile = [512, 3072], dtype = bfloat16
+  torch-xla is already a graph runtime; this counts real device executions.
+2026-08-03 18:31:42.000794:  98786  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_10881146770280589379+fad94d7c/model.neff
+
+  available metrics: ['DeviceLockWait', 'InputOutputAliasCount', 'IrValueTensorToXlaData', 'LazyTracing', 'TensorToData', 'TensorsGraphSize', 'UnwrapXlaData', 'WrapXlaData', 'CompileTime', 'ExecuteTime', 'OutboundData', 'TransferToDeviceTime']
+
+2026-08-03 18:31:44.000273:  98786  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_9816968306293991763+fad94d7c/model.neff
+  A  28 NKI calls, 1 mark_step       wall   1444.66 ms   execs(pre-sync)   0   execs(total)   1   compiles 0
+                                          samples ['1444.66', '1440.76', '1445.13']
+2026-08-03 18:31:50.000122:  98786  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_5197417722028701154+fad94d7c/model.neff
+  B  1 NKI call,  1 mark_step        wall     51.73 ms   execs(pre-sync)   0   execs(total)   1   compiles 0
+                                          samples ['52.36', '51.25', '51.73']
+2026-08-03 18:31:50.000352:  98786  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_9501908754261933912+fad94d7c/model.neff
+  C  28 torch ops, 1 mark_step       wall      1.54 ms   execs(pre-sync)   0   execs(total)   1   compiles 0
+                                          samples ['1.54', '1.73', '1.49']
+  D  1 torch op,  1 mark_step        wall      0.46 ms   execs(pre-sync)   0   execs(total)   1   compiles 0
+                                          samples ['0.29', '0.64', '0.46']
+
+====================================================================================
+INTERPRETATION
+====================================================================================
+  control: 28 torch ops -> 1 execution(s); 1 torch op -> 1
+    control OK: many torch ops batch into a single execution, so the
+    counter does detect graph batching. A negative result below is real.
+
+  28 NKI calls -> 1 execution(s); 1 NKI call -> 1
+  executions per NKI call: 0.04
+    -> The NKI calls DID share one device execution. The 53 ms per call is
+       therefore INSIDE the NEFF: real device time or per-custom-call launch
+       cost. Graph mode is already being applied and does not help; this is
+       a kernel/compiler cost, not an integration cost.
+
+  wall time per NKI call in A: 51.60 ms
+  wall time for B (1 call):    51.73 ms
+  A/B wall ratio: 27.93x for 28x the calls
+
+  full metrics report (tail):
+    Metric: DeviceLockWait
+      TotalSamples: 198
+      Accumulator: 002ms662.033us
+      ValueRate: 219.609us / second
+      Rate: 26.1623 / second
+      Percentiles: 1%=000.072us; 5%=000.085us; 10%=000.090us; 20%=000.100us; 50%=000.200us; 80%=001.528us; 90%=006.334us; 95%=045.104us; 99%=212.129us
+    Metric: InputOutputAliasCount
+      TotalSamples: 4
+      Accumulator: 0.00
+      ValueRate: 0.00 / second
+      Rate: 0.529448 / second
+      Percentiles: 1%=0.00; 5%=0.00; 10%=0.00; 20%=0.00; 50%=0.00; 80%=0.00; 90%=0.00; 95%=0.00; 99%=0.00
+    Metric: IrValueTensorToXlaData
+      TotalSamples: 2
+      Accumulator: 921.735us
+      ValueRate: 04s572ms702.588us / second
+      Rate: 7749.96 / second
+      Percentiles: 1%=050.485us; 5%=050.485us; 10%=050.485us; 20%=050.485us; 50%=871.250us; 80%=871.250us; 90%=871.250us; 95%=871.250us; 99%=871.250us
+    Metric: LazyTracing
+      TotalSamples: 2052
+      Accumulator: 015ms906.259us
+      ValueRate: 416ms802.837us / second
+      Rate: 134488 / second
+      Percentiles: 1%=000.757us; 5%=000.788us; 10%=000.820us; 20%=000.922us; 50%=002.200us; 80%=003.205us; 90%=005.293us; 95%=012.053us; 99%=015.053us
+    Metric: TensorToData
+      TotalSamples: 2
+      Accumulator: 868.559us
+      ValueRate: 03s249ms844.186us / second
+      Rate: 7481 / second
+      Percentiles: 1%=048.833us; 5%=048.833us; 10%=048.833us; 20%=048.833us; 50%=819.726us; 80%=819.726us; 90%=819.726us; 95%=819.726us; 99%=819.726us
+    Metric: TensorsGraphSize
+      TotalSamples: 21
+      Accumulator: 1737.00
+      ValueRate: 229.52 / second
+      Rate: 2.7748 / second
+      Percentiles: 1%=4.00; 5%=4.00; 10%=4.00; 20%=4.00; 50%=7.00; 80%=196.00; 90%=196.00; 95%=196.00; 99%=196.00
+    Metric: UnwrapXlaData
+      TotalSamples: 21
+      Accumulator: 024.322us
+      ValueRate: 003.214us / second
+
+----- stderr -----
+/home/ubuntu/hf-kernels-neuron/scripts/probe_neff_count.py:76: DeprecationWarning: Use torch_xla.device instead
+  dev = xm.xla_device()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_neff_count.py:67: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_neff_count.py:67: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_neff_count.py:67: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_neff_count.py:67: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_neff_count.py:67: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_neff_count.py:67: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_neff_count.py:67: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_neff_count.py:67: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_neff_count.py:67: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_neff_count.py:67: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/probe_neff_count.py:67: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()

@@ -1,0 +1,83 @@
+2026-Aug-03 18:27:33.0528 62663:62723 [2] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):273 CCOM WARN NET/OFI Failed to initialize rdma protocol
+2026-Aug-03 18:27:33.0531 62663:62723 [2] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):416 CCOM WARN NET/OFI aws-ofi-nccl initialization failed
+2026-Aug-03 18:27:33.0533 62663:62723 [2] ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t):78 CCOM WARN NET/OFI Initializing plugin failed
+2026-Aug-03 18:27:33.0535 62663:62723 [2] net_plugin.cc:104 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+  FIX APPLIED: nki.compiler.target._detect_target is now lru_cached (detected target: 'trn2')
+========================================================================================
+MFU: Qwen3 forward pass on Neuron — preset '0.6b'
+========================================================================================
+  hidden=1024 intermediate=3072 layers=28 q_heads=16 kv_heads=8 head_dim=128
+  batch=1 seq=512 dtype=bfloat16 forward-only, eager
+
+  FLOP breakdown (forward, per step):
+    qkv_proj           120.26 GFLOP  ( 17.9%)
+    attn_qk             30.06 GFLOP  (  4.5%)
+    attn_av             30.06 GFLOP  (  4.5%)
+    o_proj              60.13 GFLOP  (  9.0%)
+    mlp                270.58 GFLOP  ( 40.4%)
+    lm_head            159.32 GFLOP  ( 23.8%)
+    TOTAL              670.42 GFLOP
+
+  Denominator:
+    device peak (TensorEngine only)    632 TFLOPS bf16
+    device peak (published)            667 TFLOPS bf16
+    LNC config 2 logical cores/device, using 1
+    => primary denominator = 316 TFLOPS (per logical core, TensorEngine)
+
+========================================================================================
+BASELINE (no kernels)
+========================================================================================
+  compiling + warming up ...
+2026-08-03 18:27:41.000199:  62663  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_4923876852101323812+fad94d7c/model.neff
+2026-08-03 18:27:41.000697:  62663  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_9353043681813492233+fad94d7c/model.neff
+2026-08-03 18:27:42.000717:  62663  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_172635999925100332+fad94d7c/model.neff
+  done in 3s
+  step time          44.36 ms   (IQR 43.55-45.00)
+  throughput         11542 tok/s
+  achieved           15.11 TFLOPS
+  MFU per-core        4.78 %   (632/2 TensorEngine)
+  MFU device          2.39 %   (632, for reference only)
+
+========================================================================================
+KERNELIZED (NKI RMSNorm + RoPE + SiLU)
+========================================================================================
+  NOTE: via kernelize_for_neuron(), not use_kernels=True — see Finding #9.
+  confirming kernel engagement (one instrumented step) ...
+2026-08-03 18:27:50.000551:  62663  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_14389838407789914627+fad94d7c/model.neff
+2026-08-03 18:27:51.000276:  62663  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_13039018066742952662+fad94d7c/model.neff
+    RMSNorm nki=113 fallback=0  (expect nki=113)
+    RoPE    nki=28 fallback=0  (expect nki=28)
+    SiLU    nki=28 fallback=0  (expect nki=28)
+    NKI launches per step: 169
+  timing ...
+  done in 2s
+  step time         146.67 ms   (IQR 146.04-147.31)
+  throughput          3491 tok/s
+  achieved            4.57 TFLOPS
+  MFU per-core        1.45 %   (632/2 TensorEngine)
+  MFU device          0.72 %   (632, for reference only)
+
+========================================================================================
+RESULT
+========================================================================================
+  baseline   MFU   4.78 %   step    44.36 ms
+  kernelized MFU   1.45 %   step   146.67 ms
+  delta           -3.34 pp  speedup 0.302x
+
+  Kernels are SLOWER by 3.306x.
+
+  Attribution: 169 NKI launches/step, delta 102 ms
+    => 0.6 ms of added cost per NKI call
+    host dispatch alone (Finding #19, ~0.36 ms/call) = ~61 ms
+    That is the same order as the delta, so the result is launch-bound
+    rather than kernel-quality-bound.
+
+  Caveats: forward-only; single logical core; eager (not torch.compile);
+  kernelized via kernelize_for_neuron() since use_kernels=True can't route
+  to Neuron; attention FLOPs counted without a causal-mask discount.
+========================================================================================
+  wrote /home/ubuntu/hf-kernels-neuron/results/raw/mfu-baseline-and-kernelized-512-fixed/mfu_512_fixed.json
+
+----- stderr -----
+/home/ubuntu/hf-kernels-neuron/scripts/measure_mfu.py:142: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()

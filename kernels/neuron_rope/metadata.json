@@ -1,0 +1,14 @@
+{
+  "name": "neuron-rope",
+  "id": "neuron_rope",
+  "version": 0,
+  "license": "Apache-2.0",
+  "python-depends": [],
+  "backend": {
+    "type": "neuron"
+  },
+  "digest": {
+    "algorithm": "sha256",
+    "files": {}
+  }
+}

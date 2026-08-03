@@ -1,0 +1,190 @@
+2026-Aug-03 18:32:48.0874 103842:103878 [0] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):273 CCOM WARN NET/OFI Failed to initialize rdma protocol
+2026-Aug-03 18:32:48.0876 103842:103878 [0] int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t**):416 CCOM WARN NET/OFI aws-ofi-nccl initialization failed
+2026-Aug-03 18:32:48.0879 103842:103878 [0] ncclResult_t nccl_net_ofi_init(ncclDebugLogger_t):78 CCOM WARN NET/OFI Initializing plugin failed
+2026-Aug-03 18:32:48.0881 103842:103878 [0] net_plugin.cc:104 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+
+====================================================================================
+1. Versions and pairing
+====================================================================================
+  torch            2.9.1+cu128
+  torch_xla        2.9.0
+  torch_xla.version []
+
+====================================================================================
+2. Is the openxla dynamo backend registered?
+====================================================================================
+  registered: ['cudagraphs', 'inductor', 'openxla', 'tvm']
+  'openxla' present: True
+  import torch_xla.core.dynamo_bridge           OK
+  import torch_xla._dynamo.dynamo_bridge        OK
+  import torch_xla.experimental                 OK
+  after bridge imports, 'openxla' present: True
+
+====================================================================================
+3. Full traceback for the failing case
+====================================================================================
+  full traceback:
+
+====================================================================================
+4. Where does it break? simplest ops first, CPU vs XLA
+====================================================================================
+  --- tensors on cpu ---
+    add    OK
+    mul    OK
+    relu   OK
+    silu   OK
+  --- tensors on xla ---
+2026-08-03 18:32:56.000680:  103842  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_1356094123454322550+fad94d7c/model.neff
+2026-08-03 18:32:56.000700:  103842  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_3039558031940064066+fad94d7c/model.neff
+    add    OK
+2026-08-03 18:32:56.000754:  103842  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_18053364295595937865+fad94d7c/model.neff
+    mul    OK
+2026-08-03 18:32:56.000807:  103842  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_7226004762818036188+fad94d7c/model.neff
+    relu   OK
+    silu   TorchRuntimeError: Dynamo failed to run FX node with fake tensors: call_function <function silu at 0x7181257d
+
+====================================================================================
+5. Alternative graph-mode entry points
+====================================================================================
+2026-08-03 18:32:56.000831:  103842  [INFO]: Using a cached neff at /var/tmp/neuron-compile-cache/neuronxcc-2.26.6360.0+6f180f47/MODULE_351470511616525951+fad94d7c/model.neff
+  torch_xla.compile           OK  sum=859.8410
+  dynamo_bridge attrs: ['extract_compiled_graph', 'extract_compiled_graph_helper']
+  lazy-tensor (mark_step)     OK  sum=859.8410
+    NOTE: torch-xla is already a graph runtime. Ops accumulate into an HLO
+    graph and compile at mark_step. So 'does graph mode help' is partly
+    answerable without torch.compile at all — see scripts/probe_neff_count.py
+
+====================================================================================
+DIAGNOSIS COMPLETE
+====================================================================================
+
+----- stderr -----
+/home/ubuntu/hf-kernels-neuron/scripts/diagnose_torch_compile.py:104: DeprecationWarning: Use torch_xla.device instead
+  dev = xm.xla_device()
+Traceback (most recent call last):
+  File "/home/ubuntu/hf-kernels-neuron/scripts/diagnose_torch_compile.py", line 117, in full_traceback
+    out = cf(x)
+          ^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 832, in compile_wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/convert_frame.py", line 1875, in __call__
+    result = self._torchdynamo_orig_backend(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/convert_frame.py", line 1625, in __call__
+    result = self._inner_convert(
+             ^^^^^^^^^^^^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/convert_frame.py", line 688, in __call__
+    result = _compile(
+             ^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/convert_frame.py", line 1434, in _compile
+    guarded_code, tracer_output = compile_inner(code, one_graph, hooks)
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_utils_internal.py", line 92, in wrapper_function
+    return function(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/convert_frame.py", line 1117, in compile_inner
+    return _compile_inner(code, one_graph, hooks)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/convert_frame.py", line 1151, in _compile_inner
+    dynamo_output = compile_frame(
+                    ^^^^^^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/convert_frame.py", line 1032, in compile_frame
+    bytecode, tracer_output = transform_code_object(code, transform)
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/bytecode_transformation.py", line 1592, in transform_code_object
+    tracer_output = transformations(instructions, code_options)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/convert_frame.py", line 1004, in transform
+    tracer_output = trace_frame(
+                    ^^^^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/convert_frame.py", line 312, in _fn
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/convert_frame.py", line 815, in trace_frame
+    run_tracer()
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/convert_frame.py", line 797, in run_tracer
+    tracer.run()
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/symbolic_convert.py", line 1500, in run
+    while self.step():
+          ^^^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/symbolic_convert.py", line 1348, in step
+    self.dispatch_table[inst.opcode](self, inst)
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/symbolic_convert.py", line 904, in wrapper
+    return inner_fn(self, inst)
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/symbolic_convert.py", line 3428, in CALL
+    self._call(inst)
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/symbolic_convert.py", line 3422, in _call
+    self.call_function(fn, args, kwargs)
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/symbolic_convert.py", line 1266, in call_function
+    self.push(fn.call_function(self, args, kwargs))  # type: ignore[arg-type]
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/variables/lazy.py", line 212, in realize_and_forward
+    return getattr(self.realize(), name)(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/variables/torch.py", line 1516, in call_function
+    tensor_variable = wrap_fx_proxy(
+                      ^^^^^^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/variables/builder.py", line 2645, in wrap_fx_proxy
+    return wrap_fx_proxy_cls(target_cls=TensorVariable, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/variables/builder.py", line 2711, in wrap_fx_proxy_cls
+    return _wrap_fx_proxy(
+           ^^^^^^^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/variables/builder.py", line 2809, in _wrap_fx_proxy
+    example_value = get_fake_value(proxy.node, tx, allow_non_graph_fake=True)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/utils.py", line 3478, in get_fake_value
+    raise TorchRuntimeError(str(e)).with_traceback(e.__traceback__) from None
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/utils.py", line 3376, in get_fake_value
+    ret_val = wrap_fake_exception(
+              ^^^^^^^^^^^^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/utils.py", line 2864, in wrap_fake_exception
+    return fn()
+           ^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/utils.py", line 3377, in <lambda>
+    lambda: run_node(tx.output, node, args, kwargs, nnmodule)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/utils.py", line 3587, in run_node
+    raise RuntimeError(make_error_message(e)).with_traceback(
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/_dynamo/utils.py", line 3546, in run_node
+    return node.target(*args, **kwargs)  # type: ignore[operator]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/nn/functional.py", line 2371, in silu
+    return torch._C._nn.silu(input)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch_neuronx/xla_impl/base.py", line 167, in wrapper
+    return custom_call_cls.apply(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch/autograd/function.py", line 581, in apply
+    return super().apply(*args, **kwargs)  # type: ignore[misc]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch_neuronx/xla_impl/ops.py", line 566, in forward
+    return Silu.forward_impl(input)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/torch_xla/core/xla_op_registry.py", line 44, in __call__
+    result = torch_xla._XLAC._xla_user_computation(self._opname, args,
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch._dynamo.exc.TorchRuntimeError: Dynamo failed to run FX node with fake tensors: call_function <function silu at 0x7181257d4040>(*(FakeTensor(..., device='xla:0', size=(64, 64)),), **{}): got RuntimeError('Expected all tensors in the given list to be XLA tensors. Element at index 0 is not an XLA tensor. Got: XLAFloatType')
+
+from user code:
+   File "/home/ubuntu/hf-kernels-neuron/scripts/diagnose_torch_compile.py", line 112, in f
+    return F.silu(t)
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
+/home/ubuntu/hf-kernels-neuron/scripts/diagnose_torch_compile.py:133: DeprecationWarning: Use torch_xla.device instead
+  dev = xm.xla_device()
+/home/ubuntu/hf-kernels-neuron/scripts/diagnose_torch_compile.py:153: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/diagnose_torch_compile.py:153: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/diagnose_torch_compile.py:153: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/diagnose_torch_compile.py:168: DeprecationWarning: Use torch_xla.device instead
+  dev = xm.xla_device()
+/home/ubuntu/hf-kernels-neuron/scripts/diagnose_torch_compile.py:185: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
+/home/ubuntu/hf-kernels-neuron/scripts/diagnose_torch_compile.py:204: DeprecationWarning: Use torch_xla.sync instead
+  xm.mark_step()
