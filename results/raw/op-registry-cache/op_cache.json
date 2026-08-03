@@ -1,0 +1,24 @@
+{
+  "source_sha256_16": "5f8521daa38d96a2",
+  "n_calls": 28,
+  "iters": 3,
+  "baseline_ms_per_call": 0.5278,
+  "baseline_control_ms_per_call": 0.4943,
+  "op_cached_ms_per_call": 0.1828,
+  "speedup": 2.887,
+  "control_drift_pct": 6.34,
+  "cache": {
+    "hit": 86,
+    "miss": 1,
+    "uncacheable": 0,
+    "distinct_keys": 1
+  },
+  "cos_sim": {
+    "baseline": 0.9999424815177917,
+    "op_cached": 0.9999424815177917,
+    "control": 0.9999424815177917
+  },
+  "accurate": true,
+  "identical_to_1e6": true,
+  "verdict": "cacheable"
+}

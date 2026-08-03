@@ -187,5 +187,32 @@
       "results/raw/extract-device-metrics/device_metrics.json",
       "results/raw/extract-device-metrics/stdout.log"
     ]
+  },
+  "op-registry-cache": {
+    "command": "scripts/probe_op_registry_cache.py --json-out /home/ubuntu/hf-kernels-neuron/results/raw/op-registry-cache/op_cache.json",
+    "exit_code": 0,
+    "seconds": 11.4,
+    "artifacts": [
+      "results/raw/op-registry-cache/op_cache.json",
+      "results/raw/op-registry-cache/stdout.log"
+    ]
+  },
+  "mfu-512-both-fixes": {
+    "command": "scripts/measure_mfu.py --preset 0.6b --seq 512 --fix-op-registry --json-out /home/ubuntu/hf-kernels-neuron/results/raw/mfu-512-both-fixes/mfu_512_both.json",
+    "exit_code": 0,
+    "seconds": 32.5,
+    "artifacts": [
+      "results/raw/mfu-512-both-fixes/mfu_512_both.json",
+      "results/raw/mfu-512-both-fixes/stdout.log"
+    ]
+  },
+  "mfu-2048-both-fixes": {
+    "command": "scripts/measure_mfu.py --preset 0.6b --seq 2048 --fix-op-registry --json-out /home/ubuntu/hf-kernels-neuron/results/raw/mfu-2048-both-fixes/mfu_2048_both.json",
+    "exit_code": 0,
+    "seconds": 38.3,
+    "artifacts": [
+      "results/raw/mfu-2048-both-fixes/mfu_2048_both.json",
+      "results/raw/mfu-2048-both-fixes/stdout.log"
+    ]
   }
 }

@@ -206,6 +206,16 @@ def main():
              "reflects what a customer would see once the upstream bug is fixed. Verified "
              "accuracy-neutral by scripts/probe_target_override_fix.py.",
     )
+    ap.add_argument(
+        "--fix-op-registry", action="store_true",
+        help="ALSO register the XLA computation once per compile-cache key instead of once per "
+             "kernel call (open item B12). torch_xla's Op class already memoises the built "
+             "computation; NKI applies @xla_hlo_call inside __call__, so a fresh Op with an empty "
+             "memo is created every time. Removes ~2/3 of the residual that remains after #24: "
+             "0.53 -> 0.18 ms/call. Verified accuracy-neutral by "
+             "scripts/probe_op_registry_cache.py. Implies --fix-target-detection, since measuring "
+             "this residual under a 52 ms constant is pointless.",
+    )
     args = ap.parse_args()
 
     only = [s.strip() for s in args.only.split(",")] if args.only else None
@@ -213,15 +223,19 @@ def main():
     # Applied before any kernel runs. Patching the module attribute works regardless of how
     # resolve_target imported it, because resolve_target resolves _detect_target from its own
     # module globals at call time.
-    if args.fix_target_detection:
-        import functools
+    op_stats = None
+    if args.fix_target_detection or args.fix_op_registry:
+        from nki_dispatch_fixes import fix_target_detection
 
-        import nki.compiler.target as nki_target
+        fix_target_detection()
+    if args.fix_op_registry:
+        from nki_dispatch_fixes import fix_op_registry_cache
 
-        _orig_detect = nki_target._detect_target
-        nki_target._detect_target = functools.lru_cache(maxsize=1)(_orig_detect)
-        print("  FIX APPLIED: nki.compiler.target._detect_target is now lru_cached "
-              f"(detected target: {nki_target._detect_target()!r})")
+        op_stats, _restore = fix_op_registry_cache()
+        if op_stats is None:
+            print("  ABORTING: --fix-op-registry was requested but the patch does not apply to "
+                  "this NKI version. Refusing to report a number under a fix that is not active.")
+            return 1
 
     device = require_neuron()
     cfg = PRESETS[args.preset]
@@ -374,6 +388,14 @@ def main():
         else:
             print("    That is the same order as the delta, so the result is launch-bound")
             print("    rather than kernel-quality-bound.")
+    if op_stats is not None:
+        # Print the cache statistics, not only the timing. A faster run with zero cache hits would
+        # mean the speedup came from somewhere else, and that should be impossible to overlook.
+        print()
+        print(f"  Op-registry cache (B12): {op_stats!r}")
+        if op_stats.get("hit", 0) == 0:
+            print("    WARNING: zero hits. The fix was applied but never used, so it cannot be")
+            print("    credited with any part of this result.")
     print()
     print("  Caveats: forward-only; single logical core; eager (not torch.compile);")
     print("  kernelized via kernelize_for_neuron() since use_kernels=True can't route")
@@ -395,7 +417,16 @@ def main():
                            "nki_launches_per_step": launches,
                            "all_kernels_engaged": engaged},
             "speedup": speedup, "delta_mfu_pp": delta_mfu, "iqr_overlap": overlap,
+            "fixes": {
+                "target_detection": bool(args.fix_target_detection or args.fix_op_registry),
+                "op_registry": bool(args.fix_op_registry),
+                "op_registry_cache_stats": op_stats.as_dict() if op_stats else None,
+            },
         }
+        # mkdir first. Without it a --json-out into a new directory throws AFTER the whole
+        # measurement has run, which on a long model run means losing the result to a one-line bug
+        # in the last statement. Every other producer in this project does the same.
+        Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.json_out).write_text(json.dumps(payload, indent=2))
         print(f"  wrote {args.json_out}")
 

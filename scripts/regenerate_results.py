@@ -60,6 +60,19 @@ STAGES = [
      [sys.executable, "scripts/measure_mfu.py", "--preset", "0.6b", "--seq", "2048",
       "--fix-target-detection", "--json-out", "STAGE/mfu_2048_fixed.json"], []),
 
+    # BOTH dispatch fixes: Finding #24 (target detection) plus B12 (register the XLA computation
+    # once per compile-cache key instead of once per call). These are the numbers that say what the
+    # approach costs once the framework bugs are out of the way, rather than what it costs today.
+    ("op-registry-cache",
+     [sys.executable, "scripts/probe_op_registry_cache.py",
+      "--json-out", "STAGE/op_cache.json"], []),
+    ("mfu-512-both-fixes",
+     [sys.executable, "scripts/measure_mfu.py", "--preset", "0.6b", "--seq", "512",
+      "--fix-op-registry", "--json-out", "STAGE/mfu_512_both.json"], []),
+    ("mfu-2048-both-fixes",
+     [sys.executable, "scripts/measure_mfu.py", "--preset", "0.6b", "--seq", "2048",
+      "--fix-op-registry", "--json-out", "STAGE/mfu_2048_both.json"], []),
+
     ("fix-verification", [sys.executable, "scripts/probe_target_override_fix.py"], []),
     ("graph-batching", [sys.executable, "scripts/probe_neff_count.py"], []),
     ("host-vs-device-split", [sys.executable, "scripts/probe_where_is_the_time.py"], []),
