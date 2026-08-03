@@ -146,8 +146,19 @@ The question that decides whether this becomes a win rather than approaching par
 call participate in compiler fusion?** If yes, the last ~18% is recoverable. If no, per-layer swapping of
 small memory-bound ops tops out just below parity.
 
-All findings with severity: [`docs/poc-findings.md`](docs/poc-findings.md).
-Upstream asks with patches: [`docs/upstream-fixes.md`](docs/upstream-fixes.md).
+## Where to start
+
+| if you want | read |
+|---|---|
+| **what was built, why, and the recommendation** | [`deliverables/design-doc.md`](deliverables/design-doc.md) |
+| **every number, with the script and command that produced it** | [`results/README.md`](results/README.md) |
+| **a reading order through the code** | [`docs/CODE_GUIDE.md`](docs/CODE_GUIDE.md) |
+| all findings with severity, including the wrong turns | [`docs/poc-findings.md`](docs/poc-findings.md) |
+| upstream asks with patches | [`docs/upstream-fixes.md`](docs/upstream-fixes.md) |
+| the longer narrative version | [`deliverables/poc-document.md`](deliverables/poc-document.md) |
+
+Raw measurement artifacts are **not** in the repo — the instance they lived on expired. `make results`
+regenerates them; see [`results/raw/README.md`](results/raw/README.md).
 
 ## Versions Tested
 
