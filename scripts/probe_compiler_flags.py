@@ -180,21 +180,54 @@ def main():
         return 1
 
     ratios = [r["ratio"] for r in ok]
+    nkis = [r["nki_ms"] for r in ok]
+    torches = [r["torch_ms"] for r in ok]
     spread = max(ratios) / min(ratios)
-    print(f"\n  ratio spread across settings: {spread:.2f}x "
-          f"(min {min(ratios):.3f}, max {max(ratios):.3f})")
+    nki_spread = max(nkis) / min(nkis)
+    torch_spread = max(torches) / min(torches)
+
+    print(f"\n  spread across settings:  ratio {spread:.2f}x   "
+          f"NKI {nki_spread:.2f}x   torch {torch_spread:.2f}x")
     print()
-    if spread < 1.25:
-        print("  -> The NKI/torch ratio is STABLE across compiler settings. The device-time gap in")
-        print("     Findings #25 and #26 is not an artifact of running on defaults, and those")
-        print("     conclusions stand. Record this and close the open item.")
+
+    # The question is not "does the ratio move" — a ratio can move because the DENOMINATOR moved,
+    # which says nothing about whether any setting helps NKI. Separate the two.
+    if nki_spread < 1.15:
+        print(f"  -> NKI is INVARIANT across compiler settings ({min(nkis):.2f}-{max(nkis):.2f} ms,")
+        print(f"     {nki_spread:.2f}x spread). **No setting rescues the NKI path.** So the gap is")
+        print("     not a compiler-flag artifact, which is what this control set out to establish.")
+        if torch_spread > 1.15:
+            print(f"     The ratio spread ({spread:.2f}x) is driven by TORCH moving "
+                  f"({torch_spread:.2f}x), not NKI.")
+            worst = max(ok, key=lambda r: r["torch_ms"])
+            print(f"     Specifically '{worst['flags']}' makes torch slower "
+                  f"({worst['torch_ms']:.3f} ms), which flatters the ratio without helping NKI.")
+        print("     -> The open item is CLOSED for the wall-clock gap. Record it.")
+    elif spread < 1.25:
+        print("  -> Both sides are stable and the ratio is stable. Gap is not a flag artifact.")
+        print("     -> The open item is CLOSED for the wall-clock gap.")
     else:
-        print("  -> The ratio MOVES with compiler settings. Identify the best setting above, and")
-        print("     re-run the affected measurements under it before citing #25 or #26. The")
-        print("     project default may have been penalising one path.")
+        best = min(ok, key=lambda r: r["ratio"])
+        print(f"  -> NKI itself MOVES with flags ({nki_spread:.2f}x). The best setting is")
+        print(f"     '{best['flags']}' at {best['ratio']:.2f}x. Re-run the affected measurements")
+        print("     under it before citing #25 or #26 — the default may have penalised NKI.")
+
+    # --- scope limit, stated because it is easy to overclaim from this probe ----------------
+    per_call = min(nkis) / N_CALLS
     print()
-    print("  Then update results/measurements.json: set the compiler_flags note and resolve the")
-    print("  'independent of compiler flags' open item.")
+    print("  SCOPE LIMIT — read before citing this as settling Findings #25/#26:")
+    print(f"    This measures WALL time. At {min(nkis):.2f} ms for {N_CALLS} calls that is")
+    print(f"    {per_call:.3f} ms/call, which is the post-fix DISPATCH floor — so this run is")
+    print("    ~97% dispatch and only a few percent device. It therefore establishes that the")
+    print("    DISPATCH cost is flag-invariant, and does NOT by itself settle whether the")
+    print("    DEVICE-time gap in #25/#26 depends on flags. For that, profile device time under")
+    print("    two settings:")
+    print("      NEURON_CC_FLAGS='--target trn2 --lnc 2' python scripts/run_device_profile_sweep.py \\")
+    print("          --calls 1 28 --ops silu")
+    print("    and compare against the default-flag profiles via analyse_fusion_barrier.py.")
+    print()
+    print("  Then update results/measurements.json: set the compiler_flags note and record what")
+    print("  this closed (dispatch) versus what remains open (device).")
     return 0
 
 

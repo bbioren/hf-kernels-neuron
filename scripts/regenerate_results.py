@@ -45,13 +45,13 @@ STAGES = [
 
     ("mfu-baseline-and-kernelized-512-fixed",
      [sys.executable, "scripts/measure_mfu.py", "--preset", "0.6b", "--seq", "512",
-      "--fix-target-detection", "--json-out", "RAW/mfu_512_fixed.json"], []),
+      "--fix-target-detection", "--json-out", "STAGE/mfu_512_fixed.json"], []),
     ("mfu-kernelized-512-nofix",
      [sys.executable, "scripts/measure_mfu.py", "--preset", "0.6b", "--seq", "512",
-      "--json-out", "RAW/mfu_512_nofix.json"], []),
+      "--json-out", "STAGE/mfu_512_nofix.json"], []),
     ("mfu-2048-fixed",
      [sys.executable, "scripts/measure_mfu.py", "--preset", "0.6b", "--seq", "2048",
-      "--fix-target-detection", "--json-out", "RAW/mfu_2048_fixed.json"], []),
+      "--fix-target-detection", "--json-out", "STAGE/mfu_2048_fixed.json"], []),
 
     ("fix-verification", [sys.executable, "scripts/probe_target_override_fix.py"], []),
     ("graph-batching", [sys.executable, "scripts/probe_neff_count.py"], []),
@@ -63,7 +63,7 @@ STAGES = [
 
     ("device-profile-28-calls",
      [sys.executable, "scripts/profile_nki_call_cost.py", "--calls", "28",
-      "--outdir", "RAW/prof_n28"], ["RAW/prof_n28/**/*.neff", "RAW/prof_n28/**/*.ntff"]),
+      "--outdir", "STAGE/prof_n28"], []),
 
     ("fusion-sweep",
      [sys.executable, "scripts/run_device_profile_sweep.py", "--calls", "1", "28"], []),
@@ -124,9 +124,13 @@ def main():
             shutil.rmtree(outdir)
         outdir.mkdir(parents=True)
 
-        # RAW placeholders resolve to this stage's directory, so scripts that take --outdir or
-        # --json-out write straight into the artifact tree.
-        resolved = [a.replace("RAW/", f"{RAW}/") for a in argv]
+        # Placeholders let a stage's --outdir / --json-out write into the artifact tree rather
+        # than /tmp. Two of them, because they mean different things:
+        #   STAGE/ -> this stage's own directory. Use for per-stage output, so it is picked up
+        #             by the artifact glob below and cannot collide with another stage.
+        #   RAW/   -> the shared raw root. Use only when a LATER stage must read the output
+        #             (the in-situ profiles are produced by two stages and consumed by a third).
+        resolved = [a.replace("STAGE/", f"{outdir}/").replace("RAW/", f"{RAW}/") for a in argv]
 
         print(f"[{i}/{len(stages)}] {name}")
         print(f"    {' '.join(resolved[1:])}", flush=True)
