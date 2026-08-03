@@ -1,0 +1,362 @@
+{
+  "_about": {
+    "purpose": "Single source of truth for every quantitative claim in this project. results/README.md is GENERATED from this file by scripts/render_results.py, so numbers cannot drift between the two.",
+    "provenance_status": {
+      "transcribed": "Number is recorded here from the run's stdout, which was captured in the git commit message at the listed SHA. The raw artifact (JSON/log/NEFF) is NOT in the repo — see _artifact_loss.",
+      "in_repo": "Raw artifact is committed under results/raw/."
+    },
+    "_artifact_loss": "The trn2 instance used for all measurements expired on 2026-08-02. Every raw artifact lived in /tmp on that host: measure_mfu --json-out files, neuron-explorer summary-json output, NEFF/NTFF profile pairs, and detached run logs. All are gone. The numbers survive because each run's stdout was pasted into the commit message at the time, and every producing script is committed. Nothing here is unreproducible, but nothing here is currently backed by a raw file either. `make results` regenerates the whole set into results/raw/ on a fresh instance. Logged as a sticking point: results should never have lived only on an ephemeral host.",
+    "hardware": "trn2.3xlarge, 1 Neuron device, 4 NeuronCores, LNC2 (2 logical cores), single logical core used unless stated",
+    "compiler_flags": "NEURON_CC_FLAGS unset for every measurement — compiler defaults throughout. This is a known open item: no run has confirmed the results are independent of default target/LNC selection.",
+    "versions": {
+      "kernels": "0.15.2",
+      "transformers": "5.15.0.dev0 (commit bb3ffb97)",
+      "torch": "2.9.1+cu128",
+      "torch_xla": "2.9.0",
+      "neuronx-cc": "2.26.6360.0+6f180f47",
+      "nki": "0.5.0"
+    }
+  },
+
+  "denominator": {
+    "note": "MFU denominator, stated explicitly because Trn2 has two conventions plus an LNC subtlety.",
+    "device_tflops_tensorengine_bf16": 632,
+    "device_tflops_published_bf16": 667,
+    "logical_cores_per_device": 2,
+    "logical_cores_used": 1,
+    "per_core_denominator_tflops": 316,
+    "source": "Cayman architecture doc; 632 is TensorEngine-only, 667 published includes VectorE + ScalarE"
+  },
+
+  "measurements": [
+    {
+      "id": "mfu-baseline-512",
+      "what": "Qwen3-0.6B forward, no kernels, seq 512",
+      "step_ms": 42.04,
+      "mfu_per_core_pct": 5.05,
+      "flops_per_step_gflop": 670.42,
+      "nki_calls_per_step": 0,
+      "script": "scripts/measure_mfu.py",
+      "command": "python scripts/measure_mfu.py --preset 0.6b --seq 512 --fix-target-detection",
+      "commit": "cd85e87",
+      "status": "transcribed",
+      "notes": "An earlier run of the same config measured 41.95 ms / 5.06%. Both appear in the docs; the 0.6% spread is run-to-run variation, not a discrepancy."
+    },
+    {
+      "id": "mfu-kernelized-512-nofix",
+      "what": "Qwen3-0.6B forward, all 3 NKI kernels, seq 512, WITHOUT the Finding #24 fix",
+      "step_ms": 8753.65,
+      "mfu_per_core_pct": 0.02,
+      "nki_calls_per_step": 169,
+      "slowdown_vs_baseline": 208,
+      "script": "scripts/measure_mfu.py",
+      "command": "python scripts/measure_mfu.py --preset 0.6b --seq 512",
+      "commit": "d02331c",
+      "status": "transcribed",
+      "notes": "This is the headline that prompted the whole root-cause investigation. 169 calls x 51.8 ms = 8754 ms, which closes against the measured 8753.65."
+    },
+    {
+      "id": "mfu-kernelized-512-fixed",
+      "what": "Qwen3-0.6B forward, all 3 NKI kernels, seq 512, WITH the Finding #24 fix",
+      "step_ms": 141.43,
+      "mfu_per_core_pct": 1.5,
+      "nki_calls_per_step": 169,
+      "slowdown_vs_baseline": 3.36,
+      "kernel_counts": {"RMSNorm": 113, "RoPE": 28, "SiLU": 28, "fallbacks": 0},
+      "script": "scripts/measure_mfu.py",
+      "command": "python scripts/measure_mfu.py --preset 0.6b --seq 512 --fix-target-detection",
+      "commit": "cd85e87",
+      "status": "transcribed",
+      "notes": "IQRs non-overlapping vs baseline. Residual added cost = 141.43 - 42.04 = 99.39 ms over 169 calls = 0.588 ms/call."
+    },
+    {
+      "id": "mfu-baseline-2048",
+      "what": "Qwen3-0.6B forward, no kernels, seq 2048",
+      "step_ms": 108.76,
+      "mfu_per_core_pct": 9.9,
+      "script": "scripts/measure_mfu.py",
+      "command": "python scripts/measure_mfu.py --preset 0.6b --seq 2048 --fix-target-detection",
+      "commit": "1dea278",
+      "status": "transcribed"
+    },
+    {
+      "id": "mfu-kernelized-2048-fixed",
+      "what": "Qwen3-0.6B forward, all 3 NKI kernels, seq 2048, WITH the fix",
+      "step_ms": 223.99,
+      "mfu_per_core_pct": 4.81,
+      "nki_calls_per_step": 169,
+      "slowdown_vs_baseline": 2.06,
+      "added_ms_per_call": 0.682,
+      "script": "scripts/measure_mfu.py",
+      "commit": "1dea278",
+      "status": "transcribed",
+      "notes": "Amortisation test: call count is fixed by model depth, so more sequence = more work per call. 2.59x more baseline work costs only 1.16x more per call, so the residual is near-fixed and the penalty nearly halves."
+    },
+    {
+      "id": "mfu-silu-only-512",
+      "what": "Qwen3-0.6B forward, NKI SiLU only, seq 512, WITHOUT the fix",
+      "step_ms": 1495.54,
+      "mfu_per_core_pct": 0.14,
+      "nki_calls_per_step": 28,
+      "script": "scripts/measure_mfu.py",
+      "command": "python scripts/measure_mfu.py --preset 0.6b --seq 512 --only SiLU",
+      "commit": "d02331c",
+      "status": "transcribed",
+      "notes": "Per-call attribution: 51.9 ms/call, matching the all-three figure of 51.6 ms/call. Uniformity across kernels is what pointed at a fixed per-invocation cost."
+    },
+
+    {
+      "id": "fix-verification",
+      "what": "Finding #24 fix, two independent methods, one process, baseline re-run last as control",
+      "variants": [
+        {"variant": "baseline (no override)", "ms_per_call": 51.74, "speedup": null, "cos_sim": 0.999938},
+        {"variant": "NEURON_PLATFORM_TARGET_OVERRIDE=trn2", "ms_per_call": 0.5, "speedup": 102.8, "cos_sim": 0.999938},
+        {"variant": "lru_cache(_detect_target)", "ms_per_call": 0.49, "speedup": 105.5, "cos_sim": 0.999938},
+        {"variant": "baseline again (control)", "ms_per_call": 51.43, "speedup": null, "cos_sim": 0.999938}
+      ],
+      "script": "scripts/probe_target_override_fix.py",
+      "command": "python scripts/probe_target_override_fix.py",
+      "commit": "c898e8e",
+      "status": "transcribed",
+      "notes": "The override is set to whatever _detect_target() returns on the host, never hardcoded, because a wrong target would compile for the wrong hardware and could be silently wrong. cos_sim identical to 6 dp across all four, so neither fix changes what gets compiled."
+    },
+
+    {
+      "id": "graph-batching",
+      "what": "Do N NKI calls share one XLA graph and one device execution? Counted via torch-xla ExecuteTime metric.",
+      "variants": [
+        {"variant": "28 NKI calls, 1 mark_step", "wall_ms": 1446.37, "device_executions": 1, "ms_per_call": 51.66},
+        {"variant": "1 NKI call, 1 mark_step", "wall_ms": 52.8, "device_executions": 1, "ms_per_call": 52.8},
+        {"variant": "28 torch ops, 1 mark_step", "wall_ms": 1.23, "device_executions": 1, "ms_per_call": 0.04},
+        {"variant": "1 torch op, 1 mark_step", "wall_ms": 0.25, "device_executions": 1, "ms_per_call": 0.25}
+      ],
+      "graph_nodes_28_calls": 196,
+      "executions_before_mark_step": 0,
+      "script": "scripts/probe_neff_count.py",
+      "command": "python scripts/probe_neff_count.py",
+      "commit": "7f3deaf",
+      "status": "transcribed",
+      "notes": "compiles=0 on every variant, 3 samples each within 0.1%. The 28 calls DID share one graph (196 nodes = 28x7) and still cost 28x, so graph batching was never the lever. execs-before-mark_step = 0 rules out nki.jit self-synchronising."
+    },
+    {
+      "id": "host-vs-device-split",
+      "what": "Where the wall time goes for a 28-NKI-call graph",
+      "wall_ms": 1459.28,
+      "host_issue_ms": 1458.15,
+      "host_issue_pct": 99.9,
+      "mark_step_ms": 0.39,
+      "wait_device_ops_ms": 0.74,
+      "torch_xla_ExecuteTime_ms": 0.92,
+      "torch_xla_LazyTracing_ms": 0.28,
+      "torch_xla_TransferToDeviceTime_ms": 0.0,
+      "torch_xla_CompileTime_ms": 0.0,
+      "script": "scripts/probe_where_is_the_time.py",
+      "command": "python scripts/probe_where_is_the_time.py",
+      "commit": "c898e8e",
+      "status": "transcribed",
+      "notes": "torch-xla metric accumulators are NANOSECONDS; an earlier read of them as seconds produced a nine-digit millisecond figure. Cross-check against metrics_report(), which prints explicit units."
+    },
+    {
+      "id": "cprofile-attribution",
+      "what": "cProfile of one NKI call, before and after the fix",
+      "before_fix": {
+        "single_call_ms": [52.6, 52.38, 52.76, 51.92, 50.85, 52.17],
+        "attribution": "51 of 52 ms in select.poll <- subprocess.check_output <- _detect_target <- resolve_target <- _compile_opts",
+        "control_torch_op_ms": [0.43, 0.04, 0.02]
+      },
+      "after_fix": {
+        "single_call_ms": [0.72, 0.49, 0.43, 0.44, 0.4, 0.45],
+        "attribution": "create_computation <- xla_op_registry <- nki/framework/_torch_xla.py, plus pyhlo scribe x56 and protobuf enum lookups x168"
+      },
+      "script": "scripts/probe_inside_one_call.py",
+      "command": "python scripts/probe_inside_one_call.py [--fix-target-detection]",
+      "commit": "c898e8e",
+      "status": "transcribed",
+      "notes": "Calls timed with NO mark_step and NO sync, so the cost is proven synchronous inside the call rather than deferred."
+    },
+
+    {
+      "id": "device-profile-28-nki-calls",
+      "what": "neuron-explorer profile of the NEFF containing 28 NKI SiLU calls",
+      "device_total_time_ms": 0.609,
+      "mbu_pct": 43.0,
+      "total_active_time_pct": 95.0,
+      "activate_instruction_count": 112,
+      "hbm_read_bytes": 94371840,
+      "hbm_write_bytes": 94371840,
+      "script": "scripts/profile_nki_call_cost.py + scripts/summarise_device_profiles.py",
+      "command": "python scripts/profile_nki_call_cost.py --calls 28 --outdir results/raw/prof_n28",
+      "commit": "27136ae",
+      "status": "transcribed",
+      "notes": "activate_instruction_count 112 = 28 x 4 confirms all 28 calls are in this one NEFF. 0.609 ms device against 1459 ms wall is the 2400x ratio that ruled out every device-side explanation at once."
+    },
+
+    {
+      "id": "nki-vs-torch-device",
+      "what": "Device time, NKI kernel vs the torch op it replaces, identical work both ways",
+      "rows": [
+        {"op": "silu", "impl": "nki", "calls": 28, "device_ms": 0.607, "hbm_mb": 188.7, "mbu_pct": 43.2, "active_pct": 95.1},
+        {"op": "silu", "impl": "torch", "calls": 28, "device_ms": 0.224, "hbm_mb": 6.3, "mbu_pct": 3.9, "active_pct": 97.8},
+        {"op": "rmsnorm", "impl": "nki", "calls": 28, "device_ms": 1.625, "hbm_mb": 188.8, "mbu_pct": 16.2, "active_pct": 99.1},
+        {"op": "rmsnorm", "impl": "torch", "calls": 28, "device_ms": 0.637, "hbm_mb": 6.4, "mbu_pct": 1.4, "active_pct": 94.4},
+        {"op": "silu", "impl": "nki", "calls": 1, "device_ms": 0.052, "hbm_mb": 18.87, "mbu_pct": 47.0, "active_pct": 86.0},
+        {"op": "silu", "impl": "torch", "calls": 1, "device_ms": 0.026, "hbm_mb": 6.29, "mbu_pct": 33.4, "active_pct": 80.3},
+        {"op": "rmsnorm", "impl": "nki", "calls": 1, "device_ms": 0.091, "hbm_mb": 18.88, "mbu_pct": 27.5, "active_pct": 87.1},
+        {"op": "rmsnorm", "impl": "torch", "calls": 1, "device_ms": 0.039, "hbm_mb": 7.88, "mbu_pct": 28.4, "active_pct": 90.9}
+      ],
+      "marginal_traffic_regression": {
+        "note": "traffic(N) = FIXED + N x MARGINAL, solved from the N=1 and N=28 points. Unfused floor for a [512,3072] bf16 tile is 2 tiles = 6.29 MB.",
+        "silu_nki_marginal_mb": 6.29,
+        "silu_nki_vs_floor": 1.0,
+        "silu_torch_marginal_mb": 0.0,
+        "rmsnorm_nki_marginal_mb": 6.29,
+        "rmsnorm_nki_vs_floor": 1.0,
+        "rmsnorm_torch_marginal_mb": 0.0
+      },
+      "script": "scripts/profile_nki_vs_torch_device.py, scripts/run_device_profile_sweep.py, scripts/analyse_fusion_barrier.py",
+      "command": "make fusion",
+      "commit": "a163e0c",
+      "status": "transcribed",
+      "notes": "CHAINED microbenchmark: 28 identical ops back to back. This maximises the compiler's fusion opportunity and is therefore NKI's worst case. Do not quote the 2.5-2.7x ratio without the in-situ figure below. NKI marginal traffic is exactly the unfused floor, so the kernels spill nothing and the gap is the forfeited fusion, not kernel quality."
+    },
+
+    {
+      "id": "in-situ-device-vs-dispatch",
+      "what": "Real Qwen3-0.6B forward: how much of the regression is device vs dispatch",
+      "baseline": {"neffs": 1, "device_ms": 14.329, "hbm_mb": 2662.4, "activates": 8038, "wall_ms": 46.65},
+      "kernelized": {"neffs": 1, "device_ms": 22.722, "hbm_mb": 3779.9, "activates": 16468, "wall_ms": 146.65},
+      "wall_gap_ms": 100.0,
+      "device_gap_ms": 8.392,
+      "device_gap_pct": 8.4,
+      "dispatch_gap_ms": 91.608,
+      "dispatch_gap_pct": 91.6,
+      "per_call_device_ms": 0.0497,
+      "per_call_dispatch_ms": 0.5421,
+      "projected_with_dispatch_fixed": {"step_ms": 55.04, "slowdown_vs_baseline": 1.18, "status": "PROJECTION, not measured"},
+      "script": "scripts/profile_model_device_time.py + scripts/sum_model_device_time.py",
+      "command": "make insitu",
+      "commit": "5f50f5e",
+      "status": "transcribed",
+      "notes": "THIS IS THE NUMBER TO LEAD WITH. Wall times here (46.65/146.65) come from the profiled run rather than measure_mfu (42.04/141.43) because NEURON_RT_INSPECT adds a few ms; the decomposition uses one consistent pair. HBM traffic includes weights, so the 1.42x ratio dilutes the activation-only effect and is not the fusion penalty directly."
+    },
+
+    {
+      "id": "fused-mlp-vs-torch",
+      "what": "nkilib fused MLP vs torch (3 matmuls + silu), device time, distinct weights per block",
+      "rows": [
+        {"shape": "H=1024 I=3072", "blocks": 28, "impl": "nki", "device_ms": 8.321, "per_block_ms": 0.2972, "hbm_mb": 2172.6, "mbu_pct": 36.5, "cos_sim": 0.999979},
+        {"shape": "H=1024 I=3072", "blocks": 28, "impl": "torch", "device_ms": 2.782, "per_block_ms": 0.0993, "hbm_mb": 1059.1, "mbu_pct": 53.2, "cos_sim": 0.999979},
+        {"shape": "H=4096 I=4096", "blocks": 8, "impl": "nki", "device_ms": 11.625, "per_block_ms": 1.4532, "hbm_mb": 3288.3, "mbu_pct": 39.5, "cos_sim": 0.999977},
+        {"shape": "H=4096 I=4096", "blocks": 8, "impl": "torch", "device_ms": 4.18, "per_block_ms": 0.5225, "hbm_mb": 1619.1, "mbu_pct": 54.1, "cos_sim": 0.999977}
+      ],
+      "ratios": {"H1024_I3072": 2.99, "H4096_I4096": 2.78},
+      "weight_transpose_cost": {
+        "note": "Finding #17 (weight layout) quantified. Separate NEFF, one-time at load rather than per step.",
+        "H1024_I3072": {"device_ms": 3.533, "hbm_mb": 1172.3},
+        "H4096_I4096": {"device_ms": 6.726, "hbm_mb": 2223.0}
+      },
+      "script": "scripts/profile_fused_mlp_vs_torch.py",
+      "command": "python scripts/profile_fused_mlp_vs_torch.py --impl {nki,torch} --calls 28",
+      "commit": "8a23ae9",
+      "status": "transcribed",
+      "notes": "H=1024/I=3072 is Qwen3-0.6B's MLP shape and is INSIDE Finding #18's compile limit, so this kernel works for the benchmarked model. A first version of this measurement shared one weight set across all 28 blocks, letting the compiler amortise one weight load; torch showed 12.1 MB/block against an 18.9 MB weight set, which exposed it. Fixed to per-block weights (528 MB total)."
+    },
+    {
+      "id": "fused-mlp-compile-boundary",
+      "what": "Fused MLP single-core compile boundary vs intermediate_size",
+      "data_points": [
+        {"hidden": 1024, "intermediate": 3072, "result": "pass", "cos_sim": 0.999995},
+        {"hidden": 1024, "intermediate": 4096, "result": "pass", "cos_sim": 0.999996},
+        {"hidden": 1024, "intermediate": 5120, "result": "compile error"},
+        {"hidden": 2048, "intermediate": 4096, "result": "pass", "cos_sim": 0.999988},
+        {"hidden": 2048, "intermediate": 6144, "result": "compile error"},
+        {"hidden": 4096, "intermediate": 4096, "result": "pass", "cos_sim": 0.999979},
+        {"hidden": 4096, "intermediate": 4224, "result": "compile error"},
+        {"hidden": 4096, "intermediate": 4608, "result": "compile error"},
+        {"hidden": 4096, "intermediate": 5120, "result": "compile error"},
+        {"hidden": 4096, "intermediate": 12288, "result": "compile error"}
+      ],
+      "conclusion": "passes iff intermediate_size <= 4096; boundary is between 4096 and 4224; not a ratio effect",
+      "error": "'floordiv' does not allow division by zero, in nkilib/core/utils/kernel_helpers.py:104 via mlp_cte_tile_info.py:236",
+      "script": "scripts/spike_nkilib_mlp.py",
+      "commit": "d02331c",
+      "status": "transcribed",
+      "notes": "REFRAMED by Finding #26: this is a design boundary, not a bug. A floordiv by zero on a shard-count calculation is what happens with no SPMD shard grid. Originally filed as an nki-library bug to fix."
+    },
+
+    {
+      "id": "accuracy-suites",
+      "what": "All five test suites, NKI execution asserted by call counters",
+      "suites": [
+        {"suite": "tests/test_rmsnorm_nki.py", "result": "PASS", "seconds": 13.0, "cases": "11/11"},
+        {"suite": "tests/test_rope_nki.py", "result": "PASS", "seconds": 16.9, "cases": "20/20 + 6/6 guards"},
+        {"suite": "tests/test_silu_nki.py", "result": "PASS", "seconds": 15.6, "cases": "9/9"},
+        {"suite": "tests/test_qwen3_neuron_e2e.py", "result": "PASS", "seconds": 16.5},
+        {"suite": "tests/test_qwen3_moe_e2e.py", "result": "PASS", "seconds": 16.1}
+      ],
+      "e2e_logits_cos_sim": {"qwen3_dense": 1.000001, "qwen3_moe": 1.000002},
+      "script": "scripts/run_all_tests.py",
+      "command": "make test-all",
+      "commit": "3b94d88",
+      "status": "transcribed"
+    },
+
+    {
+      "id": "torch-compile-diagnosis",
+      "what": "Is torch.compile broken on this stack? (Finding #23)",
+      "torch": "2.9.1+cu128",
+      "torch_xla": "2.9.0",
+      "openxla_backend_registered": true,
+      "results": [
+        {"op": "add", "cpu": "OK", "xla": "OK"},
+        {"op": "mul", "cpu": "OK", "xla": "OK"},
+        {"op": "relu", "cpu": "OK", "xla": "OK"},
+        {"op": "silu", "cpu": "OK", "xla": "FAILS"}
+      ],
+      "root_cause": "torch_neuronx replaces certain ATen ops with XLA user computations. The dispatch predicate is `if any(is_xla_tensor(it) or is_xla_device(it) ...)`, which a FakeTensor on xla:0 satisfies, so Dynamo's fake-tensor pass is routed into _xla_user_computation and rejected. No abstract impls.",
+      "affected_ops": ["gelu", "silu", "randn", "CrossEntropyLoss", "Dropout", "Embedding", "clip_grad_norm_", "argmax", "Softmax", "topk", "upsample_nearest2d"],
+      "workaround": "torch_xla.compile() works; verified same value as eager (sum = 902.0360)",
+      "script": "scripts/diagnose_torch_compile.py",
+      "command": "python scripts/diagnose_torch_compile.py",
+      "commit": "7f3deaf",
+      "status": "transcribed",
+      "notes": "Affected list includes Embedding, Softmax and CrossEntropyLoss, so this hits essentially any transformer. Unrelated to the Kernel Hub; filed because we found it."
+    },
+
+    {
+      "id": "interception-coverage",
+      "what": "Upstream transformers coverage of the interception points we target",
+      "rmsnorm_registrations": 115,
+      "rope_model_files": 95,
+      "silu_decorations": 1,
+      "silu_note": "one decoration covers every ACT2FN['silu'] user",
+      "script": "scripts/neuron_kernel_registration.py",
+      "commit": "83b6269",
+      "status": "transcribed",
+      "notes": "Higher than the project guide's estimate of 87 RMSNorm / 66 RoPE."
+    }
+  ],
+
+  "open_items": [
+    {
+      "item": "No run has confirmed the results are independent of compiler flags",
+      "detail": "NEURON_CC_FLAGS was unset for every measurement. Setting --target trn2 --lnc {1,2} explicitly has not been tried. This should be the first thing re-run on a fresh instance, because a config artifact would undermine the device-time comparisons specifically.",
+      "priority": "high"
+    },
+    {
+      "item": "Is the per-call create_computation rebuild cacheable?",
+      "detail": "91.6% of the remaining regression. Not attempted: inside torch_xla's op-registry path, and a wrong guess could be silently incorrect rather than error.",
+      "priority": "high"
+    },
+    {
+      "item": "Can a NKI custom call participate in compiler fusion?",
+      "detail": "Decides whether the last ~18% after the dispatch fix is recoverable.",
+      "priority": "medium"
+    },
+    {
+      "item": "Does a kernel spanning a fused region beat the compiler on that region?",
+      "detail": "The fused MLP answers this for single-core (no, by ~3x). Unmeasured multi-core with an SPMD grid, which is the configuration the kernel was built for.",
+      "priority": "medium"
+    }
+  ]
+}

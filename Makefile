@@ -10,11 +10,27 @@ PYTHON := $(VENV)/bin/python
 PIP := $(VENV)/bin/pip
 
 .PHONY: help venv install verify demo test test-nki test-e2e test-all probe mfu mfu-unfixed \
-        mfu-amortisation rootcause fusion profile experiments registration sync lint clean versions
+        mfu-amortisation rootcause fusion insitu profile experiments registration sync lint clean \
+        versions results results-render
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
-		awk 'BEGIN {FS = ":.*?## "}; {printf "  %-15s %s\n", $$1, $$2}'
+		awk 'BEGIN {FS = ":.*?## "}; {printf "  %-18s %s\n", $$1, $$2}'
+
+results: ## Re-run EVERY measurement, writing raw artifacts into results/raw/ (30-60 min, on trn2)
+	$(PYTHON) scripts/regenerate_results.py
+
+results-render: ## Regenerate results/README.md from results/measurements.json (runs anywhere)
+	python3 scripts/render_results.py
+
+insitu: ## Finding #26 in-situ split: how much of the regression is device vs dispatch
+	$(PYTHON) scripts/profile_model_device_time.py --mode baseline \
+		--outdir results/raw/prof_model_baseline
+	$(PYTHON) scripts/profile_model_device_time.py --mode kernelized \
+		--outdir results/raw/prof_model_kernelized
+	$(PYTHON) scripts/sum_model_device_time.py \
+		results/raw/prof_model_baseline results/raw/prof_model_kernelized \
+		--wall-baseline 46.65 --wall-kernelized 146.65 --nki-calls 169
 
 venv: ## Create venv linked to Neuron PyTorch environment
 	@if [ -d "$(NEURON_VENV)" ]; then \
