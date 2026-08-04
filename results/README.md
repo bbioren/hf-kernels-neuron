@@ -2,7 +2,7 @@
 
 **GENERATED FILE — do not edit.** Source of truth is [`measurements.json`](measurements.json); regenerate with `python scripts/render_results.py`.
 
-Rendered 2026-08-03 20:40 UTC from commit `9e1a089`.
+Rendered 2026-08-04 19:46 UTC from commit `b475382`.
 
 ## Read this before quoting any number
 

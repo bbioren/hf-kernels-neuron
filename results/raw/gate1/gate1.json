@@ -1,0 +1,38 @@
+{
+  "dep": "nki",
+  "torch": "2.9.1+cu128",
+  "before": {
+    "backend": {
+      "repr": "CUDA(version=<Version('12.8')>)",
+      "name": "cuda",
+      "error": null
+    },
+    "declare": {
+      "ok": false,
+      "error": "ValueError: Kernel module `probe_gate1` uses unsupported kernel dependency: nki"
+    },
+    "load": {
+      "ok": false,
+      "error": "ValueError: Kernel module `neuron_rope` uses unsupported kernel dependency: nki"
+    }
+  },
+  "after": {
+    "backend": {
+      "repr": "Neuron()",
+      "name": "neuron",
+      "error": null
+    },
+    "declare": {
+      "ok": true,
+      "error": null
+    },
+    "load": {
+      "ok": true,
+      "error": null
+    }
+  },
+  "backend_fixed": true,
+  "declare_works_after": true,
+  "load_works_after": true,
+  "build_variant_resolution": "UNTESTED \u2014 our kernels have no build/ directory"
+}
