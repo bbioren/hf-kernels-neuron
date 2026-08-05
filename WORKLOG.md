@@ -983,7 +983,32 @@ read before it goes out.
 
 **B10. Who owns `nki/compiler/target.py`, and do I write the CR?** Highest-value item in the
 project, one decorator, reproducer in `scripts/probe_target_override_fix.py`. Not Kernel Hub
-specific — any eager per-layer NKI use pays this today.
+specific — any eager per-layer NKI use pays this today. **Still applies on the native stack**:
+re-checked the installed 0.6.0b1 source and `_detect_target` still shells out to `neuron-ls` with no
+caching decorator anywhere in the file. Its *cost* on native is unmeasured, because the fix was
+applied to both native MFU runs.
+
+*Partial answer, found 2026-08-05.* Package metadata gives the repo and a generic contact:
+`github.com/aws-neuron/private-nki-staging`, `neuron-support@amazon.com`. The Neuron Expert Directory
+(`w.amazon.com/bin/view/AWS/Neuron/Operations/Experts/`) lists NKI owners by area:
+
+| alias | listed area |
+|---|---|
+| `ggandii` | NKI, NKI APIs, NKICodegen, NKI docs generation |
+| `qieqingy` | NKI, NKI FAL integration, allocated NKI kernels, NKI GitHub repo, CustomOp |
+| `zhehongb` | Penguin / Tensorizer, NKI — Principal Compiler Engineer on the NKI compiler stack |
+| `gjfreema` | team writing kernels (NKI, BIR), open-source NKI kernel repo, kernel perf analysis |
+| `parivak` | NKI |
+
+`compiler/target.py` is plumbing in the compiler subpackage, so `ggandii` (NKI APIs) or `qieqingy`
+(repo/integration) look closest, with `zhehongb` as escalation. **That is inference from a directory,
+not confirmed file ownership** — worth one message to confirm rather than assuming. NKI defects are
+tracked as `NKI-####` and fixed by ordinary CRs (e.g. NKI-1288 in the 2026-03-16 FrameworkInference
+oncall report), so the mechanics are standard.
+
+So the open question is narrower than "who owns it": **should an intern send a CR against a core SDK
+component, or hand it to one of the above with the reproducer?** That is the judgement call, and it is
+the part worth asking a mentor.
 
 **B11. Is `NEURON_PLATFORM_TARGET_OVERRIDE` customer-supported or internal-only?** Decides whether
 it can be documented as a workaround. Related and worth raising together: with no `neuron-ls` on
