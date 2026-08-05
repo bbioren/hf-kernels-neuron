@@ -9,6 +9,55 @@
 
 ---
 
+## UPDATE 2026-08-05 — read this first if you read an earlier version
+
+Three things changed after this document was written, and two of them change its conclusions. The body
+below is unedited; this block is the diff.
+
+**1. Both integration gates were my own mistake, and the headline upstream ask is withdrawn.** The body
+treats `use_kernels=True` being unable to reach Neuron as a finding requiring a transformers patch.
+It was an artifact of running on **torch-xla**. On the Native PyTorch drop — the stack HuggingFace
+intends — `model.device.type` is `"neuron"`, `kernels._backend()` returns `Neuron()`, and stock
+`use_kernels=True` swaps all three kernels with **no patching at all** (9 RMSNorm / 2 RoPE / 2 SiLU,
+zero fallbacks, logits `cos_sim 1.000001`). All three kernels also compile and run under the native
+stack's different compiler and NKI 0.6.0b1. Findings #31. The remaining upstream ask is one item, not
+three: add the `"neuron"` entries to transformers' kernel mapping.
+
+**2. Every performance number below is torch-xla-scoped, and on native the sign flips — which is NOT a
+win.** Read this before quoting anything:
+
+| seq | stack | baseline | kernelized | verdict |
+|---|---|---|---|---|
+| 512 | torch-xla | 43.94 ms | 71.32 ms | 1.62x slower |
+| 512 | native | **189.97 ms** | **96.46 ms** | *1.97x faster* |
+| 2048 | torch-xla | 117.78 ms | 161.04 ms | 1.37x slower |
+| 2048 | native | **340.74 ms** | **251.86 ms** | *1.35x faster* |
+
+The native baseline is **4.32x slower** than the XLA one, so the ratio moved because the denominator got
+worse. Native kernelized MFU (2.20%) is *below* XLA kernelized MFU (2.98%). Nothing got faster. This is
+the same trap as the `--lnc 1` row in the compiler-flag control, at model scale. Finding #32.
+
+It does support the fusion argument from the opposite direction, though: native is eager with no
+whole-forward graph, so there is far less fusion for a NKI custom call to block — and the barrier stops
+costing much. **The fusion penalty only exists where there is fusion.**
+
+**3. A second winning candidate, and the repo-home question dissolved.** Samir Araujo pointed out a
+fused RMSNorm+MLP path we had missed (`normalization_type=NormType.RMS_NORM`); it beats torch **1.76x**
+at Qwen3-0.6B's MLP shape and loses 1.45x at H=4096/I=4096 — a shape window, like attention. But the
+`intermediate_size > 4096` single-core compile boundary is **unchanged on the new compiler**, so every
+deployed model is still excluded. Finding #33. Separately, the Hub trust gate turned out to be a
+settable org flag rather than a hardcoded `kernels-community` check, and a mapping entry can bypass it
+anyway — upstream already does this for a non-`kernels-community` CUDA kernel. Finding #34.
+
+**What the recommendation is now**, replacing the body's version: the mechanism works and costs
+HuggingFace one small addition; the ops the Kernel Hub intercepts most widely are the ones with least
+to gain; two candidates do beat the compiler and both were built for a **multi-core SPMD launch** and
+are being run single-core. So the gating question is **can `kernelize()` express a multi-core launch?**
+Weight layout, the compile boundary, and the dispatch caches are all downstream of it.
+[`deliverables/poc-document.md`](poc-document.md) is maintained as the live version.
+
+---
+
 ## The correction that prompted this document
 
 You said there should not be a slowdown, and that we should see a speedup. **Both are right, and my
