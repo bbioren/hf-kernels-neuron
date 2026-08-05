@@ -437,3 +437,102 @@ actually made this a 30-second fix rather than a hunt.
 catches it.* Both of this session's two new checks were verified against a deliberate break — removing
 the `!*.log` negation, and the prefix anchor — and both times the negative control was the only reason
 I knew the check worked. A green check is evidence only if red is reachable.
+
+---
+
+## 24. A four-minute silent hang that was `PATH`, and that I nearly "fixed" by replacing the host driver [cost: ~50 min, and a near-miss on breaking the whole environment]
+
+First contact with the Native PyTorch drop. Ran a minimal probe: create two device tensors, matmul,
+compare. It printed up to `matmul on device ...` and then produced nothing for four minutes.
+
+What was visible at that point all pointed one way:
+
+```
+parent  29 threads, main on futex_do_wait, one thread on do_wait_intr_irq (waitpid)
+child    1 thread,  futex_do_wait
+```
+
+Neither process using CPU. No `neuronx-cc` process. py-spy showing both stopped at the same Python
+line with no frames beneath it. That is a textbook **fork-from-a-multithreaded-process deadlock** —
+`fork()` copies only the calling thread, so a lock held by any of the other 28 is held forever in the
+child, which blocks before `exec` while the parent waits on it.
+
+**The dangerous part was that this diagnosis came with a plausible and expensive remedy.** The drop
+ships its own driver, runtime, collectives and tools debs at internal build numbers
+(`runtime-lib 2.x.59853.0`, `dkms 2.x.9869.0`) against the host's public `2.33.10.0` / `2.29.0.0`, and
+Samir's instruction was to install them. "Native pip packages on a mismatched production runtime hangs
+on first execution" is a completely credible story. Installing those debs would have replaced the host
+Neuron driver and runtime, which would very likely have broken the XLA venv that every measurement in
+this project was taken on — a ~10 minute DKMS rebuild each way to undo, assuming it undid cleanly.
+
+`strace -f -e trace=clone,execve` took about a minute and gave the actual answer:
+
+```
+execve("/usr/local/sbin/neuronx-cc", ["neuronx-cc", "compile", "module.mlir", ...]) = -1 ENOENT
+execve("/usr/local/bin/neuronx-cc",  ...) = -1 ENOENT     ... and 5 more, the whole PATH
+```
+
+On the first op needing a compile, the runtime forks and `execve`s **`neuronx-cc` by bare name**
+through `PATH`. It lives in `native_venv/bin/`, and I had launched
+`/home/ubuntu/native_venv/bin/python <script>` — an absolute path, which does **not** put the venv's
+`bin/` on `PATH`. Every entry missed, and the child then hung rather than reporting it.
+
+Activating the venv fixed it entirely. The same matmul completes in 1.21 s at `cos_sim 1.000002`, and
+the deb packages turned out not to be needed at all.
+
+**Three things to carry forward.**
+
+*Invoking `venv/bin/python` directly is not equivalent to activating.* For almost all Python tooling
+it is. It stops being true the moment a **subprocess** resolves a binary through `PATH` — which is
+exactly what this compiler invocation does. Fixed permanently with `scripts/run_native.sh`, which
+activates, asserts `neuronx-cc` resolves, prints the compiler version, and refuses to run otherwise.
+
+*Changing instrument beat refining the diagnosis.* More process inspection would never have falsified
+the fork-deadlock theory, because every process-state observation was genuinely consistent with it.
+`strace` answered it in one shot. This is the fifth time in this project (#8, #19, #21→#24, #29's SBUF
+story, this) that a well-fitting hypothesis was wrong and only a *different kind* of measurement
+killed it.
+
+*Following an explicit instruction immediately would have been the expensive choice.* Samir said to
+install the debs, and that was reasonable advice for the situation as described to him. Diagnosing
+before executing is what kept the environment intact — and the diagnosis showed the instruction
+addressed a problem that did not exist. Worth noting because deferring an instruction from the person
+helping you feels like the wrong call in the moment.
+
+---
+
+## 25. A structural counter contradicted an execution counter, and the verdict followed the wrong one [cost: ~20 min, one false negative on the project's decisive test]
+
+The decisive Native PyTorch test — does stock `use_kernels=True` reach Neuron without any patch —
+printed this:
+
+```
+    RoPE    swapped : 0  (expected 2)
+    ...
+    RoPE    dispatch : nki=2 fallback=0
+```
+
+and then concluded **"Gate 2 NOT cleared."** Two lines of the same output directly contradict each
+other, and the pass criterion happened to be wired to the wrong one.
+
+The dispatch counter is right: the NKI RoPE kernel ran twice, once per layer. The structural counter
+walks `named_modules()` looking for instance-level `forward` overrides, and function kernels are
+invisible to it for two independent reasons — stock `kernelize()` ends with
+`finally: model.apply(detach_hidden_kernels)`, which `delattr`s the submodule alias, and the swap
+mutates `fn.forward` rather than adding an attribute to any model submodule.
+
+Two lessons, and the first is embarrassing because the project already knew it.
+
+**Finding #8 established that execution counters are authoritative and structural inspection is
+not.** That is the single most-repeated methodological point in this work. The probe collected the
+right evidence and then adjudicated on the weaker signal anyway. Having the correct principle written
+down is not the same as wiring it into the pass condition.
+
+**And the obvious fix would also have failed.** My first repair matched qualnames inside
+`_hidden_kernels` — which still returned 0, because the post-swap qualname is *identical* to the
+pre-swap one: `_create_func_module.<locals>.Func.forward` both times, since the kernels library wraps
+our function in a freshly generated `Func` module. Only object identity distinguishes them. Snapshot
+`id(fn.forward)` before `kernelize()` and compare after: 2/2.
+
+Had this run once and been believed, the conclusion would have been "Gate 2 survives on native" —
+the exact opposite of the truth, on the question the whole native investigation existed to answer.

@@ -1,0 +1,64 @@
+{
+  "stack": "native",
+  "torch": "2.11.0+cu130",
+  "shim_used": false,
+  "gate1": {
+    "backend_name": "neuron",
+    "hasattr_torch_neuron": true
+  },
+  "kernelize_is_stock": true,
+  "kernelize_qualname": "transformers.integrations.hub_kernels.kernelize",
+  "model_device_type": "neuron",
+  "swaps": {
+    "rmsnorm": 9,
+    "rope": 2,
+    "silu": 2
+  },
+  "rope_slots_changed": {
+    "model.layers.0.self_attn::rotary_pos_emb": {
+      "before": {
+        "id": 132348518209856,
+        "qualname": "_create_func_module.<locals>.Func.forward"
+      },
+      "after": {
+        "id": 132347867058304,
+        "qualname": "_create_func_module.<locals>.Func.forward"
+      }
+    },
+    "model.layers.1.self_attn::rotary_pos_emb": {
+      "before": {
+        "id": 132348518209856,
+        "qualname": "_create_func_module.<locals>.Func.forward"
+      },
+      "after": {
+        "id": 132347867058304,
+        "qualname": "_create_func_module.<locals>.Func.forward"
+      }
+    }
+  },
+  "swaps_note": "rope is counted as the number of _hidden_kernels slots whose forward changed identity across kernelize(), NOT from named_modules(). Two reasons a module walk cannot see it: stock kernelize() detaches the submodule alias in its finally block (hub_kernels.py:603-627), and the swap mutates fn.forward rather than adding an instance attribute to a model submodule. The dispatch counters are authoritative.",
+  "swaps_expected": {
+    "rmsnorm": 9,
+    "rope": 2,
+    "silu": 2
+  },
+  "dispatch": {
+    "rmsnorm": {
+      "nki": 9,
+      "fallback": 0
+    },
+    "rope": {
+      "nki": 2,
+      "fallback": 0
+    },
+    "silu": {
+      "nki": 2,
+      "fallback": 0
+    }
+  },
+  "logits_cos_sim": 1.000001311302185,
+  "logits_max_diff": 5.960464477539062e-07,
+  "gate2_gone": true,
+  "passed": true,
+  "structural_counts_ok": true
+}

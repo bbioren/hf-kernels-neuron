@@ -199,3 +199,90 @@ That message names `silu` and mentions XLA tensor types, which invites the concl
 `torch.compile` is unsupported on Neuron generally. We drew exactly that conclusion and recorded it
 as a finding before checking. `add`/`mul`/`relu` compile fine. The workaround
 (`torch_xla.compile()`) exists and is undocumented in this context.
+
+---
+
+## Native PyTorch changes the customer story substantially — and adds one severe new trap
+
+Everything above was written against the torch-xla stack. On the Native PyTorch drop
+(`torch 2.11.0`, `torch-neuronx 0.1.0`, NKI 0.6.0b1) the two worst *integration* problems in this
+document simply do not exist, and one new *operational* problem is worse than any of them.
+
+### What gets better
+
+| | torch-xla | Native PyTorch |
+|---|---|---|
+| `model.device.type` | `"xla"` | **`"neuron"`** |
+| `kernels._backend()` | `CUDA(version=12.8)` | **`Neuron()`** |
+| `hasattr(torch, "neuron")` | False | **True** |
+| declaring `"python-depends": ["nki"]` | rejected — validates against the cuda table | **accepted** |
+| stock `use_kernels=True` reaching a Neuron kernel | never | **works, unpatched** |
+
+So the two monkeypatches this project carried for weeks are not needed. A customer on the supported
+stack does not hit either. That is a materially better story than the one in the sections above, and
+it is worth stating plainly rather than burying: **the device-routing and dependency-declaration
+friction was an artifact of using the wrong stack, and it was our mistake, not HuggingFace's.**
+
+What a customer *still* cannot do is `use_kernels=True` and get NKI kernels, because transformers ships
+no `"neuron"` entries in `_KERNEL_MAPPING`. That is the one real remaining blocker, and it is a small,
+well-understood addition rather than an architectural gap.
+
+### The new trap, and it is severe
+
+**If `neuronx-cc` is not on `PATH`, the first real operation hangs forever with no output.**
+
+Not an error. Not a timeout. The process blocks indefinitely, at the first op that needs a compile,
+having printed nothing useful. Underneath, the runtime forks a child and `execve`s `neuronx-cc` by bare
+name; all seven `PATH` entries return `ENOENT`; the child then blocks before it can report anything and
+the parent waits on the child.
+
+The reason a customer will hit this is subtle and unlucky:
+
+```bash
+/home/ubuntu/native_venv/bin/python train.py     # hangs forever
+source /home/ubuntu/native_venv/bin/activate && python train.py   # works
+```
+
+For essentially all Python tooling those two are equivalent, and calling `venv/bin/python` directly is
+a widely taught habit — it is what most Makefiles, systemd units, cron jobs, CI configs and IDE
+interpreter settings do. It stops being equivalent here precisely because a **subprocess** resolves a
+binary through `PATH`, and `PATH` is what activation sets.
+
+Severity is high for three compounding reasons:
+
+1. **It presents as a hardware or version problem.** First op, no output, driver right there in
+   `neuron-ls`. Nothing points at `PATH`.
+2. **The obvious next step is destructive.** Our drop ships driver/runtime debs at build numbers newer
+   than the host's, so "version mismatch, install the matching debs" is the natural hypothesis. That
+   replaces the host Neuron driver and runtime. We came one step from doing it. A customer with less
+   reason to be cautious will do it, and will then be debugging a driver install that was never the
+   problem.
+3. **Diagnosing it needs `strace`.** Process state (`/proc/*/wchan`, thread counts, py-spy) is
+   *consistent with a genuine fork deadlock* and will lead a careful person to the wrong conclusion.
+
+Cost to us with prior Neuron experience and both tools to hand: ~50 minutes. Cost to a customer cold:
+plausibly hours, with a real chance of a broken driver at the end.
+
+**The fix is small and entirely on the Neuron side.** The runtime already knows it wanted `neuronx-cc`
+and already knows every `execve` returned `ENOENT`. Raising there — naming the binary and the `PATH`
+searched — turns a multi-hour mystery into a one-line message. This is the single highest
+value-per-effort customer-experience fix identified in this project.
+
+Until then: document that the venv must be **activated**, not merely invoked by path, and say why.
+Our `scripts/run_native.sh` does it and asserts the compiler resolves before running anything.
+
+### Setup friction for the native drop
+
+For the record, and unchanged in character from the DLAMI notes above:
+
+- The drop is an S3 prefix, not a package index. Needs allowlisting per AWS account.
+- The bucket lives in one region while the CLI may default to another; `s3 ls` follows the redirect
+  but `presign` bakes the endpoint in and fails with `IllegalLocationConstraintException`. Region has
+  to be passed explicitly.
+- An EC2 instance role will not usually have S3 access to it, so the fetch needs credentials from
+  elsewhere. Presigned URLs keep those credentials off the instance, which is the right pattern.
+- Python 3.12 venv built from scratch, then `pip install` the wheels. ~926 MB of artifacts.
+- The `deb/` packages turned out **not** to be required — compute works against the production host
+  runtime — but nothing in the drop says so, and the instruction accompanying it says to install them.
+  Worth confirming with the drop's owners which parts are actually mandatory, because installing them
+  is the step most likely to break an existing working environment.

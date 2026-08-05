@@ -1,0 +1,35 @@
+{
+  "torch": "2.11.0+cu130",
+  "has_torch_neuron_attr": true,
+  "privateuse1": "neuron",
+  "steps": {
+    "h2d transfer": {
+      "ok": true,
+      "seconds": 8.459,
+      "device": "neuron:0",
+      "device_type": "neuron"
+    },
+    "matmul + d2h via .cpu() (no explicit synchronize)": {
+      "ok": true,
+      "seconds": 1.214,
+      "cos_sim": 1.000002,
+      "max_abs": 0.1985
+    },
+    "elementwise add/mul/silu": {
+      "ok": true,
+      "seconds": 1.542,
+      "cos_sim": 0.999999
+    }
+  },
+  "synchronize_deadlock": {
+    "observed": true,
+    "where": "torch_neuronx/__init__.py:477 -> _C._neuron_synchronize",
+    "mechanism": "fork() from 29-thread process; child blocks on futex held by a non-forked thread, before exec. Parent waits on child.",
+    "note": "not exercised in this probe; .cpu() is used to force materialisation"
+  },
+  "matmul_cos_sim": 1.0000020265579224,
+  "matmul_max_abs": 0.198455810546875,
+  "elementwise_cos_sim": 0.9999990463256836,
+  "compute_works": true,
+  "deb_packages_required_to_run": false
+}

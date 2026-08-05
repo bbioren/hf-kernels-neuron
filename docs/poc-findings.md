@@ -35,10 +35,10 @@ These are the primary references we used. Critically, they describe different la
 | 6 | Kernel can be a single file — our multi-file layout was over-engineered | Low | Resolved |
 | 7 | Variant resolver detects CUDA, not Neuron; flat layout works via fallback | Medium | Open |
 | 8 | **NKI kernels silently fall back on CPU tensors — no warning. Invalidated our Week 2 accuracy results** | **Critical** | Resolved (methodology fixed) |
-| 9 | **`use_kernels=True` cannot reach the `"neuron"` device path at all** | **High** | Open (upstream fix identified) |
+| 9 | ~~**`use_kernels=True` cannot reach the `"neuron"` device path at all**~~ → **XLA-only artifact** | **High** | **RETIRED by #31** — on Native PyTorch `model.device.type == "neuron"` and stock `use_kernels=True` swaps all three kernels unpatched. Proposed Change 1 withdrawn |
 | 10 | Function-kernel replacement is process-global, not per-model | Medium | Open |
 | 11 | transformers kernel-decorator coverage is much wider than assumed (110 RMSNorm / 95 RoPE model files) | Positive | Confirmed |
-| 12 | HF already whitelists `nki` as a Neuron dependency — but the entry is unreachable, so kernels must under-declare | High | Open |
+| 12 | HF already whitelists `nki` as a Neuron dependency — but the entry is unreachable, so kernels must under-declare | High | **RETIRED by #31** — on native `_backend()` returns `Neuron()` and `validate_dependencies(["nki"])` passes, so kernels can declare `["nki"]` honestly |
 | 13 | nki-library HAS a standalone HF-layout RoPE kernel (`rope_hf`), undocumented in the public API reference | Positive | Confirmed |
 | 14 | ~~Two NKI import paths with different capabilities~~ → **version skew: `nki`=0.5.0, `neuronxcc.nki`=older bundled. `nl.arange` was removed. Our RMSNorm+SiLU use a removed API** | Medium | **Corrected** — now our tech debt, not an upstream ask |
 | 15 | Interception-point inventory: several `_KERNEL_MAPPING` entries are unreachable (incl. `SwiGLUMLP`) | Reference | Confirmed |
@@ -56,6 +56,8 @@ These are the primary references we used. Critically, they describe different la
 | 27 | **The device gap is not a compiler-flag artifact.** NKI is invariant across `{unset, --target trn2, ±--lnc 1/2, -O2}`: 1.02x on wall clock, 1.05x on device, and marginal traffic pinned at **1.00x the unfused floor** under every setting | **Critical** | **Closed.** Not "no better flag found" — the quantity a flag would have to move is already at its theoretical minimum, so #25 and #26 are structural. Both probes are harness stages, so a compiler upgrade re-tests it |
 | 28 | **B12 answered: the residual is a SECOND bypassed cache.** `torch_xla`'s `Op` already memoises the built computation; NKI applies `@xla_hlo_call` inside `__call__`, so a fresh `Op` with an empty memo is built per call. 0.53 → 0.18 ms/call, bit-identical output | **Critical** | **Closed.** Model slowdown 3.31x → **1.62x** (seq 512) and 2.06x → **1.37x** (seq 2048). 52.25 → 0.605 → 0.162 ms/call, 322x total. Two upstream asks now, both one line, both in NKI's dispatch path |
 | 29 | **A SPEEDUP EXISTS.** `nkilib` flash attention (`attention_cte`) beats the compiler's eager attention by **1.48x at seq 2048 and 2.11x at seq 3072** on device; it loses 2.01x at seq 512 and 1.79x at 4096. A WINDOW, not a threshold | **Critical** | **First winning candidate**, and for the reason #25's criterion predicted: flash is an algorithmic restructuring the compiler does not derive. Worked first try against the HF layout. The window's upper edge is the compiler *improving* at 4096 (its traffic drops 47% while the score matrix grows), not the kernel degrading |
+| 30 | **A missing `neuronx-cc` on `PATH` makes the native stack hang forever instead of erroring.** The runtime forks and `execve`s the compiler by bare name; on `ENOENT` the child blocks pre-`exec` and the parent waits on it | **High** (customer-facing) | **Root-caused via strace.** Cost ~4 min per attempt and impersonated a driver/runtime version mismatch convincingly enough that I nearly replaced the host Neuron packages to fix a `PATH` bug |
+| 31 | **BOTH GATES ARE GONE on Native PyTorch, and our headline upstream ask is retired.** `device.type == "neuron"`, `_backend() == Neuron()`, and stock `use_kernels=True` swaps all three kernels with no patch of any kind | **Critical** | **Corrects #9 and #12.** Proposed Change 1 (xla→neuron device resolution) is unnecessary — it was an XLA artifact. Change 2 (the `_KERNEL_MAPPING` neuron entries) is still required and is now the *only* upstream blocker. All 3 kernels compile and run under NKI 0.6.0b1 |
 
 ---
 
@@ -266,7 +268,23 @@ line, no attribute, no counter.
 - Ban exact-zero diffs as a pass condition. Assert `0 < max_diff < tol` for
   hardware kernels.
 
-## 9. `use_kernels=True` cannot reach the `"neuron"` device path [HIGH]
+## 9. `use_kernels=True` cannot reach the `"neuron"` device path [HIGH — RETIRED by #31: this is a torch-xla artifact]
+
+> **Read [#31](#31-both-gates-are-gone-on-native-pytorch--and-our-headline-upstream-ask-is-retired-critical--corrects-9-and-12) first.**
+> Everything below is correct **on the torch-xla stack** and was verified there. It does not hold on
+> the Native PyTorch drop, which is the stack HuggingFace intends to be used: there
+> `model.device.type` is `"neuron"`, stock `kernelize()` needs no branch, and `use_kernels=True`
+> swaps all three kernels with no patch at all (9 RMSNorm / 2 RoPE / 2 SiLU, logits cos_sim
+> 1.000001).
+>
+> **The proposed "Change 1" below is withdrawn**, along with Change 1b and the third site in
+> `kernel_config.infer_device`. All three addressed a device string the supported stack does not
+> produce. **Change 2 — the `"neuron"` mapping entries — survives and is now the only upstream
+> blocker.**
+>
+> The section is kept in full because the *reasoning* is still the record of how the gap was found
+> and because the silent-no-op mechanism (transformers passes a `Device` object, so validation is
+> skipped) is a real property of the library that a future non-standard device will hit again.
 
 The Week 3 goal "confirm `use_kernels=True` alone triggers the swaps on Neuron"
 **cannot be met today**, for two independent reasons. Verified empirically in
@@ -411,7 +429,18 @@ the only missing pieces are the `"neuron"` mapping entries and device detection.
 `_FUNCTION_KERNEL_MAPPING`. There is no `"neuron"` entry. That is a one-block
 addition, not an architectural change.
 
-## 12. HF already whitelists `nki` for Neuron — but the entry is unreachable [HIGH]
+## 12. HF already whitelists `nki` for Neuron — but the entry is unreachable [HIGH — RETIRED by #31: torch-xla artifact]
+
+> **Read [#31](#31-both-gates-are-gone-on-native-pytorch--and-our-headline-upstream-ask-is-retired-critical--corrects-9-and-12) first.**
+> The unreachability below is real **on torch-xla**, where `hasattr(torch, "neuron")` is False and
+> `_backend()` therefore reports `CUDA(12.8)`. On the Native PyTorch drop the attribute is present,
+> `_backend()` returns `Neuron()`, and `validate_dependencies(["nki"])` **passes** — so a Neuron
+> kernel can declare `"python-depends": ["nki"]` honestly, and the under-declaration workaround
+> described below is unnecessary.
+>
+> Two things still stand: `nkilib` is **not** whitelisted (relevant to the thin-wrapper strategy in
+> #16), and the `metadata.json` field requirements measured at the end of this section are
+> stack-independent.
 
 Good news first: `kernels/python_depends.json` in 0.15.2 contains a `neuron` backend
 section, and it whitelists exactly one dependency — `nki`:
@@ -2301,3 +2330,236 @@ more useful:
    boundaries anyway, so the custom-call boundary costs less than it does here — the in-situ effect
    should be *better* than this, but it has not been measured. Finding #25 made the opposite mistake in
    the opposite direction; the lesson is the same.
+
+---
+
+## 30. A missing `neuronx-cc` on `PATH` hangs the native stack forever instead of erroring [HIGH — customer-facing]
+
+The first two attempts to run anything on the Native PyTorch drop hung with no output and no
+diagnostic. Both times the process sat for four minutes and had to be killed. The cause is trivial
+and the failure mode is not.
+
+### What it looked like
+
+`h2d` transfer worked. The first op that needed a compile did not. Two processes existed:
+
+```
+parent 147480  29 threads, main on futex_do_wait, one thread on do_wait_intr_irq (waitpid)
+child  147522   1 thread,  futex_do_wait
+```
+
+Neither burned CPU. No `neuronx-cc` process anywhere. py-spy showed both stopped at the same
+Python line with no frames beneath it, i.e. inside a C call.
+
+### The wrong diagnosis, which was very convincing
+
+From that state I concluded a classic **fork-from-a-multithreaded-process deadlock**: `fork()`
+copies only the calling thread, so a mutex held by any of the other 28 threads is locked forever in
+the child; the child blocks before `exec`, the parent waits on the child, neither moves. Every
+observation fit — the thread counts, the futex waits, the `waitpid`, the absent CPU usage, the C
+frame.
+
+It also had a plausible and expensive remedy. The drop ships its own driver/runtime/collectives/tools
+debs at internal build numbers (`runtime-lib 2.x.59853.0`, `dkms 2.x.9869.0`) against the host's
+public `2.33.10.0` / `2.29.0.0`, and Samir's instruction was to install them. A version mismatch
+causing a hang on first execution is entirely credible. **I was one step from replacing the host
+Neuron driver and runtime** — which would very likely have broken the existing XLA venv that every
+measurement in this project was taken on.
+
+### What it actually was
+
+`strace -f -e trace=clone,execve`:
+
+```
+execve("/usr/local/sbin/neuronx-cc", ["neuronx-cc", "compile", "module.mlir",
+        "--framework", "XLA", "--target", "trn2", "--lnc", "2", "-O1", ...]) = -1 ENOENT
+execve("/usr/local/bin/neuronx-cc",  ...) = -1 ENOENT
+execve("/usr/sbin/neuronx-cc",       ...) = -1 ENOENT
+execve("/usr/bin/neuronx-cc",        ...) = -1 ENOENT
+execve("/sbin/neuronx-cc",           ...) = -1 ENOENT
+execve("/bin/neuronx-cc",            ...) = -1 ENOENT
+execve("/snap/bin/neuronx-cc",       ...) = -1 ENOENT
+```
+
+On the first op needing a compile, the runtime forks a child and `execve`s **`neuronx-cc` by bare
+name**, resolved through `PATH`. `neuronx-cc` is installed inside the venv at
+`native_venv/bin/neuronx-cc`, and the venv had not been activated — the process was launched as
+`/home/ubuntu/native_venv/bin/python <script>`, an absolute path, which does **not** put the venv's
+`bin/` on `PATH`. The default `PATH` leads with `/opt/aws/neuron/bin` (the *production* tools dir),
+where the native compiler does not exist.
+
+Every `PATH` entry missed. And then, instead of reporting "neuronx-cc not found", the child hung.
+
+The futex wait was a symptom, not the cause. Activating the venv fixes it completely: the same
+matmul that hung for four minutes completes in **1.21 s** at `cos_sim 1.000002`.
+
+### Two consequences, and the second is the finding
+
+**The deb packages are not required.** Compute works against the current production host runtime
+(`dkms 2.29.0.0`, `runtime-lib 2.33.10.0`). So the host runtime can be left alone and the XLA venv
+stays intact — which also means every existing measurement remains reproducible. The decision to
+defer that install rather than follow the instruction immediately turned out to be load-bearing.
+
+**A missing compiler on `PATH` should be an error, not a hang.** This is the customer-facing half.
+The information needed for a perfect diagnostic is right there — the runtime knows it wanted
+`neuronx-cc`, and it knows all seven `execve` calls returned `ENOENT`. Instead the process blocks
+indefinitely with no output, on the *first real op*, which is the worst possible moment: it looks
+exactly like a hardware, driver, or version problem. A new user's most likely next move is precisely
+the wrong one — start replacing host packages.
+
+Estimated cost to a customer hitting this cold, without `strace` and py-spy instincts: hours, and a
+material chance of ending up with a broken driver install.
+
+### What to do
+
+1. **Report it.** `neuronx-cc` not found on `PATH` should raise immediately, naming the binary and
+   the `PATH` searched. This is a small change in the fork/exec path with a large UX payoff.
+2. **Document that the venv must be activated,** not merely invoked by absolute path. This is
+   counterintuitive: for most Python tooling, calling `venv/bin/python` directly is equivalent to
+   activating. Here it is not, because a *subprocess* resolves a binary through `PATH`.
+3. **Use `scripts/run_native.sh`** for everything on this stack. It activates the venv, asserts
+   `neuronx-cc` is resolvable, prints the resolved compiler version, and refuses to run otherwise —
+   so this specific four-minute hang cannot recur silently.
+
+### Methodological note, since it is the third instance of the same pattern
+
+The fork-deadlock hypothesis survived because every observation available at that moment
+(`/proc/*/wchan`, thread counts, CPU usage, py-spy) was consistent with it. What killed it was
+**changing instrument** — `strace` on syscalls rather than more inspection of process state.
+
+This is exactly Finding #24's lesson recurring: a hypothesis that keeps fitting the evidence may
+only be untestable by the instrument in use. It is now happened often enough in this project
+(#8, #19, #21→#24, #29's SBUF story, and this) to be the single most transferable output of the
+work. Worth stating in the PoC as a practice rather than as a series of anecdotes.
+
+---
+
+## 31. BOTH GATES ARE GONE on Native PyTorch — and our headline upstream ask is retired [CRITICAL — corrects #9 and #12]
+
+Findings #9 and #12 are the basis of two of this project's three upstream asks, and #9's proposed
+"Change 1" has been the headline one since Week 3. **Both findings are artifacts of the torch-xla
+stack.** On the Native PyTorch drop, which is what HuggingFace intends to be used, they do not
+exist.
+
+This was measured rather than assumed, on real hardware, with the shim explicitly asserted absent.
+
+### The two gates, and what they now report
+
+| | Gate 1 (Finding #12) | Gate 2 (Finding #9) |
+|---|---|---|
+| what it is | `kernels._backend()` reads `hasattr(torch, "neuron")` | transformers' `kernelize()` reads `model.device.type` |
+| consequence on XLA | reports `CUDA(12.8)` on a Neuron host, so `validate_dependencies` consults the **cuda** table and an honest `"python-depends": ["nki"]` is rejected | `"xla"` matches no mapping entry, and because transformers passes a `Device` *object* the validation is skipped, so it is a **silent no-op** |
+| on XLA | `CUDA(version=Version('12.8'))` | `"xla"` |
+| **on native** | **`Neuron()`** | **`"neuron"`** |
+
+`hasattr(torch, "neuron")` is `True` on native, and the `privateuse1` backend name is registered as
+`"neuron"`. So `_backend()` returns `Neuron()`, `validate_dependencies(["nki"])` **passes**, and
+`model.device.type` is `"neuron"` — which is exactly what stock `kernelize()` reads.
+
+### The decisive end-to-end test
+
+`scripts/probe_native_use_kernels.py`. Qwen3 (2 layers), on device, neuron mapping entries
+registered, then **stock** `transformers.integrations.hub_kernels.kernelize(model)`. The probe
+asserts `hub_kernels.kernelize` is unpatched before proceeding and aborts if it is not, so the
+result cannot be an artifact of our own shim.
+
+| | swapped | NKI dispatch | fallback |
+|---|---|---|---|
+| RMSNorm | 9 / 9 | 9 | 0 |
+| RoPE | 2 / 2 | 2 | 0 |
+| SiLU | 2 / 2 | 2 | 0 |
+
+Logits `cos_sim 1.000001`, `max_diff 5.96e-07` against the unkernelized model. Confirmed
+independently in the installed source: stock `kernelize()` computes `device_type = model.device.type`
+with only a rocm refinement and no `xla` branch (`hub_kernels.py:613`), so on native it lands on
+`Device(type="neuron")` directly.
+
+**No monkeypatch of any kind. `enable_neuron_device_detection()` was never called.**
+
+### What this retires, and what it does not
+
+**Retired: proposed Change 1** (`elif device_type == "xla" and _is_neuron_xla(): device_type = "neuron"`),
+and Change 1b, and the third site in `kernel_config.infer_device` flagged by Finding #15. All three
+addressed a device string that the supported stack does not produce. Samir's read — *"I think all
+these things will be gone when you switch to Native PyTorch"* — was correct on both gates.
+
+**Also retired: the GitHub ticket.** Samir asked for one if 0.16.0 still had the bug. Filing it would
+have sent the kernels team after a non-bug in their library. The 0.16.0 verification still stands on
+its own terms (`backends.py`, `layer/repos.py`, `python_depends.json` byte-identical to 0.15.2;
+`kernelize.py` changed only in line numbers), but the right report is "these were XLA artifacts",
+not a defect.
+
+**Still required: proposed Change 2 — the `"neuron"` entries in `_KERNEL_MAPPING` and
+`_FUNCTION_KERNEL_MAPPING`.** This is now the *only* upstream blocker, and the probe does not
+demonstrate otherwise: it injects those entries itself via `register_with_transformers()`. On a stock
+install, `use_kernels=True` on Trainium is still a no-op — no longer because the device cannot be
+resolved, but because there is nothing registered to route to. That distinction matters for how the
+ask is framed, and conflating the two would overstate the result.
+
+**Unaffected:** every performance finding. #24, #25, #26, #27, #28 and #29 were all measured on
+torch-xla, and #28 in particular is *specific* to torch-xla (`torch_xla`'s `Op._computations` does
+not exist on native — `torch_xla` is not importable there at all). Those numbers are now explicitly
+stack-scoped and pending re-validation. See "what this does not tell us" below.
+
+### The kernels themselves work on the new stack
+
+Worth confirming separately, because native ships a different compiler
+(`neuronx-cc 2.0.266551.0a0` vs `2.26.6360.0`) and a different NKI (**0.6.0b1** vs 0.5.0), and the
+0.5.0 migration already broke two of these kernels once (Finding #14: `nl.arange` and `mask=`
+removed). Import is not compile — `@nki.jit` does nothing until traced — so all three were executed,
+with fallback warnings captured so a silent fallback could not pass as a success:
+
+| kernel | NKI executed | cos_sim |
+|---|---|---|
+| RMSNorm | yes | 0.999983 |
+| SiLU | yes | 0.999980 |
+| RoPE | yes | q 1.000002 / k 1.000001 |
+
+No fallbacks, no compile errors, under NKI 0.6.0b1. `torch.neuron.synchronize()` also works, which
+retires the phantom second deadlock that Finding #30 initially recorded.
+
+### A counting error worth recording, because it produced a false negative
+
+The first run of the decisive probe reported **`RoPE swapped: 0`** and printed "Gate 2 NOT cleared" —
+while the dispatch counter in the same output read `nki=2 fallback=0`. The two lines contradicted
+each other and the verdict followed the wrong one.
+
+The structural counter walks `named_modules()` for instance-level `forward` overrides. Function
+kernels are invisible to it, for two independent reasons: stock `kernelize()` ends with
+`finally: model.apply(detach_hidden_kernels)`, which `delattr`s the submodule alias, and the swap
+mutates `fn.forward` rather than adding an attribute to a model submodule. Counting instead by
+identity change of `_hidden_kernels[...].forward` across the `kernelize()` call gives 2/2.
+
+Two things generalise. **The verdict should have rested on the execution counters in the first
+place** — that is Finding #8's whole lesson, and the probe had the right evidence sitting two lines
+below the wrong criterion. And matching on qualnames would not have worked either: the post-swap
+qualname is *identical* to the pre-swap one (`_create_func_module.<locals>.Func.forward`), because
+the kernels library wraps our function in a freshly generated `Func` module. Only object identity
+distinguishes them.
+
+Incidentally this re-confirms Finding #10: both layers' slots hold the same object id before
+(`132348518209856`) and the same one after (`132347867058304`), so the wrapper really is
+process-global and shared across layers.
+
+### What this does not tell us
+
+- **No performance number here.** This is a correctness and reachability result. Every MFU, device-time
+  and dispatch measurement in this document was taken on torch-xla and is now stack-scoped.
+- **#28 does not port.** It is a `torch_xla` `Op`-registry fix, and `torch_xla` is not importable on
+  native. Whether native has an equivalent per-call lowering cost is **unmeasured and should not be
+  assumed either way** — the dispatch path is entirely different (torch-mlir, `--framework XLA` to a
+  different compiler).
+- **#24 probably still applies.** `nki.compiler.target._detect_target` still forks a subprocess on
+  native. Not re-measured.
+- **Small model, 2 layers, seq 128.** Enough to prove routing and execution, not a performance claim.
+
+### What to do
+
+1. **Rewrite the upstream ask.** One change, not three: add the `"neuron"` entries. Everything else
+   was an XLA artifact. This makes the ask dramatically smaller and more credible.
+2. **Do not file the ticket.** Explain why instead.
+3. **Re-scope every performance number in the PoC as torch-xla-measured**, with native re-validation
+   pending. This is the highest-risk stale claim in the deliverables right now.
+4. **Re-run the performance suite on native** before publishing any MFU figure. In particular the
+   1.62x / 1.37x slowdown and the 1.48x / 2.11x attention win both depend on a dispatch path that
+   does not exist on this stack.

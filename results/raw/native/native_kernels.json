@@ -1,0 +1,59 @@
+{
+  "stack": "native",
+  "torch": "2.11.0+cu130",
+  "device_type_seen": "neuron",
+  "synchronize": {
+    "ok": true
+  },
+  "kernels": {
+    "rmsnorm": {
+      "ran": true,
+      "used_nki": true,
+      "fallback_reasons": [],
+      "cos_sim": 0.9999830722808838,
+      "shape": [
+        256,
+        2048
+      ]
+    },
+    "silu": {
+      "ran": true,
+      "used_nki": true,
+      "fallback_reasons": [],
+      "cos_sim": 0.9999799728393555,
+      "shape": [
+        256,
+        1024
+      ]
+    },
+    "rope": {
+      "ran": true,
+      "used_nki": true,
+      "fallback_reasons": [],
+      "cos_sim_q": 1.0000019073486328,
+      "cos_sim_k": 1.000001072883606,
+      "shape": [
+        1,
+        4,
+        2,
+        256,
+        128
+      ]
+    }
+  },
+  "nki": "0.6.0b1+28066168719.gc659ca3a",
+  "summary": {
+    "ran_nki": [
+      "rmsnorm",
+      "silu",
+      "rope"
+    ],
+    "accurate": [
+      "rmsnorm",
+      "silu",
+      "rope"
+    ],
+    "errored": [],
+    "fell_back": []
+  }
+}
