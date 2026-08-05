@@ -2795,17 +2795,60 @@ those branches** — ordinary Hub write permissions. Under `aws-neuron`, AWS con
 can ship a `v2` without waiting on anyone. Under `kernels-community` (a 4-user team org), we would need
 write access granted and our updates would plausibly sit behind their review.
 
+### And an untrusted org is not even blocking, because a mapping entry can declare its own trust
+
+`LayerRepository.__init__` stores `trust_remote_code` and `load()` forwards it to `get_kernel`
+(`layer.py:70-99`), so an entry can opt itself in. **Upstream transformers already does exactly this**,
+for exactly this situation:
+
+```python
+"Qwen3_5GatedDeltaNet": {
+    Device(type="cuda", properties=CUDAProperties(min_capability=121, max_capability=121)):
+        LayerRepository(
+            repo_id="Atlas-Inference/gdn",
+            layer_name="Qwen3_5GatedDeltaNet",
+            revision="ef12347fc77d6ddf1cb72c0bd0af1c7d6cc69172",
+            # TODO: drop once Atlas-Inference is an allow-listed trusted publisher
+            trust_remote_code=True,
+        ),
+},
+```
+
+A non-`kernels-community` org, shipped in the default mapping, with the trust check bypassed and a TODO
+recording the interim state. That is a precedent and a documented pattern for our case.
+
+Note what they do differently: `revision=<full commit sha>` rather than `version=N`. A version is a
+mutable `v<N>` branch, so pinning an immutable commit is the safer choice when the trust check is being
+bypassed — the content cannot change under the user afterwards. Worth mirroring.
+
+Three ways to load an untrusted kernel, then, in decreasing order of how invisible they are to the user:
+
+| mechanism | scope | user action |
+|---|---|---|
+| `LayerRepository(..., trust_remote_code=True)` in the mapping | that entry only | **none** — works on the default `use_kernels=True` path |
+| `transformers.integrations.hub_kernels.allow_all_hub_kernels()` | global, in-process | context manager |
+| `KernelConfig` metadata `{"trust_remote_code": True}` | per-config | explicit config |
+
+**And the failure mode is loud, unusually for this project.** `_get_layer_memoize` calls `repo.load()`
+with no `try`/`except` (`layer.py:498-505`), and `use_fallback` only covers the "no mapping found" cases
+— not a load failure. So an untrusted publisher raises
+`ValueError: Kernel repository '...' is not from a trusted publisher. Set trust_remote_code=True ...`,
+which names its own fix. Contrast Finding #8: this is the failure mode we keep wishing the rest of the
+stack had.
+
 ### Revised recommendation
 
-**Ask for `aws-neuron/` plus the `trustedKernelPublisher` flag.** That gets the default-path trust *and*
-versioning control, which the earlier framing had treated as mutually exclusive. It is also the smaller
-ask of the two in practice: a flag on an org that already exists and is already an AWS/HF
-collaboration, versus write access into HF's own kernel org.
+**Ship the `"neuron"` entries pointing at `aws-neuron/` with `trust_remote_code=True` and a TODO,
+mirroring `Atlas-Inference/gdn`. Ask for the `trustedKernelPublisher` flag in parallel so the TODO can
+be dropped.** Nothing blocks on HF setting the flag, and the pattern is already in their codebase.
 
-Fall back to `kernels-community/` only if HF declines the flag. Worth asking what their criteria are,
-since `numKernels: 0` may itself be the blocker — they may reasonably want to see published, working
-kernels before marking a publisher trusted, which would make the sequence "publish under
-`kernels-community` first, move later" rather than a permanent choice.
+This is strictly better than the earlier "choose trust or control" framing, which was wrong twice over:
+the gate is a settable org flag rather than a hardcoded name, *and* an entry can bypass it anyway. Pin
+`revision=<sha>` rather than `version=N` for as long as the bypass is in place.
+
+Still worth asking HF's criteria for the flag, since `numKernels: 0` may be the blocker — they may
+reasonably want to see published, working kernels first, which makes it a sequencing question rather
+than a permanent choice.
 
 ### The methodological point, which is the same one this project keeps relearning
 

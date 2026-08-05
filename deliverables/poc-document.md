@@ -273,23 +273,39 @@ Ordered by value per unit of effort.
 block in `_KERNEL_MAPPING` and one in `_FUNCTION_KERNEL_MAPPING`. Blocked on the repo-home decision
 below, because the entries name repo IDs.
 
-**2. HuggingFace: enable `trustedKernelPublisher` on the existing `aws-neuron` org.** This ask
-replaces an earlier, worse-informed one. The Hub trust gate is **not** a hardcoded
-`kernels-community` check — `kernels/utils.py::_check_trust_remote_code` looks up an org-level
-`trustedKernelPublisher` boolean via the Hub API, and `kernels-community` simply has it set. Verified
-live: `kernels-community` reports `trustedKernelPublisher: true` with 56 kernels; `aws-neuron` already
-exists as a joint AWS/HF org with 31 models and 180 followers, but has 0 kernels and no such flag.
+**2. Publish under `aws-neuron/`, and ask HuggingFace for the `trustedKernelPublisher` flag in
+parallel.** This replaces an earlier, worse-informed ask that framed this as a choice between
+default-path trust and versioning control. It is neither a choice nor blocking.
 
-So trust and versioning control are **not** the tradeoff we previously described. A kernel version is
-just a `v<N>` branch in a `repo_type="kernel"` repo, so control comes down to who can push branches —
-which under `aws-neuron` is AWS. Getting the flag set on an org that already exists is a smaller ask
-than obtaining write access into HF's own kernel org.
+The Hub trust gate is not a hardcoded `kernels-community` check —
+`kernels/utils.py::_check_trust_remote_code` queries an org-level `trustedKernelPublisher` boolean via
+the Hub API, and `kernels-community` simply has it set. Verified live: `kernels-community` reports
+`trustedKernelPublisher: true` with 56 kernels, while `aws-neuron` already exists as a joint AWS/HF org
+(31 models, 180 followers) with 0 kernels and no flag.
 
-Fall back to `kernels-community/` only if HF declines. Worth asking their criteria: `numKernels: 0`
-may itself be the blocker, in which case the sequence is "publish under `kernels-community` first,
-move later" rather than a permanent choice. Note also that `trust_remote_code=[...]` is *not* a
-per-repo allowlist — it is for signing identities, is unimplemented, and silently falls back to the
-publisher check.
+And an untrusted org does not block the default path anyway, because a mapping entry can declare its
+own trust — which **upstream transformers already does**, for precisely this situation:
+
+```python
+LayerRepository(
+    repo_id="Atlas-Inference/gdn",
+    layer_name="Qwen3_5GatedDeltaNet",
+    revision="ef12347fc77d6ddf1cb72c0bd0af1c7d6cc69172",
+    # TODO: drop once Atlas-Inference is an allow-listed trusted publisher
+    trust_remote_code=True,
+)
+```
+
+So the recommendation is to mirror that exactly: ship the `"neuron"` entries against `aws-neuron/` with
+`trust_remote_code=True` and the same kind of TODO, pin `revision=<commit sha>` rather than a mutable
+`version=N` branch while the bypass is in place, and drop both once the flag is granted. Versioning
+control comes free, since a version is just a `v<N>` branch and control is ordinary Hub write
+permission.
+
+Worth asking HF's criteria for the flag, since `numKernels: 0` may itself be the blocker — they may
+reasonably want to see working published kernels first, which makes it a sequencing question. Note also
+that `trust_remote_code=[...]` is *not* a per-repo allowlist: it is for signing identities, is
+unimplemented, and warns then falls back to the publisher check.
 
 **3. NKI: cache `_detect_target`.** One decorator, 86x per call, accuracy-neutral by measurement,
 still applies on native, and benefits every eager NKI user rather than just this integration. This is
