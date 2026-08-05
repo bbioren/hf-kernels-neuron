@@ -58,6 +58,8 @@ These are the primary references we used. Critically, they describe different la
 | 29 | **A SPEEDUP EXISTS.** `nkilib` flash attention (`attention_cte`) beats the compiler's eager attention by **1.48x at seq 2048 and 2.11x at seq 3072** on device; it loses 2.01x at seq 512 and 1.79x at 4096. A WINDOW, not a threshold | **Critical** | **First winning candidate**, and for the reason #25's criterion predicted: flash is an algorithmic restructuring the compiler does not derive. Worked first try against the HF layout. The window's upper edge is the compiler *improving* at 4096 (its traffic drops 47% while the score matrix grows), not the kernel degrading |
 | 30 | **A missing `neuronx-cc` on `PATH` makes the native stack hang forever instead of erroring.** The runtime forks and `execve`s the compiler by bare name; on `ENOENT` the child blocks pre-`exec` and the parent waits on it | **High** (customer-facing) | **Root-caused via strace.** Cost ~4 min per attempt and impersonated a driver/runtime version mismatch convincingly enough that I nearly replaced the host Neuron packages to fix a `PATH` bug |
 | 31 | **BOTH GATES ARE GONE on Native PyTorch, and our headline upstream ask is retired.** `device.type == "neuron"`, `_backend() == Neuron()`, and stock `use_kernels=True` swaps all three kernels with no patch of any kind | **Critical** | **Corrects #9 and #12.** Proposed Change 1 (xla→neuron device resolution) is unnecessary — it was an XLA artifact. Change 2 (the `_KERNEL_MAPPING` neuron entries) is still required and is now the *only* upstream blocker. All 3 kernels compile and run under NKI 0.6.0b1 |
+| 32 | **On native the kernels are FASTER than baseline — 1.97x at seq 512 — and that is NOT a win.** The native torch baseline is 4.3x slower than the XLA one, so the ratio flipped because the denominator degraded. Both absolute numbers are worse on native | **Critical** | **The `--lnc 1` trap from #27, now at model scale.** Never quote the native speedup without the baseline beside it. Native kernelized MFU 2.20% is *below* XLA kernelized 2.98% |
+| 33 | **The fused RMSNorm+MLP is a second winning candidate — 1.76x faster at Qwen3-0.6B's shape — but only at shapes nobody deploys.** Finding #18's `I>4096` single-core boundary is UNCHANGED on the new compiler, so every real model is still excluded | **High** | Samir's suggestion, and correct: `NormType.RMS_NORM` works and is accurate (cos_sim 0.999973). Loses 1.45x at H=4096/I=4096, so it is a shape *window* like #29. Two new interface mismatches found: the norm weight must be 2D and the hidden tensor must be 3D |
 
 ---
 
@@ -2563,3 +2565,169 @@ process-global and shared across layers.
 4. **Re-run the performance suite on native** before publishing any MFU figure. In particular the
    1.62x / 1.37x slowdown and the 1.48x / 2.11x attention win both depend on a dispatch path that
    does not exist on this stack.
+
+---
+
+## 32. On native the kernels are FASTER than baseline, and that is not a win [CRITICAL]
+
+Re-ran the MFU measurement on the Native PyTorch stack, since every number in this project had
+been taken on torch-xla. The headline reverses: the kernels go from a **1.62x slowdown** to a
+**1.97x speedup**. That reads like the project's central negative result just evaporated.
+
+It did not. The ratio flipped because the baseline got worse.
+
+### The measurement
+
+Qwen3-0.6B, 28 layers, bf16, forward only, single logical core, denominator 316 TFLOPS,
+169 NKI launches/step with zero fallbacks, Finding #24's fix applied on both stacks.
+
+| seq | stack | baseline | kernelized | verdict | baseline MFU | kernelized MFU |
+|---|---|---|---|---|---|---|
+| 512 | xla | 43.94 ms | 71.32 ms | 1.62x **slower** | ~4.9% | 2.98% |
+| 512 | **native** | **189.97 ms** | **96.46 ms** | **1.97x faster** | **1.12%** | **2.20%** |
+| 2048 | xla | 117.78 ms | 161.04 ms | 1.37x **slower** | ~9.9% | 6.69% |
+| 2048 | **native** | **340.74 ms** | **251.86 ms** | **1.35x faster** | **3.16%** | **4.28%** |
+
+IQRs are tight and non-overlapping on the native runs (baseline 187.83–191.72), so the speedup is
+real *against that baseline*. Read across the stacks instead of within them:
+
+| | seq 512 | seq 2048 |
+|---|---|---|
+| baseline, native vs xla | **4.32x slower** | 2.89x slower |
+| kernelized, native vs xla | 1.35x slower | 1.56x slower |
+
+**Everything is slower on native. The baseline is much slower.** Native kernelized MFU (2.20%) is
+*below* XLA kernelized MFU (2.98%). Nothing got faster; the thing being divided by got slower.
+
+### Why, and this is the interesting part
+
+Finding #25 established that on torch-xla the *baseline* enjoys whole-graph fusion — torch's HBM
+traffic was **independent of chain length**, which is only possible if the entire chain collapsed
+into one pass. That fusion is exactly what our kernels were losing to: an opaque NKI custom call is
+an optimisation barrier, and for memory-bound ops the fusion *is* the optimisation.
+
+Native is eager. Ops dispatch through PyTorch's dispatcher one at a time, with no equivalent
+whole-forward graph. So the compiler advantage that beat our kernels on XLA largely evaporates —
+and our kernels look better by comparison purely because their competition got worse.
+
+That reframes Finding #25 in a way worth stating carefully: **the fusion barrier is only a cost
+where there is fusion to lose.** On the eager native path there is much less, so the barrier costs
+less. This is a coherent story rather than a paradox, and it does not make the kernels good.
+
+*Not verified:* that native performs no whole-forward fusion. It is the explanation the numbers
+support, and the mechanism is consistent with eager dispatch, but the direct test — does torch's
+traffic on native scale linearly with chain length, as Finding #25 measured on XLA — needs device
+profiling that is not wired up for this stack. Stated as the leading explanation, not a result.
+
+### This is Finding #27's trap at model scale
+
+#27 recorded a `--lnc 1` row with the best NKI/torch ratio in its table, which was not an
+improvement: NKI barely moved while torch got 91% slower. The lesson written down then was *a ratio
+is two numbers, and a change in it does not say which one moved.*
+
+This is the same error one level up, and it would have been very easy to publish. "The kernels are
+1.97x faster on Native PyTorch" is a true sentence, sourced from a clean measurement with tight
+IQRs, and it is the single most misleading sentence this project could emit. Sticking point #18
+exists because the same habit already cost reviewer trust once.
+
+**Rule for this number: never quote the native speedup without the native baseline beside it.**
+
+### What to do
+
+1. **Do not report a native speedup.** Report the cross-stack table. The honest summary is that
+   native eager is currently a large regression for this workload and the kernels partially offset
+   it.
+2. **The XLA-measured performance findings are not superseded, they are re-scoped.** #25, #26, #27
+   and #29 describe a stack with whole-graph fusion. They remain the right description of that
+   stack, and #25's mechanism now has independent support from the *other* direction: remove the
+   fusion and the barrier stops mattering.
+3. **Measure Finding #24's worth on native.** It was applied to both runs above, so its native
+   contribution is unmeasured. Cheap: re-run without the flag.
+4. **The interesting question is now why native eager is 3-4x slower than an XLA graph** for the
+   same model. That is a framework question, well outside this PoC, but it is the largest single
+   number anyone will notice in this table.
+
+---
+
+## 33. The fused RMSNorm+MLP wins 1.76x — at a shape nobody deploys [HIGH]
+
+Samir pointed at the one candidate this project had missed, and he was right that it exists:
+`nkilib.core.mlp.mlp` accepts `normalization_type=NormType.RMS_NORM` with
+`quantization_type=QuantizationType.NONE`. We had always used the `NO_NORM` default, and Finding
+#26 generalised "nkilib's RMSNorm always fuses quantisation" (true of `core/rmsnorm/`) into "no
+non-quantising RMSNorm path exists", which was wrong.
+
+It is the best candidate by Finding #25's criterion: it spans a fusable region, contains two real
+matmuls, **and** absorbs an RMSNorm that would otherwise be a separate optimisation barrier. Six
+torch ops (norm, gate, up, silu, mul, down) replaced by one kernel call.
+
+### The result
+
+Native stack, bf16, S=512, distinct weights per block, wall clock.
+
+| shape | NKI fused | torch | verdict | cos_sim |
+|---|---|---|---|---|
+| H=1024 I=3072 (Qwen3-0.6B) | **0.6095 ms/block** | 1.0728 ms/block | **NKI 1.76x FASTER** | 0.999973 |
+| H=4096 I=4096 | 2.5377 ms/block | 1.7459 ms/block | NKI 1.45x slower | 0.999967 |
+
+So it is a **shape window**, the same structure as Finding #29's attention result: wins small,
+loses larger. Two candidates now, both windows, neither a monotone improvement.
+
+**Two caveats, and the second is fatal for practical use.**
+
+*The timing is wall clock and includes dispatch.* Device-time profiling is not wired up for native,
+and Finding #32 established that the native torch baseline is 3-4x slower than the XLA one. So part
+of this 1.76x is the same degraded-denominator effect. The NKI side pays one dispatch per block and
+the torch side pays six, which also cuts in NKI's favour. **Treat 1.76x as provisional**; it bounds
+the answer rather than settling it.
+
+*Finding #18's boundary is unchanged on the new compiler.* Re-tested deliberately, since the
+original boundary was measured on `neuronx-cc 2.26.6360.0` and native ships `2.0.266551.0a0`:
+
+| H | I | result |
+|---|---|---|
+| 1024 | 3072 | PASS |
+| 1024 | 4096 | PASS |
+| 1024 | 5120 | FAIL — `'floordiv' does not allow division by zero` |
+| 4096 | 4096 | PASS |
+| 4096 | 12288 | FAIL — same |
+
+Still exactly `I <= 4096`, still the same error inside the CTE sharding tile arithmetic. So the
+1.76x win is at Qwen3-0.6B's shape, and **every model anyone deploys is on the wrong side of the
+line** — Qwen3-8B I=12288, Llama-3-8B and Mistral-7B I=14336. This strongly supports Finding #26's
+reading that the boundary is a design boundary (no SPMD grid) rather than a version-specific bug:
+two different compiler generations, identical threshold.
+
+### Two new interface mismatches, both from one keyword argument
+
+Enabling normalisation changes the kernel's input contract, which is worth recording because it
+raises the cost estimate for a thin wrapper:
+
+1. **The norm weight must be 2D.** HF's RMSNorm weight is `nn.Parameter(torch.ones(hidden_size))`,
+   i.e. 1D `[H]`. Passing it gives
+   `[NCC_INKI016] Unexpected HBM tensor shape of (1024,). Expected a vector with shape [1, X] or [X, 1]`.
+   Needs a `reshape(1, H)`.
+2. **The hidden tensor must be 3D.** With `NO_NORM` a 2D `[B*S, H]` input works — that is what all
+   of Finding #26's measurements used. With `RMS_NORM` it fails with
+   `index 2 out of bounds for sequence of size 2`, because the norm path routes through
+   `load_hidden_tensor_tile`, which computes
+   `batch_idx * view.shape[1] * view.shape[2] + bxs_offset * view.shape[2]`
+   (`mlp_cte_tensor_io.py:78-81`). So the required input **rank** depends on a keyword argument.
+
+Neither is hard. Both are undocumented, both fail at compile time rather than validation time, and
+they land on top of the three weight transposes from Finding #17. A wrapper for this kernel needs:
+3 transposes + 1 reshape + a rank change + the `I<=4096` guard. That is the concrete answer to
+"how automatable is porting?" for a fused kernel — and the answer is "not very".
+
+### What to do
+
+1. **Report the win with both caveats.** It is real, it is correct to six decimals, and it is
+   unusable on any deployed model until the SPMD question is answered.
+2. **The SPMD launch question is now the top nkilib ask, and it gates two candidates.** Both #29's
+   attention (which shards batch across LNC2 cores) and this kernel were built for a multi-core
+   grid. Whether `kernelize()` can express that is the single question standing between "two
+   promising candidates at toy shapes" and "a usable speedup".
+3. **Re-file Finding #18 with this data.** Identical threshold across two compiler generations is
+   much stronger evidence for "usage constraint, needs a real diagnostic" than the original
+   single-compiler report.
+4. **Measure it on device, not wall clock,** before it goes in any customer-facing document.

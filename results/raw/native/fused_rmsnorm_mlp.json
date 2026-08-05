@@ -1,0 +1,68 @@
+{
+  "stack": "native",
+  "torch": "2.11.0+cu130",
+  "shapes": [
+    {
+      "H": 1024,
+      "I": 3072,
+      "S": 512,
+      "B": 1,
+      "blocks": 8,
+      "nki_cos_sim": 0.9999731183052063,
+      "torch_cos_sim": 0.9999684691429138,
+      "nki_ms": 4.876247025094926,
+      "torch_ms": 8.582309004850686,
+      "nki_ms_per_block": 0.6095308781368658,
+      "torch_ms_per_block": 1.0727886256063357,
+      "ratio_nki_over_torch": 0.5681742550097988,
+      "verdict": "NKI FASTER by 1.76x"
+    },
+    {
+      "H": 4096,
+      "I": 4096,
+      "S": 512,
+      "B": 1,
+      "blocks": 2,
+      "nki_cos_sim": 0.999967098236084,
+      "torch_cos_sim": 0.9999646544456482,
+      "nki_ms": 5.075472989119589,
+      "torch_ms": 3.4918510064017028,
+      "nki_ms_per_block": 2.5377364945597947,
+      "torch_ms_per_block": 1.7459255032008514,
+      "ratio_nki_over_torch": 1.453519345417256,
+      "verdict": "NKI slower by 1.45x"
+    }
+  ],
+  "neuronx_cc": "2.0.266551.0a0+319bd7e0",
+  "boundary_sweep": [
+    {
+      "H": 1024,
+      "I": 3072,
+      "ok": true
+    },
+    {
+      "H": 1024,
+      "I": 4096,
+      "ok": true
+    },
+    {
+      "H": 1024,
+      "I": 5120,
+      "ok": false,
+      "error": "RuntimeError: error: failed to compile NKI kernel: Collected 1 different diagnostics: - [x1] error: 'floordiv' does not allow division by zero "
+    },
+    {
+      "H": 4096,
+      "I": 4096,
+      "ok": true
+    },
+    {
+      "H": 4096,
+      "I": 12288,
+      "ok": false,
+      "error": "RuntimeError: error: failed to compile NKI kernel: Collected 1 different diagnostics: - [x1] error: 'floordiv' does not allow division by zero "
+    }
+  ],
+  "boundary_changed": false,
+  "any_win": true
+}

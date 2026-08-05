@@ -94,11 +94,38 @@ def load_kernel_module(package_name: str):
 # Device handling
 # --------------------------------------------------------------------------
 
+def stack() -> str | None:
+    """Which Neuron PyTorch stack is this process on? "native", "xla", or None.
+
+    There are two, they are separate installs, and they cannot be mixed — `torch_xla` is not
+    importable in the native venv at all. Everything in this project through Week 6 was
+    measured on "xla"; "native" is the drop HuggingFace intends to be used. The difference
+    that matters for these helpers: XLA is a lazy graph runtime needing an explicit
+    `mark_step()`, while native dispatches eagerly through PyTorch's own machinery.
+
+    Native is checked first and by two signals, because `hasattr(torch, "neuron")` alone
+    would be satisfiable by anything that sets the attribute.
+    """
+    if hasattr(torch, "neuron"):
+        try:
+            if torch._C._get_privateuse1_backend_name() == "neuron":
+                return "native"
+        except Exception:
+            pass
+    try:
+        import torch_xla.core.xla_model as xm  # noqa: F401
+
+        return "xla"
+    except ImportError:
+        return None
+
+
 def get_xla_device():
     """Return the Neuron XLA device, or None if unavailable.
 
     Note `device.type` is `"xla"`, not `"neuron"` — which is precisely why
-    `use_kernels=True` can't route to the neuron mapping (Finding #9).
+    `use_kernels=True` can't route to the neuron mapping on this stack (Finding #9). On the
+    native stack it reports `"neuron"` and the gap does not exist (Finding #31).
     """
     try:
         import torch_xla.core.xla_model as xm
@@ -119,35 +146,76 @@ def xla_hardware() -> str | None:
 
 
 def sync():
-    """Force pending XLA operations to execute."""
-    try:
+    """Force pending device work to complete, on whichever stack we are on.
+
+    On XLA this is mandatory: ops accumulate lazily and nothing runs until `mark_step()`.
+    Timing without it measures graph construction, which is how Finding #19's first version
+    came to time an empty graph.
+
+    On native, dispatch is eager and materialising a result (`.cpu()` / `.item()`) already
+    synchronises, so this is a belt-and-braces barrier rather than a requirement.
+    """
+    s = stack()
+    if s == "xla":
         import torch_xla.core.xla_model as xm
 
         xm.mark_step()
-    except Exception:
-        pass
+        try:
+            xm.wait_device_ops()
+        except Exception:
+            pass
+    elif s == "native":
+        try:
+            torch.neuron.synchronize()
+        except Exception:
+            # Not fatal. Every caller consumes its output, which forces materialisation.
+            pass
 
 
 def require_neuron() -> torch.device:
-    """Return the Neuron XLA device, raising a clear error if we're not on hardware.
+    """Return a Neuron device, raising a clear error if we are not on hardware.
 
-    Tests must fail loudly rather than silently degrade to a CPU run — that
-    silent degradation is exactly what produced Finding #8.
+    Tests must fail loudly rather than silently degrade to a CPU run — that silent
+    degradation is exactly what produced Finding #8. Works on both stacks.
     """
-    dev = get_xla_device()
-    if dev is None:
-        raise RuntimeError(
-            "No XLA device available. These tests must run on Trainium.\n"
-            "Run on trn2 with the Neuron venv activated:\n"
-            "  source /opt/aws_neuronx_venv_pytorch_2_9/bin/activate"
-        )
-    hw = xla_hardware()
-    if hw != "NEURON":
-        raise RuntimeError(
-            f"XLA device present but hardware is {hw!r}, expected 'NEURON'. "
-            "Refusing to report NKI results from non-Neuron hardware."
-        )
-    return dev
+    s = stack()
+
+    if s == "native":
+        # Prove the device is really usable rather than trusting the registered backend name:
+        # a registered PrivateUse1 name with no working runtime behind it would otherwise pass.
+        try:
+            probe = torch.zeros(8, 8).to("neuron")
+        except Exception as e:
+            raise RuntimeError(
+                f"Native Neuron backend is registered but a device tensor could not be "
+                f"created: {type(e).__name__}: {e}\n"
+                "If this hangs or fails on the first op, check that neuronx-cc is on PATH — "
+                "run through ./scripts/run_native.sh, which asserts it (Finding #30)."
+            ) from e
+        if probe.device.type != "neuron":
+            raise RuntimeError(
+                f"Expected device.type 'neuron', got {probe.device.type!r}. "
+                "Refusing to report NKI results from an unexpected device."
+            )
+        return torch.device("neuron")
+
+    if s == "xla":
+        dev = get_xla_device()
+        if dev is None:
+            raise RuntimeError("torch_xla imported but no XLA device is available.")
+        hw = xla_hardware()
+        if hw != "NEURON":
+            raise RuntimeError(
+                f"XLA device present but hardware is {hw!r}, expected 'NEURON'. "
+                "Refusing to report NKI results from non-Neuron hardware."
+            )
+        return dev
+
+    raise RuntimeError(
+        "No Neuron device available on either stack. These tests must run on Trainium.\n"
+        "  XLA    : source /opt/aws_neuronx_venv_pytorch_2_9/bin/activate\n"
+        "  native : ./scripts/run_native.sh <script>"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -302,8 +370,11 @@ def report(results: list[AccuracyResult], title: str) -> bool:
     print("=" * 76)
     print(title)
     print("=" * 76)
-    hw = xla_hardware()
-    print(f"  hardware: {hw}")
+    s = stack()
+    hw = xla_hardware() if s == "xla" else ("NEURON" if s == "native" else None)
+    # Name the stack, not just the hardware. Every number in this project through Week 6 was
+    # measured on "xla", and a result is not comparable across the two.
+    print(f"  stack: {s}    hardware: {hw}")
     print()
     for r in results:
         print(r.line())

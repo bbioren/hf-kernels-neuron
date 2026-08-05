@@ -68,7 +68,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 import torch
 
 from neuron_kernel_registration import kernelize_for_neuron
-from nki_test_utils import nki_call_counter, require_neuron
+from nki_test_utils import nki_call_counter, require_neuron, stack, sync
 
 SEP = "=" * 88
 
@@ -136,14 +136,8 @@ def build_model(cfg, dtype=torch.bfloat16):
     return model, config
 
 
-def sync():
-    import torch_xla.core.xla_model as xm
-
-    xm.mark_step()
-    try:
-        xm.wait_device_ops()
-    except Exception:
-        pass
+# `sync` and `stack` come from nki_test_utils and are stack-aware: mark_step on torch-xla,
+# torch.neuron.synchronize on native. See the import above.
 
 
 def time_steps(model, ids, iters, warmup):
@@ -223,12 +217,27 @@ def main():
     # Applied before any kernel runs. Patching the module attribute works regardless of how
     # resolve_target imported it, because resolve_target resolves _detect_target from its own
     # module globals at call time.
+    current_stack = stack()
+    print(f"  stack: {current_stack}")
+    if current_stack == "native":
+        print("  NOTE: native stack. Every previously published number in this project was")
+        print("        measured on torch-xla and is NOT comparable line-for-line.")
+
     op_stats = None
     if args.fix_target_detection or args.fix_op_registry:
         from nki_dispatch_fixes import fix_target_detection
 
         fix_target_detection()
     if args.fix_op_registry:
+        # Finding #28 patches torch_xla's Op registry. On native there is no torch_xla — it is
+        # not even importable — so the fix is not "unapplied", it is meaningless. Refuse rather
+        # than let a run be labelled as carrying a fix that cannot exist on this stack.
+        if current_stack == "native":
+            print("  ABORTING: --fix-op-registry is a torch_xla fix (Finding #28) and does not")
+            print("            apply on the native stack, where torch_xla is not importable.")
+            print("            Whether native has an equivalent per-call lowering cost is an")
+            print("            open question — do not assume it does or does not.")
+            return 1
         from nki_dispatch_fixes import fix_op_registry_cache
 
         op_stats, _restore = fix_op_registry_cache()
@@ -303,7 +312,12 @@ def main():
     label = ", ".join(only) if only else "RMSNorm + RoPE + SiLU"
     print(f"KERNELIZED (NKI {label})")
     print(SEP)
-    print("  NOTE: via kernelize_for_neuron(), not use_kernels=True — see Finding #9.")
+    if current_stack == "native":
+        print("  NOTE: via kernelize_for_neuron() for comparability with the torch-xla runs.")
+        print("        On this stack stock use_kernels=True ALSO works (Finding #31); the swap")
+        print("        mechanism is identical either way.")
+    else:
+        print("  NOTE: via kernelize_for_neuron(), not use_kernels=True — see Finding #9.")
     model2, _ = build_model(cfg)
     model2 = model2.to(device)
     kernelize_for_neuron(model2, only=only)
@@ -404,6 +418,9 @@ def main():
 
     if args.json_out:
         payload = {
+            # Recorded first and always. An MFU figure is meaningless without the stack it was
+            # taken on, and this project has numbers from both.
+            "stack": current_stack,
             "preset": args.preset, "batch": args.batch, "seq": args.seq,
             "config": cfg, "flops_forward": flops, "flop_breakdown": breakdown,
             "denominator": {
