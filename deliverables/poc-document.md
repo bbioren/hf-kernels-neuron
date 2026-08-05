@@ -113,9 +113,10 @@ Mistral-7B are 14336. So the result is real and currently unusable.
 
 **4. Hub publishing is unproven and may not be reachable.** The loader expects
 `build/<variant>/` directories; our flat Python-only layout works through a fallback path;
-`kernel-builder` has no Neuron target at all. Nothing has been uploaded. There is also a trust gate
-(`ALLOW_ALL_KERNELS = False`) that treats repos outside `kernels-community` as untrusted, which makes
-the repo-home decision a technical one and not just branding.
+`kernel-builder` has no Neuron target at all. Nothing has been uploaded. Kernels also live in a
+distinct `repo_type="kernel"` on the Hub, and `aws-neuron` currently has zero of them. The trust gate
+is a solvable org flag rather than a blocker (see ask 2), but nothing about the *upload* path has been
+exercised end to end.
 
 **5. Attention wins by bypassing the thing this PoC is about.** The best result came from calling
 `attention_cte` directly, not through the Kernel Hub. Wiring it through transformers' attention
@@ -272,11 +273,23 @@ Ordered by value per unit of effort.
 block in `_KERNEL_MAPPING` and one in `_FUNCTION_KERNEL_MAPPING`. Blocked on the repo-home decision
 below, because the entries name repo IDs.
 
-**2. HuggingFace: decide the repo home — `kernels-community/` vs `aws-neuron/`.** Not branding.
-`kernels` has `ALLOW_ALL_KERNELS = False`, gating "kernels coming from untrusted repos, i.e. repos
-outside `kernels-community`". Publishing under our own org means every user trips a trust gate, which
-defeats the point of `use_kernels=True` just working. Our lean is `kernels-community/`, accepting
-that our updates then go through their review.
+**2. HuggingFace: enable `trustedKernelPublisher` on the existing `aws-neuron` org.** This ask
+replaces an earlier, worse-informed one. The Hub trust gate is **not** a hardcoded
+`kernels-community` check — `kernels/utils.py::_check_trust_remote_code` looks up an org-level
+`trustedKernelPublisher` boolean via the Hub API, and `kernels-community` simply has it set. Verified
+live: `kernels-community` reports `trustedKernelPublisher: true` with 56 kernels; `aws-neuron` already
+exists as a joint AWS/HF org with 31 models and 180 followers, but has 0 kernels and no such flag.
+
+So trust and versioning control are **not** the tradeoff we previously described. A kernel version is
+just a `v<N>` branch in a `repo_type="kernel"` repo, so control comes down to who can push branches —
+which under `aws-neuron` is AWS. Getting the flag set on an org that already exists is a smaller ask
+than obtaining write access into HF's own kernel org.
+
+Fall back to `kernels-community/` only if HF declines. Worth asking their criteria: `numKernels: 0`
+may itself be the blocker, in which case the sequence is "publish under `kernels-community` first,
+move later" rather than a permanent choice. Note also that `trust_remote_code=[...]` is *not* a
+per-repo allowlist — it is for signing identities, is unimplemented, and silently falls back to the
+publisher check.
 
 **3. NKI: cache `_detect_target`.** One decorator, 86x per call, accuracy-neutral by measurement,
 still applies on native, and benefits every eager NKI user rather than just this integration. This is

@@ -1657,10 +1657,19 @@ truth per fact (27 KB, down from 49 KB). *Rejected:* patching the stale recommen
 
 ## BLOCKED — NEEDS INPUT (current)
 
-**B17. Repo home: `kernels-community/` vs `aws-neuron/`.** Now a technical question, not branding:
-`kernels` has `ALLOW_ALL_KERNELS = False`, gating repos outside `kernels-community` as untrusted. Our
-own org means every user trips a trust gate, defeating the point of `use_kernels=True` just working.
-Lean: `kernels-community/`. Blocks the mapping-entry PR, which names repo IDs.
+**B17. Repo home — REFRAMED, and the earlier lean was wrong.** I had this as a genuine tradeoff
+(trust on the default path vs versioning control) on the strength of the comment at
+`hub_kernels.py:686` saying the gate covers "repos outside `kernels-community`". The implementation
+disagrees: `kernels/utils.py::_check_trust_remote_code` queries an org-level `trustedKernelPublisher`
+flag via the Hub API, and `kernels-community` is not special-cased in code — it just has the flag.
+Verified live: `kernels-community` has `trustedKernelPublisher: true` and 56 kernels; **`aws-neuron`
+already exists** (joint AWS/HF org, 31 models, 180 followers) with 0 kernels and no flag.
+
+Versioning is a `v<N>` branch in a `repo_type="kernel"` repo, so control is just Hub write
+permissions and does not depend on the org. **So the ask is `aws-neuron` + the flag**, which gets both
+properties. Fall back to `kernels-community/` only if HF declines — and ask their criteria, since
+`numKernels: 0` may itself be the blocker. Finding #34. Still blocks the mapping-entry PR, which names
+repo IDs.
 
 **B18. Can `kernelize()` express a multi-core SPMD launch?** Now the single gating question for the
 whole performance story. Both winning candidates were built for a multi-core grid and are handicapped

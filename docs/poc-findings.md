@@ -60,6 +60,7 @@ These are the primary references we used. Critically, they describe different la
 | 31 | **BOTH GATES ARE GONE on Native PyTorch, and our headline upstream ask is retired.** `device.type == "neuron"`, `_backend() == Neuron()`, and stock `use_kernels=True` swaps all three kernels with no patch of any kind | **Critical** | **Corrects #9 and #12.** Proposed Change 1 (xla→neuron device resolution) is unnecessary — it was an XLA artifact. Change 2 (the `_KERNEL_MAPPING` neuron entries) is still required and is now the *only* upstream blocker. All 3 kernels compile and run under NKI 0.6.0b1 |
 | 32 | **On native the kernels are FASTER than baseline — 1.97x at seq 512 — and that is NOT a win.** The native torch baseline is 4.3x slower than the XLA one, so the ratio flipped because the denominator degraded. Both absolute numbers are worse on native | **Critical** | **The `--lnc 1` trap from #27, now at model scale.** Never quote the native speedup without the baseline beside it. Native kernelized MFU 2.20% is *below* XLA kernelized 2.98% |
 | 33 | **The fused RMSNorm+MLP is a second winning candidate — 1.76x faster at Qwen3-0.6B's shape — but only at shapes nobody deploys.** Finding #18's `I>4096` single-core boundary is UNCHANGED on the new compiler, so every real model is still excluded | **High** | Samir's suggestion, and correct: `NormType.RMS_NORM` works and is accurate (cos_sim 0.999973). Loses 1.45x at H=4096/I=4096, so it is a shape *window* like #29. Two new interface mismatches found: the norm weight must be 2D and the hidden tensor must be 3D |
+| 34 | **The Hub trust gate is an org-level flag, not a hardcoded `kernels-community` check — so `aws-neuron` can be trusted AND keep versioning control.** `huggingface.co/aws-neuron` already exists (31 models, 180 followers) but has `numKernels: 0` and no `trustedKernelPublisher` | **High** | **Reverses the repo-home recommendation.** The earlier lean toward `kernels-community` came from trusting a stale code comment instead of reading `_check_trust_remote_code`. The ask to HF is now a flag on an existing org, not a choice between trust and control |
 
 ---
 
@@ -2731,3 +2732,90 @@ they land on top of the three weight transposes from Finding #17. A wrapper for 
    much stronger evidence for "usage constraint, needs a real diagnostic" than the original
    single-compiler report.
 4. **Measure it on device, not wall clock,** before it goes in any customer-facing document.
+
+---
+
+## 34. The Hub trust gate is an org-level flag, so `aws-neuron` can be trusted *and* keep versioning control [HIGH — reverses the repo-home recommendation]
+
+The repo-home question (`kernels-community/` vs `aws-neuron/`) had been filed as a real tradeoff:
+trust on the default path versus control over versioning. **It is much less of a tradeoff than that**,
+and the earlier reasoning was based on a stale code comment rather than the implementation.
+
+### What the earlier recommendation rested on
+
+`transformers/integrations/hub_kernels.py:686`:
+
+```python
+# Whether to allow hub kernels coming from untrusted repos, i.e. repos outside `kernels-community`
+ALLOW_ALL_KERNELS = False
+```
+
+Read on its own, that says the gate is a hardcoded organisation name, and therefore that publishing
+anywhere else forces every user to opt into untrusted kernels. That is what went into the PoC
+document's ask and into the draft message to John, with a lean toward `kernels-community`.
+
+### What the implementation actually does
+
+`kernels/utils.py::_check_trust_remote_code`:
+
+```python
+publisher = repo_id.split("/", 1)[0]
+info = _get_hf_api().get_organization_overview(publisher)
+if getattr(info, "trustedKernelPublisher", False):
+    return
+raise ValueError(f"Kernel repository '{repo_id}' is not from a trusted publisher. ...")
+```
+
+The gate is **an org-level boolean on the Hub**, `trustedKernelPublisher`. `kernels-community` is not
+special-cased in code; it simply has the flag set. Confirmed against the live Hub API:
+
+| org | exists | `numKernels` | `trustedKernelPublisher` |
+|---|---|---|---|
+| `kernels-community` | yes, `plan: team`, 4 users | 56 | **`true`** |
+| `aws-neuron` | **yes** — "AWS Inferentia and Trainium", 31 models, 38 users, 180 followers | **0** | **field absent → falsy → untrusted** |
+
+So `aws-neuron` already exists as an established joint AWS/HF organisation (it hosts the Optimum
+Neuron models). It has no kernel-type repos yet, and it is not currently a trusted publisher — but
+becoming one is **a flag HF sets on an existing org**, not a code change, a fork, or a migration.
+
+**The `trust_remote_code=[...]` list form is not an escape hatch.** `LayerRepository` accepts
+`trust_remote_code: bool | list[str]`, which looks like a per-repo allowlist. It is not: the list is
+for *signing identities*, the docstring says verification "is not yet implemented", and passing a list
+emits a warning and **falls back to the default publisher check**. Worth knowing so nobody designs
+around it.
+
+### Versioning is identical either way
+
+A kernel "version" is a **branch named `v1`, `v2`, …** in a Hub repo of type `kernel`, resolved by
+`list_repo_refs(repo_id, repo_type="kernel")` and filtered on the `v<N>` name pattern
+(`kernels/_versions.py:12-30`). `version=` and `revision=` are mutually exclusive and one is required.
+
+That mechanism does not depend on the organisation. What depends on the organisation is **who can push
+those branches** — ordinary Hub write permissions. Under `aws-neuron`, AWS controls that directly and
+can ship a `v2` without waiting on anyone. Under `kernels-community` (a 4-user team org), we would need
+write access granted and our updates would plausibly sit behind their review.
+
+### Revised recommendation
+
+**Ask for `aws-neuron/` plus the `trustedKernelPublisher` flag.** That gets the default-path trust *and*
+versioning control, which the earlier framing had treated as mutually exclusive. It is also the smaller
+ask of the two in practice: a flag on an org that already exists and is already an AWS/HF
+collaboration, versus write access into HF's own kernel org.
+
+Fall back to `kernels-community/` only if HF declines the flag. Worth asking what their criteria are,
+since `numKernels: 0` may itself be the blocker — they may reasonably want to see published, working
+kernels before marking a publisher trusted, which would make the sequence "publish under
+`kernels-community` first, move later" rather than a permanent choice.
+
+### The methodological point, which is the same one this project keeps relearning
+
+Decision D39 in this project was *verify the installed source rather than trusting a docstring* —
+adopted after nearly sending Samir file:line citations on the strength of a comment. This finding is
+that same error, committed later, in a deliverable: a code comment was read as a specification, the
+implementation four files away said something materially different, and a recommendation was written
+on the comment.
+
+The comment is not even wrong in spirit — `kernels-community` really is the only trusted publisher
+today. It is wrong about *why*, and the why is what determines whether the situation is changeable.
+**A comment describes the world when it was written; the code describes the mechanism.** For anything
+load-bearing, read the mechanism.
