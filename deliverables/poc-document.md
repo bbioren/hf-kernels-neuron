@@ -122,7 +122,15 @@ exercised end to end.
 `attention_cte` directly, not through the Kernel Hub. Wiring it through transformers' attention
 interface is not done, so the strongest performance result is not yet a Kernel Hub result.
 
-**6. Open questions we cannot answer from here.** Whether a NKI custom call can participate in
+**6. The project is eager-only, and that is an assumption rather than a conclusion.** All three
+kernels declare `can_torch_compile = False` because we never tested Dynamo tracing, not because we
+found it impossible. Meanwhile eager on native is 4.3x slower than the XLA graph path, and Neuron's
+own figures put compile at ~23% MFU for Qwen3-8B against ~5% eager. So the configuration this PoC
+validated is both the slowest available and possibly not the one customers will use. See the
+`torch.compile` entry under "what is not done" — the one-experiment test is to flip the flag on a
+single kernel and see whether it traces.
+
+**7. Open questions we cannot answer from here.** Whether a NKI custom call can participate in
 compiler fusion (compiler team). Whether the `I > 4096` boundary is intended (nkilib team). Whether
 native has an equivalent of the torch-xla per-call lowering cost — unmeasured, and it should not be
 assumed either way.
@@ -427,10 +435,42 @@ it constrain the claim.
 - **Backward kernels.** All three declare `has_backward = False`, so training mode falls back. If
   training matters for the beta, this is real work: `rope_hf` has a backward path, `nl.silu_dx`
   exists, RMSNorm backward would need writing.
-- **`torch.compile`.** All three declare `can_torch_compile = False`. Separately, `torch_neuronx`'s op
-  overrides are not fake-tensor safe, which breaks `torch.compile` on nearly every transformer —
-  the override list includes `Embedding`, `Softmax` and `CrossEntropyLoss`. Filed with a reproducer;
-  outside this project's scope.
+- **`torch.compile` — and this is a limitation of the PoC's *framing*, not just a missing feature.**
+  Everything here is eager mode, and that deserves to be challenged rather than assumed.
+
+  All three kernels declare `can_torch_compile = False`. That was our choice, and it is not
+  cosmetic: `_validate_layer` raises if a kernel is selected in `Mode.TORCH_COMPILE` without it, so
+  the declaration actively excludes us. It was the honest value — we never verified the kernels
+  survive Dynamo tracing — but it is an untested assumption, not a finding.
+
+  The mechanism is **not** eager-only. Upstream `_KERNEL_MAPPING` registers several entries
+  specifically for `Mode.INFERENCE | Mode.TORCH_COMPILE` and `Mode.TRAINING | Mode.TORCH_COMPILE`,
+  so HuggingFace treats compiled usage as first class. Eager-only Neuron kernels would cover a
+  fraction of what the mechanism offers.
+
+  **And the configuration we measured may not be the one that matters.** These numbers are eager,
+  single-core, forward-only, and native eager is currently 4.3x slower than the XLA graph path at
+  the baseline. On Neuron's own published figures compile is where the MFU is — roughly 23% for
+  Qwen3-8B under `torch.compile` against ~5% eager. If the deployment story is compiled, then two of
+  this document's central findings need re-testing rather than porting:
+
+  - the dispatch costs (#24, #28) may largely vanish, since a compiler can hoist per-call work out
+    of the loop;
+  - the fusion barrier (#25) could move in either direction, because that analysis is about *one*
+    graph compiler's inability to fuse across an opaque custom call, and `torch.compile` puts a
+    different compiler in the path whose behaviour here is unmeasured.
+
+  What partly kept us in eager is a real blocker, but an XLA-era one: `torch_neuronx`'s op overrides
+  are not fake-tensor safe (the dispatch predicate accepts a `FakeTensor` then rejects it), which
+  breaks `torch.compile` on nearly any transformer since the override list includes `Embedding`,
+  `Softmax` and `CrossEntropyLoss`. Filed with a reproducer. **But native lowers through torch-mlir
+  rather than `torch_xla`, so whether that blocker exists there was never re-checked.** Carrying an
+  XLA-stack blocker forward into a native-stack conclusion is exactly the mistake Finding #31
+  records, and it happened again here.
+
+  Concrete next step, and it is cheap: flip `can_torch_compile = True` on one kernel and see whether
+  it traces on native. That single experiment decides whether the eager framing is a constraint or a
+  habit.
 - **Hub upload.** Nothing published. Blocked on the repo-home decision, and possibly on the loader's
   variant-directory expectation.
 - **Attention through the Kernel Hub.** The best performance result bypasses the mechanism this PoC is
