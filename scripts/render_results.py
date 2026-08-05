@@ -83,6 +83,19 @@ def main():
         L.append("")
         L.append(f"Versions were checked before trusting any of it: {rep['versions_verified']}")
         L.append("")
+    # The two-stack warning goes ABOVE the headline number, not in a footnote. Sticking point #18
+    # is about leading with the most dramatic true figure, and there is now a figure in this file
+    # ("kernels 1.97x faster") that is true, cleanly measured, and badly misleading on its own.
+    st = d["_about"]["_stacks"]
+    L.append("### Read this before quoting any number: there are TWO stacks")
+    L.append("")
+    L.append(f"{st['warning']}")
+    L.append("")
+    L.append(f"{st['why_it_matters']}")
+    L.append("")
+    L.append(f"{st['which_findings_port']}")
+    L.append("")
+
     L.append("### The number to lead with")
     L.append("")
     ins = ms["in-situ-device-vs-dispatch"]
@@ -332,6 +345,55 @@ def main():
     npass = sum(1 for p in fb["data_points"] if p["result"] == "pass")
     L.append(f"Compile boundary, {len(fb['data_points'])} data points "
              f"({npass} pass): **{fb['conclusion']}**. {fb['notes']}")
+    L.append("")
+
+    # --- native stack ---------------------------------------------------------------------
+    ng = ms["native-gates"]
+    nk = ms["native-kernels"]
+    nm = ms["mfu-native"]
+    fr = ms["fused-rmsnorm-mlp-native"]
+
+    L.append("## The Native PyTorch stack (Findings #31, #32, #33)")
+    L.append("")
+    gv = ng["values"]
+    L.append(f"**Both integration gates are gone.** `model.device.type` is `{gv['model_device_type']}`, "
+             f"`kernels._backend()` returns `{gv['kernels_backend']}`, and "
+             f"`validate_dependencies([\"nki\"])` {gv['validate_dependencies_nki']}. Stock "
+             f"`use_kernels=True` swaps all three kernels with **no patching** — "
+             f"{gv['rmsnorm_swaps']} RMSNorm, {gv['rope_swaps']} RoPE, {gv['silu_swaps']} SiLU, "
+             f"dispatch {gv['dispatch_nki']}, logits `cos_sim {gv['logits_cos_sim']}`. The probe "
+             f"asserts our shim is absent before it runs, so this cannot be an artifact of it.")
+    L.append("")
+    kv = nk["values"]
+    L.append(f"All three kernels compile and run under the native stack's NKI `{kv['nki']}`: "
+             f"RMSNorm `{kv['rmsnorm_cos_sim']}`, SiLU `{kv['silu_cos_sim']}`, RoPE q "
+             f"`{kv['rope_cos_sim_q']}` / k `{kv['rope_cos_sim_k']}`, fell back: {kv['fell_back']}.")
+    L.append("")
+    L.append("**And the sign of the performance headline flips, which is NOT a win:**")
+    L.append("")
+    L.append("| seq | baseline ms | kernelized ms | verdict | baseline MFU | kernelized MFU |")
+    L.append("|---|---|---|---|---|---|")
+    for r in nm["rows"]:
+        L.append(f"| {r['seq']} | {r['baseline_ms']} | {r['kernelized_ms']} | *{r['verdict']}* | "
+                 f"{r['baseline_mfu_pct']}% | {r['kernelized_mfu_pct']}% |")
+    L.append("")
+    cs = nm["cross_stack"]
+    L.append(f"Against torch-xla: baseline is **{cs['baseline_native_vs_xla_seq512']}** and "
+             f"kernelized is {cs['kernelized_native_vs_xla_seq512']} at seq 512. "
+             f"{cs['reading']}")
+    L.append("")
+    L.append("**Samir's fused RMSNorm+MLP is a second winning candidate**, and a second shape window:")
+    L.append("")
+    L.append("| shape | NKI ms/block | torch ms/block | verdict | cos_sim |")
+    L.append("|---|---|---|---|---|")
+    for r in fr["rows"]:
+        L.append(f"| H={r['H']} I={r['I']} ({r['label']}) | {r['nki_ms_per_block']} | "
+                 f"{r['torch_ms_per_block']} | **{r['verdict']}** | {r['cos_sim']} |")
+    L.append("")
+    br = fr["boundary_retest"]
+    L.append(f"Wall clock, so provisional — see the note in `measurements.json`. And the practical "
+             f"blocker is unchanged: Finding #18's single-core compile boundary re-tested on the new "
+             f"compiler gives {br['results']}, verdict **{br['verdict']}**. {br['implication']}")
     L.append("")
 
     # --- correctness ----------------------------------------------------------------------

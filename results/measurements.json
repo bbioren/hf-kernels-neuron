@@ -30,7 +30,33 @@
     },
     "hardware": "trn2.3xlarge, 1 Neuron device, 4 NeuronCores, LNC2 (2 logical cores), single logical core used unless stated",
     "compiler_flags": "NEURON_CC_FLAGS unset for every measurement — compiler defaults throughout. This was the top open item, on the theory that a bad default could be the whole slowdown. Now CLOSED in both halves by two controls that sweep {unset, --target trn2, +--lnc 1, +--lnc 2, +-O2}. Wall clock: NKI is invariant at 1.02x spread (13.82-14.15 ms). Device: NKI is invariant at 1.05x spread (0.580-0.608 ms) and its marginal HBM traffic is 6.29 MB/call under every setting, which is exactly the unfused floor — one tile in, one tile out — so no flag has anywhere to go. See the compiler-flag-control and device-time-under-flags measurements.",
+    "_stacks": {
+      "warning": "MEASUREMENTS IN THIS FILE COME FROM TWO DIFFERENT STACKS AND ARE NOT INTERCHANGEABLE. Every measurement without an explicit \"stack\" field was taken on torch-xla. Entries with \"stack\": \"native\" were taken on the Native PyTorch drop. The claims in _about.compiler_flags and the versions below describe the torch-xla stack only.",
+      "why_it_matters": "The sign of the headline differs between them. On torch-xla the kernels are 1.62x SLOWER than baseline at seq 512; on native they are 1.97x FASTER. That is not an improvement — the native baseline is 4.32x slower than the XLA one, so the ratio moved because the denominator got worse. Native kernelized MFU (2.20%) is BELOW xla kernelized MFU (2.98%). See the mfu-native measurements and Finding #32. Never quote a native speedup without the native baseline beside it.",
+      "which_findings_port": "The dispatch fix for Finding #24 (_detect_target lru_cache) still applies on native — the subprocess is still forked there. Finding #28 (the torch_xla Op-registry cache) does NOT port and is meaningless on native, because torch_xla is not importable. Whether native has an equivalent per-call lowering cost is UNMEASURED and should not be assumed either way.",
+      "xla": {
+        "kernels": "0.15.2",
+        "transformers": "5.15.0.dev0 (commit bb3ffb97)",
+        "torch": "2.9.1+cu128",
+        "torch_xla": "2.9.0",
+        "neuronx-cc": "2.26.6360.0+6f180f47",
+        "nki": "0.5.0+28631259367.ga768afa6",
+        "venv": "/opt/aws_neuronx_venv_pytorch_2_9 (DLAMI)"
+      },
+      "native": {
+        "kernels": "0.15.2",
+        "transformers": "5.15.0.dev0",
+        "torch": "2.11.0+cu130",
+        "torch-neuronx": "0.1.0+c312e3f4",
+        "neuronx-cc": "2.0.266551.0a0+319bd7e0",
+        "nki": "0.6.0b1+28066168719.gc659ca3a",
+        "torch-mlir": "1.0.111.0",
+        "venv": "/home/ubuntu/native_venv (built from s3://huggingface-aws/pytorch-native/drop_jun_25/)",
+        "note": "torch_xla is NOT importable here. Host Neuron runtime/driver left at the production versions — the drop's deb/ packages were NOT installed and turned out not to be required (Finding #30). Must be run via scripts/run_native.sh, or neuronx-cc is off PATH and the first compile hangs forever."
+      }
+    },
     "versions": {
+      "_see": "_stacks above — this key is retained for the torch-xla measurements, which are the majority of this file",
       "kernels": "0.15.2",
       "transformers": "5.15.0.dev0 (commit bb3ffb97)",
       "torch": "2.9.1+cu128",
@@ -580,6 +606,93 @@
       "commit": "83b6269",
       "status": "transcribed",
       "notes": "Higher than the project guide's estimate of 87 RMSNorm / 66 RoPE."
+    },
+
+    {
+      "id": "native-gates",
+      "stack": "native",
+      "what": "Do the two integration gates exist on the Native PyTorch stack? Decisive test: stock transformers hub_kernels.kernelize() on Qwen3, with the probe ASSERTING our shim is absent before it proceeds.",
+      "method": "2-layer Qwen3 on device, neuron mapping entries registered, then the real transformers kernelize(). Swaps counted structurally AND by execution counter; the counters are authoritative (Finding #8). Function-kernel swaps counted by identity change of _hidden_kernels[...].forward, because stock kernelize detaches the submodule alias in its finally block.",
+      "values": {
+        "model_device_type": "neuron",
+        "kernels_backend": "Neuron()",
+        "hasattr_torch_neuron": true,
+        "validate_dependencies_nki": "passes",
+        "rmsnorm_swaps": 9,
+        "rope_swaps": 2,
+        "silu_swaps": 2,
+        "dispatch_nki": "9 / 2 / 2, fallback 0 on all three",
+        "logits_cos_sim": 1.000001,
+        "shim_used": false
+      },
+      "script": "scripts/probe_native_use_kernels.py",
+      "artifact": "results/raw/native/native_use_kernels.json",
+      "status": "in_repo",
+      "notes": "BOTH GATES GONE. Retires Findings #9 and #12 and withdraws the project's headline upstream ask (the xla->neuron device-resolution patch). What remains required is the \"neuron\" entries in _KERNEL_MAPPING — this probe injects them itself, so on a stock install use_kernels=True is still a no-op, now for lack of entries to route to rather than lack of device routing. Finding #31."
+    },
+
+    {
+      "id": "native-kernels",
+      "stack": "native",
+      "what": "Do all three NKI kernels COMPILE AND RUN under the native stack's different compiler and NKI version? Import is not compile — @nki.jit does nothing until traced, and the 0.5.0 migration already broke two of these kernels once (Finding #14).",
+      "method": "Each kernel executed on a device tensor against a CPU reference, with warnings captured so a silent fallback cannot pass as a success. torch.neuron.synchronize() also exercised, since it appeared to deadlock before PATH was fixed.",
+      "values": {
+        "nki": "0.6.0b1+28066168719.gc659ca3a",
+        "rmsnorm_cos_sim": 0.999983,
+        "silu_cos_sim": 0.999980,
+        "rope_cos_sim_q": 1.000002,
+        "rope_cos_sim_k": 1.000001,
+        "fell_back": "none",
+        "synchronize_ok": true
+      },
+      "script": "scripts/probe_native_kernels.py",
+      "artifact": "results/raw/native/native_kernels.json",
+      "status": "in_repo",
+      "notes": "All three compile and run under NKI 0.6.0b1 / neuronx-cc 2.0.266551.0a0, no fallbacks."
+    },
+
+    {
+      "id": "mfu-native",
+      "stack": "native",
+      "what": "MFU baseline vs kernelized on the native stack. THE SIGN OF THE HEADLINE FLIPS, and it is not a win.",
+      "method": "Same script and same denominator as the torch-xla MFU measurements, with the harness made stack-aware (mark_step on xla, torch.neuron.synchronize on native). Finding #24's fix applied. --fix-op-registry deliberately REFUSED on this stack, since it patches torch_xla which is not importable here.",
+      "rows": [
+        {"seq": 512, "baseline_ms": 189.97, "kernelized_ms": 96.46, "verdict": "1.970x faster", "baseline_mfu_pct": 1.12, "kernelized_mfu_pct": 2.20, "baseline_iqr_ms": "187.83-191.72"},
+        {"seq": 2048, "baseline_ms": 340.74, "kernelized_ms": 251.86, "verdict": "1.353x faster", "baseline_mfu_pct": 3.16, "kernelized_mfu_pct": 4.28}
+      ],
+      "cross_stack": {
+        "baseline_native_vs_xla_seq512": "4.32x slower (189.97 vs 43.94)",
+        "kernelized_native_vs_xla_seq512": "1.35x slower (96.46 vs 71.32)",
+        "baseline_native_vs_xla_seq2048": "2.89x slower (340.74 vs 117.78)",
+        "kernelized_native_vs_xla_seq2048": "1.56x slower (251.86 vs 161.04)",
+        "reading": "Read DOWN the columns, not across the rows. Everything is slower on native and the baseline is much slower, which is what flipped the ratio. Native kernelized MFU 2.20% is BELOW xla kernelized MFU 2.98%. Nothing got faster."
+      },
+      "script": "scripts/measure_mfu.py",
+      "artifact": "results/raw/native/mfu_512_native.json, results/raw/native/mfu_2048_native.json",
+      "status": "in_repo",
+      "notes": "Finding #32. This is Finding #27's --lnc 1 trap at model scale: a ratio is two numbers and a change in it does not say which one moved. The mechanism is informative though — native is eager with no whole-forward graph, so there is far less fusion for a NKI custom call to block, which supports Finding #25 from the opposite direction. That native performs no whole-forward fusion is the explanation the numbers support, NOT a verified result: the direct traffic-scaling test needs device profiling not wired up on this stack."
+    },
+
+    {
+      "id": "fused-rmsnorm-mlp-native",
+      "stack": "native",
+      "what": "Does nkilib's FUSED RMSNorm+MLP beat the compiler? Samir Araujo's suggestion, and the best candidate by Finding #25's criterion — it spans a fusable region, has two real matmuls, AND absorbs an RMSNorm that would otherwise be its own optimisation barrier. Six torch ops replaced by one call.",
+      "method": "nkilib.core.mlp.mlp with normalization_type=NormType.RMS_NORM, quantization_type=NONE. Distinct weights per block (Finding #26's harness error was sharing one set, which let the compiler amortise a single weight load). Correctness gated against a CPU fp32 reference before any timing. WALL CLOCK, not device time.",
+      "rows": [
+        {"H": 1024, "I": 3072, "label": "Qwen3-0.6B", "nki_ms_per_block": 0.6095, "torch_ms_per_block": 1.0728, "verdict": "NKI 1.76x FASTER", "cos_sim": 0.999973},
+        {"H": 4096, "I": 4096, "label": "largest passing single-core", "nki_ms_per_block": 2.5377, "torch_ms_per_block": 1.7459, "verdict": "NKI 1.45x slower", "cos_sim": 0.999967}
+      ],
+      "boundary_retest": {
+        "what": "Finding #18's I>4096 single-core compile boundary, re-tested on the NEW compiler (2.0.266551.0a0 vs the original 2.26.6360.0)",
+        "results": "1024/3072 PASS, 1024/4096 PASS, 1024/5120 FAIL, 4096/4096 PASS, 4096/12288 FAIL",
+        "verdict": "UNCHANGED — still exactly I<=4096, same 'floordiv does not allow division by zero' in the CTE tile arithmetic",
+        "implication": "Two compiler generations agreeing on the exact threshold is strong evidence this is a DESIGN boundary (the kernel requires an SPMD launch grid) rather than an arithmetic bug, which supports Finding #26's reading over Finding #18's original filing. It also means the 1.76x win is at a shape nobody deploys: Qwen3-8B is I=12288, Llama-3-8B and Mistral-7B are 14336."
+      },
+      "interface_mismatches_found": "Two, both undocumented, both failing at compile time rather than validation, both from that one keyword argument: the normalization weight must be 2D (HF's RMSNorm weight is 1D [H], giving 'Unexpected HBM tensor shape of (1024,)'), and the hidden tensor must be 3D where NO_NORM accepted 2D ('index 2 out of bounds for sequence of size 2', because the norm path routes through load_hidden_tensor_tile which indexes view.shape[2]). So the required input RANK depends on a keyword argument. A wrapper needs 3 transposes + 1 reshape + a rank change + an I<=4096 guard.",
+      "script": "scripts/profile_fused_rmsnorm_mlp.py",
+      "artifact": "results/raw/native/fused_rmsnorm_mlp.json",
+      "status": "in_repo",
+      "notes": "Finding #33. PROVISIONAL: wall clock includes dispatch, and Finding #32 established the native torch baseline is 3-4x slower than the XLA one, so part of the 1.76x is the same degraded-denominator effect. The NKI side also pays one dispatch per block where torch pays six, which cuts in NKI's favour. Needs device-time attribution before it goes in anything customer-facing. Second winning candidate, second shape WINDOW — same structure as the attention result."
     }
   ],
 
@@ -602,9 +715,30 @@
       "priority": "medium"
     },
     {
-      "item": "Does a kernel spanning a fused region beat the compiler on that region?",
-      "detail": "The fused MLP answers this for single-core (no, by ~3x). Unmeasured multi-core with an SPMD grid, which is the configuration the kernel was built for.",
+      "item": "PARTLY ANSWERED — does a kernel spanning a fused region beat the compiler on that region?",
+      "detail": "Yes, twice, and both are shape WINDOWS rather than thresholds. nkilib flash attention beats eager attention 1.48x at seq 2048 and 2.11x at 3072 on device (losing 2.01x at 512 and 1.79x at 4096). The fused RMSNorm+MLP beats torch 1.76x at H=1024/I=3072 in wall clock (losing 1.45x at H=4096/I=4096). Both win for the reason Finding #25's criterion predicted. Both are still single-core, which is NOT the configuration either kernel was built for, and the fused MLP's win is at a shape nobody deploys because the I<=4096 boundary is unchanged on the new compiler.",
+      "priority": "partly closed",
+      "status": "see the attn-sweep and fused-rmsnorm-mlp-native measurements; Findings #29 and #33"
+    },
+    {
+      "item": "Can kernelize() express a multi-core SPMD launch? TOP OPEN ITEM.",
+      "detail": "Now the single gating question for the whole performance story. Both winning candidates (flash attention, fused RMSNorm+MLP) were designed for a multi-core SPMD grid and are being run single-core because that is what a per-layer forward swap gives them. This sits ABOVE weight layout (#17), the I<=4096 compile boundary (#18) and the dispatch caches (#24, #28) — all of those are downstream of it. If the answer is no, per-layer swapping tops out near parity for small ops and at toy shapes for fused ones, and the honest recommendation narrows to 'the Kernel Hub is a cheap correctness/compatibility mechanism for Neuron, not a performance story'.",
+      "priority": "high"
+    },
+    {
+      "item": "Device-time profiling on the native stack.",
+      "detail": "neuron-explorer on a NEFF+NTFF pair is what separates dispatch cost from device work, and that separation is what the strongest findings rest on. It is not wired up for native. Consequence: the fused RMSNorm+MLP 1.76x cannot be attributed and every native MFU figure stays provisional.",
+      "priority": "high"
+    },
+    {
+      "item": "Why is native eager 3-4x slower than the torch-xla graph path?",
+      "detail": "The largest single number in the cross-stack table (baseline 189.97 ms native vs 43.94 ms xla at seq 512) and the first thing any reader will ask. Leading explanation is that native dispatches eagerly with no whole-forward graph, so it forgoes the fusion the XLA path gets — which is consistent with Finding #25 and with the kernels looking relatively better on native. Not verified. Framework question, outside this PoC's scope, but it conditions every relative number here.",
       "priority": "medium"
+    },
+    {
+      "item": "What is Finding #24's dispatch fix worth on native?",
+      "detail": "The _detect_target subprocess is still forked on native, and the fix was applied to BOTH native MFU runs, so its native contribution is unmeasured. Cheap to get: re-run measure_mfu without --fix-target-detection.",
+      "priority": "low"
     }
   ]
 }

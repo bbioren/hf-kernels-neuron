@@ -2,7 +2,7 @@
 
 **GENERATED FILE — do not edit.** Source of truth is [`measurements.json`](measurements.json); regenerate with `python scripts/render_results.py`.
 
-Rendered 2026-08-05 18:28 UTC from commit `7af0eb5`.
+Rendered 2026-08-05 20:53 UTC from commit `2da744c`.
 
 ## Read this before quoting any number
 
@@ -12,9 +12,9 @@ The trn2 instance used for the ORIGINAL measurements expired on 2026-08-02. Ever
 
 Every number below carries a `status`:
 
-- **`transcribed`** (3 of 23) — Number is recorded here from the run's stdout, which was captured in the git commit message at the listed SHA. The raw artifact (JSON/log/NEFF) is NOT in the repo — see _artifact_loss.
-- **`reproduced`** (15 of 23) — Original number is transcribed AND an independent re-run on the replacement instance is committed under results/raw/. The committed artifact carries the re-run's value, which is recorded alongside. See _reproduction for the agreement.
-- **`in_repo`** (5 of 23) — Raw artifact is committed under results/raw/ and is the source of the number quoted here.
+- **`transcribed`** (3 of 27) — Number is recorded here from the run's stdout, which was captured in the git commit message at the listed SHA. The raw artifact (JSON/log/NEFF) is NOT in the repo — see _artifact_loss.
+- **`reproduced`** (15 of 27) — Original number is transcribed AND an independent re-run on the replacement instance is committed under results/raw/. The committed artifact carries the re-run's value, which is recorded alongside. See _reproduction for the agreement.
+- **`in_repo`** (9 of 27) — Raw artifact is committed under results/raw/ and is the source of the number quoted here.
 
 ### The whole set was re-run on a second instance
 
@@ -41,6 +41,14 @@ The original host expired before any raw artifact was committed. Re-running ever
 The re-run is a reproduction, not a recovery. Where a measurement's committed artifact and its transcribed number differ, the artifact is the re-run and the transcribed number is the original; both are stated and neither is silently replaced.
 
 Versions were checked before trusting any of it: Matched the recorded environment exactly before trusting any re-run: torch 2.9.1+cu128, torch_xla 2.9.0, neuronx-cc 2.26.6360.0+6f180f47 (DLAMI); kernels 0.15.2 and transformers 5.15.0.dev0 installed from requirements.txt, which pins transformers to commit bb3ffb97 rather than tracking main. nki reports 0.5.0+28631259367.ga768afa6 where the original run recorded plain 0.5.0 — same version, build suffix now captured.
+
+### Read this before quoting any number: there are TWO stacks
+
+MEASUREMENTS IN THIS FILE COME FROM TWO DIFFERENT STACKS AND ARE NOT INTERCHANGEABLE. Every measurement without an explicit "stack" field was taken on torch-xla. Entries with "stack": "native" were taken on the Native PyTorch drop. The claims in _about.compiler_flags and the versions below describe the torch-xla stack only.
+
+The sign of the headline differs between them. On torch-xla the kernels are 1.62x SLOWER than baseline at seq 512; on native they are 1.97x FASTER. That is not an improvement — the native baseline is 4.32x slower than the XLA one, so the ratio moved because the denominator got worse. Native kernelized MFU (2.20%) is BELOW xla kernelized MFU (2.98%). See the mfu-native measurements and Finding #32. Never quote a native speedup without the native baseline beside it.
+
+The dispatch fix for Finding #24 (_detect_target lru_cache) still applies on native — the subprocess is still forked there. Finding #28 (the torch_xla Op-registry cache) does NOT port and is meaningless on native, because torch_xla is not importable. Whether native has an equivalent per-call lowering cost is UNMEASURED and should not be assumed either way.
 
 ### The number to lead with
 
@@ -214,6 +222,30 @@ Weight-layout cost (Finding #17) quantified for the first time: the on-device tr
 
 Compile boundary, 10 data points (4 pass): **passes iff intermediate_size <= 4096; boundary is between 4096 and 4224; not a ratio effect**. REFRAMED by Finding #26: this is a design boundary, not a bug. A floordiv by zero on a shard-count calculation is what happens with no SPMD shard grid. Originally filed as an nki-library bug to fix. The reframe matters for the recommendation: 'the library has a bug at I>4096' invites a bug report, whereas 'the library assumes a multi-core shard grid we are not giving it' invites the correct question, which is whether per-layer swapping is the right integration model for these kernels at all.
 
+## The Native PyTorch stack (Findings #31, #32, #33)
+
+**Both integration gates are gone.** `model.device.type` is `neuron`, `kernels._backend()` returns `Neuron()`, and `validate_dependencies(["nki"])` passes. Stock `use_kernels=True` swaps all three kernels with **no patching** — 9 RMSNorm, 2 RoPE, 2 SiLU, dispatch 9 / 2 / 2, fallback 0 on all three, logits `cos_sim 1.000001`. The probe asserts our shim is absent before it runs, so this cannot be an artifact of it.
+
+All three kernels compile and run under the native stack's NKI `0.6.0b1+28066168719.gc659ca3a`: RMSNorm `0.999983`, SiLU `0.99998`, RoPE q `1.000002` / k `1.000001`, fell back: none.
+
+**And the sign of the performance headline flips, which is NOT a win:**
+
+| seq | baseline ms | kernelized ms | verdict | baseline MFU | kernelized MFU |
+|---|---|---|---|---|---|
+| 512 | 189.97 | 96.46 | *1.970x faster* | 1.12% | 2.2% |
+| 2048 | 340.74 | 251.86 | *1.353x faster* | 3.16% | 4.28% |
+
+Against torch-xla: baseline is **4.32x slower (189.97 vs 43.94)** and kernelized is 1.35x slower (96.46 vs 71.32) at seq 512. Read DOWN the columns, not across the rows. Everything is slower on native and the baseline is much slower, which is what flipped the ratio. Native kernelized MFU 2.20% is BELOW xla kernelized MFU 2.98%. Nothing got faster.
+
+**Samir's fused RMSNorm+MLP is a second winning candidate**, and a second shape window:
+
+| shape | NKI ms/block | torch ms/block | verdict | cos_sim |
+|---|---|---|---|---|
+| H=1024 I=3072 (Qwen3-0.6B) | 0.6095 | 1.0728 | **NKI 1.76x FASTER** | 0.999973 |
+| H=4096 I=4096 (largest passing single-core) | 2.5377 | 1.7459 | **NKI 1.45x slower** | 0.999967 |
+
+Wall clock, so provisional — see the note in `measurements.json`. And the practical blocker is unchanged: Finding #18's single-core compile boundary re-tested on the new compiler gives 1024/3072 PASS, 1024/4096 PASS, 1024/5120 FAIL, 4096/4096 PASS, 4096/12288 FAIL, verdict **UNCHANGED — still exactly I<=4096, same 'floordiv does not allow division by zero' in the CTE tile arithmetic**. Two compiler generations agreeing on the exact threshold is strong evidence this is a DESIGN boundary (the kernel requires an SPMD launch grid) rather than an arithmetic bug, which supports Finding #26's reading over Finding #18's original filing. It also means the 1.76x win is at a shape nobody deploys: Qwen3-8B is I=12288, Llama-3-8B and Mistral-7B are 14336.
+
 ## Correctness
 
 | suite | result | seconds | cases |
@@ -233,7 +265,11 @@ Upstream coverage: 115 RMSNorm registrations, 95 RoPE model files, 1 SiLU decora
 - **[closed]** CLOSED — is any of this a compiler-flag artifact? — Was the top open item, on the theory that a bad compiler default could be the entire slowdown. Closed in both halves. Dispatch: NKI wall time is invariant across {unset, --target trn2, +--lnc 1, +--lnc 2, +-O2} at 1.02x spread. Device: NKI device time is invariant at 1.05x spread and NKI marginal HBM traffic is 6.29 MB/call — exactly the unfused floor — under every setting, so there is no headroom for a flag to find. Both probes run as harness stages, so a future stack change re-tests it automatically rather than requiring someone to remember.
 - **[closed]** CLOSED — is the per-call create_computation rebuild cacheable? — Yes. It was 91% of what remained after Finding #24, and it is the same bug as #24: torch_xla's Op class already memoises the built computation, and NKI applies @xla_hlo_call inside TorchXlaKernel.__call__ so a fresh Op with an empty memo is created per call. Registering once per compile-cache key gives 0.528 -> 0.183 ms/call with bit-identical output, and takes the model-level slowdown from 3.31x to 1.62x at seq 512 and 1.37x at seq 2048. See the op-registry-cache and mfu-both-fixes measurements. What remains open is the UPSTREAM change: this is verified as a runtime monkeypatch, not shipped, and it needs an owner in the same way the #24 fix does.
 - **[medium]** Can a NKI custom call participate in compiler fusion? — Decides whether the last ~18% after the dispatch fix is recoverable.
-- **[medium]** Does a kernel spanning a fused region beat the compiler on that region? — The fused MLP answers this for single-core (no, by ~3x). Unmeasured multi-core with an SPMD grid, which is the configuration the kernel was built for.
+- **[partly closed]** PARTLY ANSWERED — does a kernel spanning a fused region beat the compiler on that region? — Yes, twice, and both are shape WINDOWS rather than thresholds. nkilib flash attention beats eager attention 1.48x at seq 2048 and 2.11x at 3072 on device (losing 2.01x at 512 and 1.79x at 4096). The fused RMSNorm+MLP beats torch 1.76x at H=1024/I=3072 in wall clock (losing 1.45x at H=4096/I=4096). Both win for the reason Finding #25's criterion predicted. Both are still single-core, which is NOT the configuration either kernel was built for, and the fused MLP's win is at a shape nobody deploys because the I<=4096 boundary is unchanged on the new compiler.
+- **[high]** Can kernelize() express a multi-core SPMD launch? TOP OPEN ITEM. — Now the single gating question for the whole performance story. Both winning candidates (flash attention, fused RMSNorm+MLP) were designed for a multi-core SPMD grid and are being run single-core because that is what a per-layer forward swap gives them. This sits ABOVE weight layout (#17), the I<=4096 compile boundary (#18) and the dispatch caches (#24, #28) — all of those are downstream of it. If the answer is no, per-layer swapping tops out near parity for small ops and at toy shapes for fused ones, and the honest recommendation narrows to 'the Kernel Hub is a cheap correctness/compatibility mechanism for Neuron, not a performance story'.
+- **[high]** Device-time profiling on the native stack. — neuron-explorer on a NEFF+NTFF pair is what separates dispatch cost from device work, and that separation is what the strongest findings rest on. It is not wired up for native. Consequence: the fused RMSNorm+MLP 1.76x cannot be attributed and every native MFU figure stays provisional.
+- **[medium]** Why is native eager 3-4x slower than the torch-xla graph path? — The largest single number in the cross-stack table (baseline 189.97 ms native vs 43.94 ms xla at seq 512) and the first thing any reader will ask. Leading explanation is that native dispatches eagerly with no whole-forward graph, so it forgoes the fusion the XLA path gets — which is consistent with Finding #25 and with the kernels looking relatively better on native. Not verified. Framework question, outside this PoC's scope, but it conditions every relative number here.
+- **[low]** What is Finding #24's dispatch fix worth on native? — The _detect_target subprocess is still forked on native, and the fix was applied to BOTH native MFU runs, so its native contribution is unmeasured. Cheap to get: re-run measure_mfu without --fix-target-detection.
 
 ## Environment
 
@@ -243,6 +279,7 @@ trn2.3xlarge, 1 Neuron device, 4 NeuronCores, LNC2 (2 logical cores), single log
 
 | package | version |
 |---|---|
+| `_see` | _stacks above — this key is retained for the torch-xla measurements, which are the majority of this file |
 | `kernels` | 0.15.2 |
 | `transformers` | 5.15.0.dev0 (commit bb3ffb97) |
 | `torch` | 2.9.1+cu128 |

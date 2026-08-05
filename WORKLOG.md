@@ -1,11 +1,30 @@
-# Week 3 Worklog
+# Worklog
 
-## SESSION SUMMARY
+## CURRENT STATE — read this first
 
-**Read this first.** Branch `week-3`, **nothing pushed**. All five test suites pass on trn2.
-Weeks 3, 4, 5 and 6 are all done. Final deliverable: **`deliverables/poc-document.md`**.
+**Branch `main`.** Everything is committed and pushed; `week-3` was merged in and work now goes
+directly to `main`. All five test suites pass on trn2. Weeks 3–6 are done, plus two later sessions
+that changed the headline twice.
 
-### The result that matters
+**Live deliverable: [`deliverables/poc-document.md`](deliverables/poc-document.md)**, maintained as a
+living document rather than a report — it carries the current recommendation, the current numbers,
+and a "where we are struggling" section. [`docs/poc-findings.md`](docs/poc-findings.md) is the full
+findings log (33 findings).
+
+**Two things below are superseded and left in place deliberately, because the corrections are the
+useful part.** Sessions 1–7 describe the torch-xla stack. Two later results changed the conclusions:
+
+- **A speedup exists** (session 8). `nkilib` flash attention beats the compiler 1.48x at seq 2048 and
+  2.11x at 3072 on device. The project had concluded no speedup was available anywhere.
+- **Both integration gates were our own mistake** (session 9). On the Native PyTorch drop,
+  `model.device.type` is `"neuron"` and `_backend()` returns `Neuron()`, so stock `use_kernels=True`
+  works unpatched. The headline upstream ask — the `xla`→`neuron` device-resolution patch — is
+  withdrawn. One ask remains: the `"neuron"` mapping entries.
+- **And every performance number in sessions 1–7 is torch-xla-scoped.** On native the sign of the
+  headline flips (1.62x slower → 1.97x "faster") *because the baseline is 4.32x worse*. See
+  Finding #32 before quoting anything.
+
+### The result that matters (sessions 1–7, torch-xla)
 
 **Every `@nki.jit` invocation was forking a subprocess. Fixing it is one decorator and worth 102x
 per call.**
@@ -1426,3 +1445,233 @@ the longer the chain, the more fusion torch gets, and the worse NKI looks by com
 the N=28 figure is the worst case and the N=1 figure is the fairer single-op comparison — though N=1 is
 dominated by the custom call's 12.58 MB of fixed NEFF setup traffic, which is why the marginal-traffic
 regression, not either ratio, is the right instrument.
+
+---
+
+## SESSION 8 — B12 answered, and the first speedup
+
+Two results, and the second retires the project's central negative claim.
+
+### T36 — The residual was a second bypassed cache (Finding #28)
+
+B12 had been the top technical ask since session 5: is the ~0.53 ms/call `create_computation` rebuild
+cacheable? It had been deliberately left alone because cProfile put it inside `torch_xla`'s
+op-registry path and a wrong guess there could be silently incorrect rather than raise.
+
+Reading the source answered it before any measurement. `torch_xla/core/xla_op_registry.py` defines
+`Op`, which holds `self._computations = dict()` and whose docstring asks callers to register ops
+globally "in order to amortize the lowering cost". `nki/framework/_torch_xla.py::TorchXlaKernel.__call__`
+applies `@xla_hlo_call` **inside** `__call__`, so every invocation constructs a fresh `Op` with a
+fresh empty memo. The cache is not cold by accident; it is newly created, and therefore always empty.
+
+Beside Finding #24 the pair is striking — both are *a cache exists and the code path defeats it*:
+
+| | the cache | how it is defeated |
+|---|---|---|
+| #24 | `func._nki_compile_cache` | target resolution runs while building the cache *key* |
+| #28 | `Op._computations` | the memo lives on an object recreated per call |
+
+Verified in #24's shape: 0.5278 → 0.1828 ms/call (2.89x), 86 hits against 1 miss, cos_sim
+**bit-identical to 16 digits**, baseline re-run last as a control. The patch asserts five structural
+landmarks in the installed source and prints its hash, refusing to patch an NKI it does not recognise.
+
+Model level: **52.25 → 0.605 → 0.162 ms/call, 322.5x total.** Slowdown 3.31x → **1.62x** at seq 512
+and 2.06x → **1.37x** at seq 2048. The ~1.18x projection from session 5 assumed dispatch went to zero;
+these are measured and sit between it and the old 3.31x, which is what the projection predicted.
+
+### T37 — A SPEEDUP EXISTS (Finding #29)
+
+Findings #25/#26 had produced a criterion: a kernel wins when it replaces a region the compiler would
+*not* otherwise fuse well **and** there is real arithmetic to restructure. RMSNorm/RoPE/SiLU fail both
+halves. The fused MLP passes the second and loses single-core. The one candidate the criterion
+actually favours had never been tested.
+
+Flash attention is an algorithmic restructuring, not a fusion — it never materialises the
+`[heads, S, S]` score matrix. A compiler fuses elementwise chains; it does not re-derive the
+algorithm. And `attention_cte` explicitly supports running without an SPMD grid.
+
+It worked **first try** against the HF-native layout (`tp_q=True, tp_k=True, tp_out=False`), GQA
+expressed natively with no K/V replication, `cos_sim 1.000010`. The first nkilib kernel that dropped
+into the Kernel Hub's calling convention without a fight.
+
+| seq | NKI ms/layer | torch ms/layer | verdict |
+|---|---|---|---|
+| 512 | 0.2463 | 0.1225 | 2.01x slower |
+| 1024 | 0.4939 | 0.4269 | 1.16x slower |
+| **2048** | **1.1438** | 1.6902 | **1.48x FASTER** |
+| **3072** | **1.8484** | 3.9062 | **2.11x FASTER** |
+| 4096 | 2.8295 | 1.5784 | 1.79x slower |
+
+A **window**, not a threshold, and reproduced across two runs to four significant figures.
+
+**My first explanation of the seq-4096 reversal was backwards, and the traffic column caught it.** I
+blamed single-core SBUF pressure in the NKI kernel — plausible, matched Finding #26, and it blamed the
+kernel. But torch's traffic goes 279.86 → 748.70 → **395.05** MB as seq goes 2048 → 3072 → 4096: it
+*drops 47%* while the score matrix it is supposedly materialising *grows* from 302 to 537 MB. At 4096
+it moves less than one copy of the score matrix, which is only possible if it stopped materialising
+it. NKI is exactly on its own linear trend at every point. **Nothing degraded on the NKI side; the
+compiler got better.** A one-number benchmark would have shipped the wrong story confidently.
+
+## DECISIONS (session 8)
+
+**D39. Verified `kernels`/`transformers` were unmodified before citing them.** Was about to send
+Samir file:line citations on the strength of a docstring saying the project patches in-process only.
+Checked pip RECORD SHA256s instead (`scripts/verify_kernels_pristine.py`): byte-identical to the
+published wheels. So the Neuron plumbing being cited really is HF's code, not ours. *Rejected:*
+trusting our own comment.
+
+**D40. Corrected the seq-4096 explanation rather than shipping the tidy one.** See above. *Rejected:*
+the SBUF story, which fit an existing finding and blamed the kernel.
+
+---
+
+## SESSION 9 — Native PyTorch, and both gates evaporate
+
+Samir's reply to the week 3–6 summary was, in substance, *you are on the wrong stack*. He was right
+about everything except one instruction.
+
+### T38 — Fetched and built the native stack
+
+`s3://huggingface-aws/pytorch-native/drop_jun_25/`. The bucket is in a different region than the CLI
+default, and `presign` bakes the endpoint in, so it needs the region passed explicitly. The instance
+role has no S3 access to it, so credentials came from the laptop via presigned URLs — which keeps
+them off the instance. Python 3.12 venv, 926 MB of wheels.
+
+Result: torch 2.11.0, torch-neuronx 0.1.0, NKI **0.6.0b1**, neuronx-cc 2.0.266551.0a0, torch-mlir.
+`torch_xla` is not importable at all.
+
+### T39 — A four-minute hang that was `PATH`, and a near-miss on the environment
+
+First two runs hung silently. Process state showed a 29-thread parent on `futex_do_wait` with a
+thread in `waitpid`, and a single-threaded child also on `futex_do_wait`, neither using CPU. That is
+a textbook fork-from-a-multithreaded-process deadlock and every observation fit.
+
+**It came with an expensive remedy.** The drop ships driver/runtime debs at build numbers *newer* than
+the host's, and Samir's instruction was to install them. "Native wheels on a mismatched production
+runtime hangs on first execution" is completely credible. Installing them replaces the host Neuron
+driver and would very likely have broken the XLA venv holding every measurement in this project.
+
+`strace -f -e trace=clone,execve` took a minute:
+
+```
+execve("/usr/local/sbin/neuronx-cc", ["neuronx-cc", "compile", "module.mlir", ...]) = -1 ENOENT
+execve("/usr/local/bin/neuronx-cc",  ...) = -1 ENOENT      ... and 5 more, the whole PATH
+```
+
+On the first op needing a compile the runtime forks and `execve`s **`neuronx-cc` by bare name**. It
+lives in `native_venv/bin/`, and running `/home/ubuntu/native_venv/bin/python script.py` — an absolute
+path — does **not** put the venv's `bin` on `PATH`. Every entry missed, and the child then hung rather
+than reporting it. Activating the venv fixed it: the same matmul completes in 1.21 s.
+
+So the debs were never needed. Finding #30, and `scripts/run_native.sh` now activates, asserts
+`neuronx-cc` resolves, prints the compiler version, and refuses to run otherwise.
+
+### T40 — Both gates gone (Finding #31)
+
+| | torch-xla | native |
+|---|---|---|
+| `model.device.type` | `"xla"` | **`"neuron"`** |
+| `kernels._backend()` | `CUDA(12.8)` | **`Neuron()`** |
+| `hasattr(torch, "neuron")` | False | **True** |
+| declaring `["nki"]` | rejected | **accepted** |
+
+Decisive test: stock `hub_kernels.kernelize()` with the shim asserted absent. 9 RMSNorm / 2 RoPE /
+2 SiLU swapped, dispatch `nki=9/2/2` with zero fallbacks, logits `cos_sim 1.000001`. All three kernels
+also compile and run under NKI 0.6.0b1.
+
+**Proposed Change 1 is withdrawn**, along with Change 1b and the third site in
+`kernel_config.infer_device`. **Change 2 — the mapping entries — survives and is the only upstream
+blocker.** And the GitHub ticket Samir asked for should not be filed: it would send the kernels team
+after a non-bug.
+
+**A false negative on the decisive test, worth recording.** The first run printed
+`RoPE swapped: 0 → Gate 2 NOT cleared` while the dispatch counter two lines below read `nki=2`. The
+pass criterion was wired to structural inspection, which cannot see function kernels — stock
+`kernelize()` `delattr`s the submodule alias in its `finally` block, and the swap mutates
+`fn.forward`. Finding #8 established years-of-this-project ago that execution counters are
+authoritative; having the principle written down did not put it in the pass condition. The obvious
+repair (match qualnames) would also have failed, since the post-swap qualname is *identical*.
+
+### T41 — Native perf, and the sign of the headline flips (Finding #32)
+
+| seq | stack | baseline | kernelized | verdict |
+|---|---|---|---|---|
+| 512 | xla | 43.94 ms | 71.32 ms | 1.62x slower |
+| 512 | native | **189.97 ms** | **96.46 ms** | *1.97x faster* |
+| 2048 | xla | 117.78 ms | 161.04 ms | 1.37x slower |
+| 2048 | native | **340.74 ms** | **251.86 ms** | *1.35x faster* |
+
+The native baseline is **4.32x slower** than the XLA one. Native kernelized MFU (2.20%) is *below*
+XLA kernelized (2.98%). Nothing got faster; the denominator got worse. This is Finding #27's `--lnc 1`
+trap at model scale, and "the kernels are 1.97x faster on Native PyTorch" is a true sentence that
+would be the most misleading thing this project could emit.
+
+It does give Finding #25 support from the opposite direction: native is eager with no whole-forward
+graph, so there is much less fusion to lose, so the barrier costs less. **The fusion penalty only
+exists where there is fusion.**
+
+### T42 — Samir's fused RMSNorm+MLP (Finding #33)
+
+He was right that we had missed it: `normalization_type=NormType.RMS_NORM` with
+`quantization_type=NONE`. Finding #26 had generalised "nkilib's RMSNorm always fuses quantisation" —
+true of `core/rmsnorm/` — into "no non-quantising path exists". Wrong.
+
+| shape | NKI fused | torch | verdict | cos_sim |
+|---|---|---|---|---|
+| H=1024 I=3072 | **0.6095 ms/block** | 1.0728 | **1.76x FASTER** | 0.999973 |
+| H=4096 I=4096 | 2.5377 | 1.7459 | 1.45x slower | 0.999967 |
+
+Second winning candidate, second shape window. Wall clock, so it carries the degraded-baseline caveat.
+
+Two undocumented interface mismatches, both from that one keyword: the norm weight must be **2D**
+(HF's is 1D `[H]`), and the hidden tensor must be **3D** where `NO_NORM` accepted 2D — the required
+input *rank* depends on a keyword argument. Both fail at compile time, not validation.
+
+**And Finding #18's `I > 4096` boundary is unchanged** on a compiler two generations newer. Identical
+threshold, same `floordiv` by zero. Two generations agreeing is much stronger evidence for #26's
+reading of it as a design boundary (no SPMD grid) than the original single-compiler report. So the
+1.76x is at a shape nobody deploys — Qwen3-8B is I=12288.
+
+## DECISIONS (session 9)
+
+**D41. Did NOT install the deb packages, against an explicit instruction.** Flagged the risk, then
+diagnosed before executing. The instruction addressed a problem that did not exist, and following it
+immediately would have replaced the host driver to fix a `PATH` bug. *Rejected:* doing what the person
+helping you says, immediately, because deferring feels wrong.
+
+**D42. Do not file the GitHub ticket Samir asked for.** Both gates are XLA-path artifacts. *Rejected:*
+filing it — it would send him chasing a non-bug in his own library.
+
+**D43. Refused `--fix-op-registry` on native rather than silently skipping it.** Finding #28 patches
+`torch_xla`, which is not importable there, so the fix is not merely unapplied — it is meaningless.
+*Rejected:* letting a run be labelled as carrying a fix that cannot exist on that stack.
+
+**D44. Reported the native result as the cross-stack table, not as a speedup.** *Rejected:* the
+flattering true sentence. Sticking point #18 exists because this habit already cost reviewer trust
+once.
+
+**D45. Rewrote `poc-document.md` as a living document.** It had gone three findings stale and its
+recommendation argued the opposite of the current conclusion. It now leads with status, carries a
+"where we are struggling" section, and defers detail to `poc-findings.md` so there is one source of
+truth per fact (27 KB, down from 49 KB). *Rejected:* patching the stale recommendation in place.
+
+## BLOCKED — NEEDS INPUT (current)
+
+**B17. Repo home: `kernels-community/` vs `aws-neuron/`.** Now a technical question, not branding:
+`kernels` has `ALLOW_ALL_KERNELS = False`, gating repos outside `kernels-community` as untrusted. Our
+own org means every user trips a trust gate, defeating the point of `use_kernels=True` just working.
+Lean: `kernels-community/`. Blocks the mapping-entry PR, which names repo IDs.
+
+**B18. Can `kernelize()` express a multi-core SPMD launch?** Now the single gating question for the
+whole performance story. Both winning candidates were built for a multi-core grid and are handicapped
+single-core. Sits above weight layout (#17), the compile boundary (#18) and the dispatch fixes.
+
+**B19. Device-time profiling on native.** Without it the fused-MLP 1.76x cannot be attributed, and any
+native MFU number stays provisional.
+
+**B20. Why is native eager 3–4x slower than the XLA graph path?** The largest single number in the
+cross-stack table, and the first thing any reader will ask. Framework question, outside this PoC.
+
+Still open: B10 (who owns `target.py`, do I write the CR — still applies on native), B14 (can a NKI
+custom call participate in fusion), B3 (is inference-only acceptable for beta), B4 (Hub upload, gated
+on B17).
