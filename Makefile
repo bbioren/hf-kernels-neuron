@@ -148,10 +148,13 @@ sync: ## rsync the working tree to trn2 for testing
 # HuggingFace Kernels Project Quip doc. Only content BELOW that heading is touched — the project
 # plan above it is never modified. Dry run unless APPLY=1.
 # QUIP_API_TOKEN must be in the environment (https://quip-amazon.com/dev/token); never commit it.
+# --format html is deliberate: Quip's markdown importer hardcodes 6em per table column
+# regardless of content, which makes every table unreadably narrow. Converting to HTML lets us
+# set widths from the actual content. Needs `pip install --user markdown`.
 QUIP_THREAD ?= DUX9AAEWHvn
 quip-status: ## Sync the progress-tracking section into Quip (add APPLY=1 to actually write)
 	python3 scripts/sync_quip.py --thread $(QUIP_THREAD) \
-		--file deliverables/progress-tracking.md \
+		--file deliverables/progress-tracking.md --format html \
 		--mode section --after-heading "Progress Tracking" $(if $(APPLY),--apply,)
 
 lint: ## Byte-compile all kernels, scripts, and tests

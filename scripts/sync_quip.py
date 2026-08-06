@@ -48,6 +48,7 @@ from __future__ import annotations  # so `str | None` works on Python < 3.10
 import argparse
 import json
 import os
+import re
 import sys
 from html.parser import HTMLParser
 import urllib.error
@@ -229,6 +230,109 @@ def edit(base_url, token, thread_id, *, content=None, location=LOC_APPEND,
     return _request(base_url, "threads/edit-document", token, data=data)
 
 
+# Quip's own markdown importer hardcodes a narrow fixed width per table column --
+# style='width: 6em' on every <th> and width: 12em on the <table> -- regardless of what the cells
+# contain. A column holding "status" and a column holding a 200-character sentence both get 6em,
+# which is why imported tables come out unreadably skinny. There is no markdown-side fix, because
+# the width is not derived from the content at all.
+#
+# So for tables we convert to HTML ourselves and set the widths explicitly. Quip emits
+# style='width: Nem' in its own output, which is the reason to expect it to honour it on input.
+TABLE_BUDGET_EM = 46.0   # roughly the usable width of a Quip document body
+MIN_COL_EM = 4.0
+EM_PER_CHAR = 0.5
+# Allocation is proportional to sqrt(desired width), not to desired width itself. Straight
+# proportionality lets one very long column starve the others: in the open-questions table a
+# 120-character "why it matters" column pushed "Team" down to 3.4em, too narrow for the word
+# "frameworks". Dampening keeps the ordering (wide content still gets wide columns) while
+# stopping the extremes from crowding everything else out.
+WIDTH_DAMPEN = 0.5
+
+
+def _cell_texts(table_html: str) -> list[list[str]]:
+    """Rows of cell text from a markdown-generated table. Regex is defensible here because the
+    input is the `markdown` library's own predictable output, not arbitrary HTML."""
+    rows = []
+    for row in re.findall(r"<tr>(.*?)</tr>", table_html, re.S):
+        cells = re.findall(r"<t[hd][^>]*>(.*?)</t[hd]>", row, re.S)
+        rows.append([re.sub(r"<[^>]+>", "", c).strip() for c in cells])
+    return rows
+
+
+def _column_widths(rows: list[list[str]]) -> list[float]:
+    """Allocate TABLE_BUDGET_EM across columns in proportion to the longest cell in each.
+
+    Proportional rather than absolute: a table whose columns all want 30em cannot have them, so
+    the budget is divided by relative need. Columns are floored at MIN_COL_EM so a narrow column
+    stays clickable, and the result is rescaled so the total still matches the budget.
+    """
+    ncols = max((len(r) for r in rows), default=0)
+    if not ncols:
+        return []
+    # A fixed budget divided eight ways leaves every column too narrow to hold a word like
+    # "Consulted", so wide tables get a bigger budget. Capped, because past a point a wide table
+    # just becomes horizontal scrolling, which reads worse than wrapping.
+    budget = min(TABLE_BUDGET_EM + max(0, ncols - 4) * 5.0, 76.0)
+    want = []
+    for c in range(ncols):
+        longest = max((len(r[c]) for r in rows if c < len(r)), default=1)
+        want.append(max(MIN_COL_EM, min(longest * EM_PER_CHAR, budget)))
+    damped = [w ** WIDTH_DAMPEN for w in want]
+    total = sum(damped)
+    if total <= 0:
+        return [budget / ncols] * ncols
+    scaled = [max(MIN_COL_EM, w * budget / total) for w in damped]
+    # Rescale once more, since clamping to the minimum can push the sum back over budget.
+    s = sum(scaled)
+    return [round(w * budget / s, 2) for w in scaled]
+
+
+def _widen_tables(html: str) -> tuple[str, int]:
+    """Inject explicit per-column widths into every table. Returns (html, tables_widened)."""
+    count = 0
+
+    def fix(match):
+        nonlocal count
+        table = match.group(0)
+        widths = _column_widths(_cell_texts(table))
+        if not widths:
+            return table
+        count += 1
+
+        col = iter(range(len(widths)))
+
+        def add_width(cell_match):
+            i = next(col, None)
+            if i is None or i >= len(widths):
+                return cell_match.group(0)
+            tag, attrs = cell_match.group(1), cell_match.group(2)
+            return f"<{tag}{attrs} style=\"width: {widths[i]}em\">"
+
+        # Only the header row carries widths; Quip applies them down the column.
+        head = re.search(r"<thead>.*?</thead>", table, re.S)
+        if head:
+            fixed_head = re.sub(r"<(th)((?:\s[^>]*)?)>", add_width, head.group(0))
+            table = table[:head.start()] + fixed_head + table[head.end():]
+        total = round(sum(widths), 2)
+        return table.replace("<table>", f'<table style="width: {total}em">', 1)
+
+    return re.sub(r"<table>.*?</table>", fix, html, flags=re.S), count
+
+
+def md_to_html(md: str) -> tuple[str, int]:
+    """Markdown -> HTML with table widths set from content. Returns (html, tables_widened)."""
+    try:
+        import markdown as _md
+    except ImportError:
+        raise QuipError(
+            "--format html needs the `markdown` package:\n"
+            "    python3 -m pip install --user markdown\n"
+            "  Or use --format markdown, which needs no dependency but renders tables narrow."
+        )
+    html = _md.markdown(md, extensions=["tables", "fenced_code", "sane_lists"])
+    return _widen_tables(html)
+
+
 def strip_leading_h1(md: str) -> tuple[str, str | None]:
     """Split off a leading `# Title` line.
 
@@ -289,6 +393,13 @@ def main():
         print(f"error: {args.file} has no content to sync", file=sys.stderr)
         return 2
 
+    # --format html means "convert, then send HTML". Previously it passed raw markdown through
+    # with format=html, which would have rendered as literal pipe characters — a latent bug,
+    # since nothing exercised that path.
+    widened = 0
+    if args.fmt == "html":
+        body, widened = md_to_html(body)
+
     if not args.create and not args.thread:
         print("error: pass --thread <ID> to update a doc, or --create to make a new one.",
               file=sys.stderr)
@@ -297,6 +408,9 @@ def main():
     print(f"file          {args.file}  ({len(body)} chars, {len(body.splitlines())} lines)")
     if title:
         print(f"stripped H1   {title!r}  (used as the Quip doc title)")
+    if args.fmt == "html":
+        print(f"converted     markdown -> HTML, {widened} table(s) given explicit column widths "
+              f"(budget {TABLE_BUDGET_EM:g}em)")
 
     if args.create:
         print(f"mode          CREATE a new document")
