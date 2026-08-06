@@ -144,6 +144,12 @@ registration: ## Print the neuron kernel mapping + proposed upstream diff
 sync: ## rsync the working tree to trn2 for testing
 	./scripts/sync_to_trn2.sh
 
+# Set QUIP_THREAD to the token in the doc URL, e.g. quip-amazon.com/AbCdEfGhIjKl/... -> AbCdEfGhIjKl
+# Dry run by default. QUIP_API_TOKEN must be in the environment; never commit it.
+quip-status: ## Preview syncing the status doc to Quip (add APPLY=1 to actually write)
+	python3 scripts/sync_quip.py --thread $(QUIP_THREAD) \
+		--file deliverables/status-and-questions.md $(if $(APPLY),--apply,)
+
 lint: ## Byte-compile all kernels, scripts, and tests
 	$(PYTHON) -m compileall -q kernels scripts tests
 
