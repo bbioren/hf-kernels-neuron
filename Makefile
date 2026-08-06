@@ -148,13 +148,16 @@ sync: ## rsync the working tree to trn2 for testing
 # HuggingFace Kernels Project Quip doc. Only content BELOW that heading is touched — the project
 # plan above it is never modified. Dry run unless APPLY=1.
 # QUIP_API_TOKEN must be in the environment (https://quip-amazon.com/dev/token); never commit it.
-# --format html is deliberate: Quip's markdown importer hardcodes 6em per table column
-# regardless of content, which makes every table unreadably narrow. Converting to HTML lets us
-# set widths from the actual content. Needs `pip install --user markdown`.
+# format=markdown, deliberately. HTML was tried in order to set table column widths, because
+# Quip hardcodes 6em per column (~11 characters) regardless of content. Quip ignores width on
+# import through every encoding the API offers -- th style, th width attribute, colgroup/col,
+# percentages, and a post-import REPLACE_SECTION on the header cell, which errors. So HTML buys
+# nothing here and costs a `markdown` dependency. The fix lives in the document instead: prose
+# goes in lists, and tables are kept only where cells are short enough to read at 6em.
 QUIP_THREAD ?= DUX9AAEWHvn
 quip-status: ## Sync the progress-tracking section into Quip (add APPLY=1 to actually write)
 	python3 scripts/sync_quip.py --thread $(QUIP_THREAD) \
-		--file deliverables/progress-tracking.md --format html \
+		--file deliverables/progress-tracking.md \
 		--mode section --after-heading "Progress Tracking" $(if $(APPLY),--apply,)
 
 lint: ## Byte-compile all kernels, scripts, and tests

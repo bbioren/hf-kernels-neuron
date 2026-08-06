@@ -139,38 +139,65 @@ class _TopLevelSections(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.depth = 0
         self.ids: list[str] = []
-        # (id, tag, text) per top-level section. The text is needed to locate a marker
-        # heading for --mode section, so a sync can target part of a document.
+        # (id, tag, text) per top-level block. Text is needed to locate a marker heading, so
+        # --mode section can target part of a document.
         self.sections: list[tuple[str, str, str]] = []
-        self._cur: list | None = None
+        self._cur: list | None = None   # [id, tag, text-parts] for the block being walked
+        self._need_id = False           # inside a depth-0 block that had no id of its own
 
-    def _maybe_record(self, tag, attrs):
+    def _open_block(self, tag, attrs):
+        """Record the outermost id-bearing element of each top-level block.
+
+        Descending matters. Quip wraps a table in an id-LESS div:
+            <div data-section-style='13'><table id='...'>...</table></div>
+        so a strict depth-0 rule finds no id for that block and the table becomes unaddressable.
+        That is not cosmetic: DELETE_SECTION was never being called on tables, they survived
+        every sync, and the tracking section accumulated a duplicate set of tables each time —
+        silently, because deleting the paragraphs around them succeeded.
+        """
+        sid = dict(attrs).get("id")
+        if sid:
+            self.ids.append(sid)
+            self._cur = [sid, tag.lower(), []]
+            self._need_id = False
+        else:
+            self._need_id = True        # look for an id on the way down
+
+    def handle_starttag(self, tag, attrs):
         if self.depth == 0:
+            self._open_block(tag, attrs)
+        elif self._need_id:
             sid = dict(attrs).get("id")
             if sid:
                 self.ids.append(sid)
-                return [sid, tag.lower(), []]
-        return None
-
-    def handle_starttag(self, tag, attrs):
-        opened = self._maybe_record(tag, attrs)
-        if opened is not None and self._cur is None:
-            self._cur = opened
+                self._cur = [sid, tag.lower(), []]
+                self._need_id = False
         if tag.lower() not in _VOID_TAGS:
             self.depth += 1
 
     def handle_startendtag(self, tag, attrs):
-        opened = self._maybe_record(tag, attrs)  # self-closing: no depth change
-        if opened is not None:
-            self.sections.append((opened[0], opened[1], ""))
+        # Self-closing, so no depth change. Only meaningful as a whole block at depth 0.
+        if self.depth == 0:
+            sid = dict(attrs).get("id")
+            if sid:
+                self.ids.append(sid)
+                self.sections.append((sid, tag.lower(), ""))
+        elif self._need_id:
+            sid = dict(attrs).get("id")
+            if sid:
+                self.ids.append(sid)
+                self._cur = [sid, tag.lower(), []]
+                self._need_id = False
 
     def handle_endtag(self, tag):
         if tag.lower() not in _VOID_TAGS:
             self.depth = max(0, self.depth - 1)
-        if self.depth == 0 and self._cur is not None:
-            sid, t, parts = self._cur
-            self.sections.append((sid, t, "".join(parts).strip()))
-            self._cur = None
+        if self.depth == 0:
+            if self._cur is not None:
+                sid, t, parts = self._cur
+                self.sections.append((sid, t, "".join(parts).strip()))
+                self._cur = None
+            self._need_id = False
 
     def handle_data(self, data):
         if self._cur is not None:
@@ -230,14 +257,27 @@ def edit(base_url, token, thread_id, *, content=None, location=LOC_APPEND,
     return _request(base_url, "threads/edit-document", token, data=data)
 
 
-# Quip's own markdown importer hardcodes a narrow fixed width per table column --
-# style='width: 6em' on every <th> and width: 12em on the <table> -- regardless of what the cells
-# contain. A column holding "status" and a column holding a 200-character sentence both get 6em,
-# which is why imported tables come out unreadably skinny. There is no markdown-side fix, because
-# the width is not derived from the content at all.
+# TABLE WIDTHS CANNOT BE SET THROUGH THIS API. Recorded here so nobody spends the afternoon I
+# spent on it.
 #
-# So for tables we convert to HTML ourselves and set the widths explicitly. Quip emits
-# style='width: Nem' in its own output, which is the reason to expect it to honour it on input.
+# Quip hardcodes every imported table column to style='width: 6em' -- roughly 11 characters --
+# regardless of content. A column holding "status" and a column holding a 200-character sentence
+# get the same 6em, so wide-content tables come out unreadably narrow. Quip emits that attribute
+# in its own output, which made it look like an input it would honour. It is not. Five encodings
+# were tested on throwaway documents and all five were stripped:
+#
+#   style="width: 30em" on <th>            -> 6em
+#   width="480" attribute on <th>          -> 6em
+#   <colgroup><col style="width: 30em">    -> 6em
+#   percentage widths + width:100% table   -> 6em
+#   post-import REPLACE_SECTION on the <th> with a width -> API error
+#
+# Quip owns table geometry. The width machinery below is therefore INERT for its original
+# purpose; it is kept because md_to_html remains a working markdown->HTML path and the width
+# computation is harmless, but --format markdown is the default and loses nothing.
+#
+# The real fix is editorial: keep prose out of tables, since Quip renders paragraphs and lists at
+# full document width. deliverables/progress-tracking.md is written that way.
 TABLE_BUDGET_EM = 46.0   # roughly the usable width of a Quip document body
 MIN_COL_EM = 4.0
 EM_PER_CHAR = 0.5
