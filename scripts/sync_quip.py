@@ -48,8 +48,8 @@ from __future__ import annotations  # so `str | None` works on Python < 3.10
 import argparse
 import json
 import os
-import re
 import sys
+from html.parser import HTMLParser
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -103,16 +103,120 @@ def get_thread(base_url, token, thread_id):
     return _request(base_url, f"threads/{thread_id}", token)
 
 
-def section_ids(thread) -> list[str]:
-    """Every section id in the document, in document order.
+def new_document(base_url, token, content, *, title=None, fmt="markdown"):
+    """Create a new Quip document and return the thread payload.
 
-    Quip returns the document as HTML with an `id` attribute on each section element, which is
-    the documented way to address sections. Parsing them out with a regex rather than an HTML
-    parser is adequate because we only need the id attributes, not structure — but it is the
-    fragile part of this script, so the caller prints the count for eyeballing before applying.
+    Used once, to bring the doc into existence. Every update after that goes through
+    edit-document against the returned thread id, so the URL and the comment thread persist.
     """
-    html = thread.get("html") or ""
-    return re.findall(r"<[a-zA-Z0-9]+[^>]*\bid=['\"]([^'\"]+)['\"]", html)
+    data = {"content": content, "format": fmt}
+    if title:
+        data["title"] = title
+    return _request(base_url, "threads/new-document", token, data=data)
+
+
+# Void elements never get a closing tag, so they must not change nesting depth.
+_VOID_TAGS = {"br", "img", "hr", "input", "meta", "link", "col", "area", "base",
+              "embed", "source", "track", "wbr"}
+
+
+class _TopLevelSections(HTMLParser):
+    """Collect `id` attributes of TOP-LEVEL elements only.
+
+    This has to be depth-aware, and the reason is worth recording. Quip assigns a section id to
+    every addressable element, which for a table means one per CELL. A regex over all `id=`
+    occurrences reported 938 sections for a 213-line document with 8 tables — and since
+    edit-document deletes one section per HTTP call, that is 938 requests, which is slow and
+    walks straight into Quip's rate limit.
+
+    Deleting the top-level element removes everything nested inside it, so the top-level ids are
+    both sufficient and two orders of magnitude cheaper. Quip's document HTML has no wrapper
+    element (it starts directly with `<h1 id=...>`), so depth 0 is exactly the set we want.
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.depth = 0
+        self.ids: list[str] = []
+        # (id, tag, text) per top-level section. The text is needed to locate a marker
+        # heading for --mode section, so a sync can target part of a document.
+        self.sections: list[tuple[str, str, str]] = []
+        self._cur: list | None = None
+
+    def _maybe_record(self, tag, attrs):
+        if self.depth == 0:
+            sid = dict(attrs).get("id")
+            if sid:
+                self.ids.append(sid)
+                return [sid, tag.lower(), []]
+        return None
+
+    def handle_starttag(self, tag, attrs):
+        opened = self._maybe_record(tag, attrs)
+        if opened is not None and self._cur is None:
+            self._cur = opened
+        if tag.lower() not in _VOID_TAGS:
+            self.depth += 1
+
+    def handle_startendtag(self, tag, attrs):
+        opened = self._maybe_record(tag, attrs)  # self-closing: no depth change
+        if opened is not None:
+            self.sections.append((opened[0], opened[1], ""))
+
+    def handle_endtag(self, tag):
+        if tag.lower() not in _VOID_TAGS:
+            self.depth = max(0, self.depth - 1)
+        if self.depth == 0 and self._cur is not None:
+            sid, t, parts = self._cur
+            self.sections.append((sid, t, "".join(parts).strip()))
+            self._cur = None
+
+    def handle_data(self, data):
+        if self._cur is not None:
+            self._cur[2].append(data)
+
+
+def _parse(thread) -> _TopLevelSections:
+    parser = _TopLevelSections()
+    parser.feed(thread.get("html") or "")
+    parser.close()
+    return parser
+
+
+def section_ids(thread) -> list[str]:
+    """Top-level section ids, in document order."""
+    return _parse(thread).ids
+
+
+def sections_after_marker(thread, marker: str):
+    """Return (marker_id, [ids after it]) for the first top-level section containing `marker`.
+
+    This is what makes it safe to sync into a document somebody else owns the top of. The
+    project plan lives above a "Progress Tracking:" heading; everything below that heading is
+    ours to replace on every sync, and everything above it is never touched.
+
+    Matching is on the section's visible text, case-insensitively, and prefers a heading over a
+    paragraph so a passing mention in prose cannot be mistaken for the marker.
+    """
+    secs = _parse(thread).sections
+    needle = marker.strip().lower()
+
+    idx = None
+    for i, (_sid, tag, text) in enumerate(secs):
+        if needle in text.lower() and tag.startswith("h"):
+            idx = i
+            break
+    if idx is None:  # fall back to any section type
+        for i, (_sid, _tag, text) in enumerate(secs):
+            if needle in text.lower():
+                idx = i
+                break
+    if idx is None:
+        raise QuipError(
+            f"marker {marker!r} not found among {len(secs)} top-level sections.\n"
+            "  Add a heading with that text to the Quip doc, or pass --after-heading."
+        )
+    return secs[idx][0], [sid for sid, _t, _x in secs[idx + 1:]]
 
 
 def edit(base_url, token, thread_id, *, content=None, location=LOC_APPEND,
@@ -144,11 +248,21 @@ def strip_leading_h1(md: str) -> tuple[str, str | None]:
 def main():
     ap = argparse.ArgumentParser(
         description="Sync a Markdown file into an existing Quip document, in place.")
-    ap.add_argument("--thread", required=True,
-                    help="Quip thread ID, the token in the doc URL")
+    ap.add_argument("--thread",
+                    help="Quip thread ID, the token in the doc URL. Omit with --create.")
+    ap.add_argument("--create", action="store_true",
+                    help="create a NEW document instead of updating one, and print its thread "
+                         "ID. Run this once; use --thread for every update after that, so the "
+                         "URL and the comment thread survive.")
     ap.add_argument("--file", required=True, help="path to the .md file")
-    ap.add_argument("--mode", choices=("replace", "append"), default="replace",
-                    help="replace: swap the whole body (default). append: add to the end.")
+    ap.add_argument("--mode", choices=("replace", "append", "section"), default="section",
+                    help="section (default): replace only the content BELOW --after-heading, "
+                         "leaving everything above it untouched. Use this when the doc has "
+                         "content you do not own. replace: swap the whole body. append: add to "
+                         "the end without removing anything.")
+    ap.add_argument("--after-heading", default="Progress Tracking",
+                    help="marker heading for --mode section. Everything below it is replaced on "
+                         "each sync; everything above it is never touched.")
     ap.add_argument("--format", dest="fmt", choices=("markdown", "html"), default="markdown",
                     help="Quip renders markdown natively including tables. Fall back to html "
                          "only if something specific fails to convert.")
@@ -175,9 +289,31 @@ def main():
         print(f"error: {args.file} has no content to sync", file=sys.stderr)
         return 2
 
+    if not args.create and not args.thread:
+        print("error: pass --thread <ID> to update a doc, or --create to make a new one.",
+              file=sys.stderr)
+        return 2
+
     print(f"file          {args.file}  ({len(body)} chars, {len(body.splitlines())} lines)")
     if title:
-        print(f"stripped H1   {title!r}  (Quip shows the doc title already; --keep-h1 to keep it)")
+        print(f"stripped H1   {title!r}  (used as the Quip doc title)")
+
+    if args.create:
+        print(f"mode          CREATE a new document")
+        print(f"format        {args.fmt}")
+        if not args.apply:
+            print("\nDRY RUN — nothing written. Re-run with --apply to create it.")
+            return 0
+        res = new_document(args.base_url, token, body, title=title, fmt=args.fmt)
+        meta = res.get("thread", {})
+        print(f"\ncreated.")
+        print(f"  thread id   {meta.get('id')}")
+        print(f"  url         {meta.get('link')}")
+        print(f"  title       {meta.get('title')!r}")
+        print(f"\nFor every update from now on:")
+        print(f"  make quip-status QUIP_THREAD={meta.get('id')} APPLY=1")
+        return 0
+
     print(f"thread        {args.thread}")
     print(f"mode          {args.mode}")
     print(f"format        {args.fmt}")
@@ -187,14 +323,25 @@ def main():
     print(f"quip title    {meta.get('title')!r}")
     print(f"quip url      {meta.get('link')}")
 
-    old = section_ids(thread)
-    print(f"existing      {len(old)} section(s)")
+    if args.mode == "section":
+        marker_id, old = sections_after_marker(thread, args.after_heading)
+        total = len(section_ids(thread))
+        print(f"marker        {args.after_heading!r} -> {marker_id}")
+        print(f"sections      {total} total, {total - len(old) - 1} preserved above the marker, "
+              f"{len(old)} below it will be replaced")
+    else:
+        old = section_ids(thread)
+        print(f"existing      {len(old)} section(s)")
 
     if not args.apply:
         print()
         print("DRY RUN — nothing written. Re-run with --apply.")
-        if args.mode == "replace":
-            print(f"Would append the new body, then delete {len(old)} old section(s).")
+        if args.mode == "section":
+            print(f"Would append the new body, then delete the {len(old)} section(s) currently "
+                  f"below {args.after_heading!r}.")
+            print("Everything above the marker is left alone.")
+        elif args.mode == "replace":
+            print(f"Would append the new body, then delete ALL {len(old)} section(s).")
             print("Note: inline comments anchored to those sections will be orphaned. "
                   "Thread-level comments survive.")
         else:
@@ -208,8 +355,8 @@ def main():
         print(f"open: {meta.get('link')}")
         return 0
 
-    # replace: append first, then delete the old sections. This order means a mid-run failure
-    # leaves both versions present (recoverable) rather than an empty document.
+    # replace / section: append first, then delete the old sections. This order means a mid-run
+    # failure leaves both versions present (recoverable) rather than an empty document.
     print("\nappending new content ...")
     edit(args.base_url, token, args.thread, content=body, location=LOC_APPEND, fmt=args.fmt)
 

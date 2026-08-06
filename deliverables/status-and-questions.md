@@ -45,7 +45,7 @@ two of the three turned out to be my own mistake. Performance is the weak half: 
 intercepts most widely are the ops with least to gain, and both winning candidates are blocked from
 real model shapes by the same unanswered question.
 
-| | status |
+| area | status |
 |---|---|
 | Mechanism works end to end | **done** — stock `use_kernels=True`, no patching |
 | Kernels correct | **done** — 3 kernels, 2 model families, 2 stacks, 2 NKI versions |
@@ -203,10 +203,13 @@ Not blocking me, but they need owners.
 
 **Earlier** — root-caused a 206x slowdown to two framework caching bugs (322x recovered), found the first
 speedup (flash attention), and established why RMSNorm/RoPE/SiLU cannot win. Full history in
-[`WORKLOG.md`](../WORKLOG.md).
+`WORKLOG.md`.
 
 ---
 
-**Deeper reading:** [`deliverables/poc-document.md`](poc-document.md) is the live technical document.
-[`results/README.md`](../results/README.md) has every number with provenance.
-[`docs/poc-findings.md`](../docs/poc-findings.md) is the full findings log, 34 entries.
+**Deeper reading** — all in the project repo, ask me for access:
+
+- `deliverables/poc-document.md` — the live technical document (recommendation, findings, what's not done)
+- `results/README.md` — every number with provenance, and a warning about which ones get misquoted
+- `docs/poc-findings.md` — the full findings log, 34 entries
+- `WORKLOG.md` — session-by-session history including the corrections

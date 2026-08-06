@@ -144,11 +144,15 @@ registration: ## Print the neuron kernel mapping + proposed upstream diff
 sync: ## rsync the working tree to trn2 for testing
 	./scripts/sync_to_trn2.sh
 
-# Set QUIP_THREAD to the token in the doc URL, e.g. quip-amazon.com/AbCdEfGhIjKl/... -> AbCdEfGhIjKl
-# Dry run by default. QUIP_API_TOKEN must be in the environment; never commit it.
-quip-status: ## Preview syncing the status doc to Quip (add APPLY=1 to actually write)
+# Syncs deliverables/progress-tracking.md into the "Progress Tracking:" section of the
+# HuggingFace Kernels Project Quip doc. Only content BELOW that heading is touched — the project
+# plan above it is never modified. Dry run unless APPLY=1.
+# QUIP_API_TOKEN must be in the environment (https://quip-amazon.com/dev/token); never commit it.
+QUIP_THREAD ?= DUX9AAEWHvn
+quip-status: ## Sync the progress-tracking section into Quip (add APPLY=1 to actually write)
 	python3 scripts/sync_quip.py --thread $(QUIP_THREAD) \
-		--file deliverables/status-and-questions.md $(if $(APPLY),--apply,)
+		--file deliverables/progress-tracking.md \
+		--mode section --after-heading "Progress Tracking" $(if $(APPLY),--apply,)
 
 lint: ## Byte-compile all kernels, scripts, and tests
 	$(PYTHON) -m compileall -q kernels scripts tests
