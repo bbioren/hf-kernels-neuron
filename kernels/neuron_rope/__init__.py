@@ -1,3 +1,25 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License").
+# You may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# NOTICE OF MODIFICATION (Apache-2.0 section 4b)
+#   This file is a modified derivative work of:
+#     aws-neuron/nki-library, src/nkilib_src/nkilib/core/embeddings/rope_hf.py
+#     https://github.com/aws-neuron/nki-library  (Apache-2.0)
+#   The notice above is reproduced from that file. Five adaptations were made to
+#   fit the HuggingFace `kernels` per-layer forward-swap model; they are
+#   enumerated in the module docstring below and analysed in
+#   docs/nki-library-porting-analysis.md.
 """NKI RoPE (rotary position embedding) kernel for Neuron, HF-compatible.
 
 PORTED FROM PRODUCTION nki-library, not from a tutorial.

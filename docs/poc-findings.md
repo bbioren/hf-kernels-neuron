@@ -61,6 +61,10 @@ These are the primary references we used. Critically, they describe different la
 | 32 | **On native the kernels are FASTER than baseline — 1.97x at seq 512 — and that is NOT a win.** The native torch baseline is 4.3x slower than the XLA one, so the ratio flipped because the denominator degraded. Both absolute numbers are worse on native | **Critical** | **The `--lnc 1` trap from #27, now at model scale.** Never quote the native speedup without the baseline beside it. Native kernelized MFU 2.20% is *below* XLA kernelized 2.98% |
 | 33 | **The fused RMSNorm+MLP is a second winning candidate — 1.76x faster at Qwen3-0.6B's shape — but only at shapes nobody deploys.** Finding #18's `I>4096` single-core boundary is UNCHANGED on the new compiler, so every real model is still excluded | **High** | Samir's suggestion, and correct: `NormType.RMS_NORM` works and is accurate (cos_sim 0.999973). Loses 1.45x at H=4096/I=4096, so it is a shape *window* like #29. Two new interface mismatches found: the norm weight must be 2D and the hidden tensor must be 3D |
 | 34 | **The Hub trust gate is an org-level flag, not a hardcoded `kernels-community` check — so `aws-neuron` can be trusted AND keep versioning control.** `huggingface.co/aws-neuron` already exists (31 models, 180 followers) but has `numKernels: 0` and no `trustedKernelPublisher` | **High** | **Reverses the repo-home recommendation.** The earlier lean toward `kernels-community` came from trusting a stale code comment instead of reading `_check_trust_remote_code`. The ask to HF is now a flag on an existing org, not a choice between trust and control |
+| 35 | **Publishing a kernel needs a `kernel`-type Hub repo, and creating one is access-restricted.** The Hub returns `403 {"error":"Kernel repository creation is restricted. Request access in your user or organizations settings."}`. This is a gate *before* the #34 trust gate: `trust_remote_code=True` bypasses trust, not creation | **Critical** | **Supersedes #34 as the binding constraint on repo home.** Uploading `bbioren/neuron-rmsnorm` as a `model`-type repo succeeded and is invisible to `get_kernel`, which reads `repo_type="kernel"` (`variants.py:239`, `utils.py:286/323/349/393/551`). `huggingface_hub.constants.REPO_TYPES` does not even list `kernel`, so `create_repo` fails client-side too |
+| 36 | **A `model`-type kernel repo is legacy, and the two repo types are genuinely separate repositories.** `kernels-community/activation` resolves under *both* types with **different SHAs and different `build/` variant sets** (`kernel`: `7daa788f`, `torch-stable-abi210-*`+rocm; `model`: `9f885f72`, `torch27/28/29-*`+windows) | **High** | Official spec confirms kernel-type is "the first-class kernel repository type" and points to a migration guide for model-type repos. So the Neuron ask is not just a trust flag — it is kernel-repo creation access on whichever org publishes |
+| 37 | **`neuron` is already an officially supported backend type in the Kernel Hub spec** — the documented set is `cann, cpu, cuda, metal, neuron, rocm, xpu` | **Medium — positive** | Our `{"backend": {"type": "neuron"}}` was compliant all along, and the noarch variant `torch-neuron` resolves ahead of `torch-universal` (both `VariantAccepted`, `torch-neuron` selected). Neuron is *specified* on the Hub side; what is missing is publishing access, not spec support |
+| 38 | **Our build layout was non-compliant in a way that works today and would break on older `kernels`.** The spec requires the kernel at `build/<variant>/__init__.py` **and** a compat copy at `build/<variant>/<name_underscored>/__init__.py` exporting the same symbols. We shipped only the nested form | **Medium** | 0.15.2 tries the primary path first and falls back to nested (`utils.py:203-205`), so nested-only passes on this version and silently regresses on older ones. `scripts/build_hub_repo.py` now emits both. Files are duplicated rather than re-exported because these load via `spec_from_file_location`, so `from .. import *` raises "relative import beyond top-level package" |
 
 ---
 
@@ -2862,3 +2866,134 @@ The comment is not even wrong in spirit — `kernels-community` really is the on
 today. It is wrong about *why*, and the why is what determines whether the situation is changeable.
 **A comment describes the world when it was written; the code describes the mechanism.** For anything
 load-bearing, read the mechanism.
+
+---
+
+## 35–38. Publishing to the Hub: the layout was the easy part, the repo type is the wall [CRITICAL — supersedes #34 as the binding constraint]
+
+The goal was narrow: take one working kernel, put it on the Hub, and prove `use_kernels=True` can
+reach it. That would flip a ceiling item to done and settle a loading asymmetry we had been relying
+on without testing.
+
+The layout worked. The publish did not, for a reason no amount of layout work would have fixed.
+
+### The asymmetry we set out to close
+
+Every kernel in this project loaded from disk via `LocalLayerRepository`. That path has a fallback
+the Hub path does not:
+
+```python
+# get_local_kernel -> _resolve_local_variant_path : tolerant, has a flat fallback
+# get_kernel       -> install_kernel              : no fallback at all
+variant_path = repo_path / "build" / variant_str          # utils.py:367
+if not variant_path.exists():
+    raise FileNotFoundError(f"Variant path does not exist: `{variant_path}`")
+```
+
+So "it loads locally" was never evidence it would load from the Hub. Closing that gap needed a real
+build-variant layout, which `scripts/build_hub_repo.py` now generates.
+
+### What the layout actually has to be (verified against 0.15.2 source, then against the spec)
+
+| Requirement | Source |
+|---|---|
+| `build/<variant>/` must exist; no flat fallback | `utils.py:367` |
+| `metadata.json` lives **inside** `build/<variant>/`, not at the repo root | `utils.py:199` |
+| module dir name is `metadata.name.python_name` (dashes → underscores) | `utils.py:200` |
+| primary is `build/<variant>/__init__.py`, else `build/<variant>/<mod>/__init__.py` | `utils.py:203-205` |
+| noarch variant string is `torch-<backend>` | `variants.py:210-235` |
+| noarch accepted if backend matches system **or** is `universal` | `variants.py:470-477` |
+| Neuron backend name is `"neuron"` | `backends.py:114-125` |
+
+Two of these I had initially guessed wrong: `metadata.json` at the repo root (it must be in the
+variant dir), and nested-module-only (the spec wants **both** the primary and a nested compat copy —
+Finding #38). Nested-only passes on 0.15.2 because of the `:203-205` fallback and would regress
+silently on older versions.
+
+Pre-flight on the native stack passed: both `torch-neuron` and `torch-universal` parsed and were
+`VariantAccepted`, `torch-neuron` was selected over `torch-universal`, and the module loaded with
+`layers.NeuronRMSNorm` intact.
+
+### Then the wall
+
+The upload succeeded. `bbioren/neuron-rmsnorm`, commit `41687c8e`, seven files, correct layout. And
+`get_kernel` returned:
+
+```
+RepositoryNotFoundError: 404
+https://huggingface.co/api/kernels/bbioren/neuron-rmsnorm/tree/41687c8e.../build
+```
+
+`api/kernels/`, not `api/models/`. Every read path in the library asks for `repo_type="kernel"`
+(`variants.py:239`, `utils.py:286/323/349/393/551`, `lockfile.py:52/62`, `status.py:57`). We had
+created a `model`-type repo, because that is the only thing `create_repo` accepts —
+`huggingface_hub.constants.REPO_TYPES` is `[None, "model", "dataset", "space"]`, with `kernel`
+absent despite `REPO_TYPE_KERNEL` existing and `REPO_TYPES_URL_PREFIXES` mapping
+`"kernel" -> "kernels/"`.
+
+Asking the server directly removed the ambiguity:
+
+```
+POST /api/repos/create  {"name": "neuron-rmsnorm", "type": "kernel", "private": true}
+403 {"error":"Kernel repository creation is restricted.
+              Request access in your user or organizations settings."}
+```
+
+**Kernel-repo creation is gated.** Not a client bug, not a layout problem, not something
+`trust_remote_code=True` touches — that bypasses *trust*, which is a later gate. This one is prior
+to it and cannot be worked around from the client.
+
+### The two repo types are separate repositories, not aliases
+
+Probing a known-good kernel both ways:
+
+| | `repo_type="kernel"` | `repo_type="model"` |
+|---|---|---|
+| `kernels-community/activation` sha | `7daa788f` | `9f885f72` |
+| `build/` variants | 41, incl. `torch-stable-abi210-*`, rocm | 42, incl. `torch27/28/29-*`, windows |
+| `bbioren/neuron-rmsnorm` | **404** | OK, `41687c8e`, our 2 variants |
+
+Different SHAs and different variant sets — two distinct repos that share a name. The official spec
+resolves why: kernel-type is "the first-class kernel repository type", new `kernel-builder` uploads
+default to it, and there is a migration guide for maintainers of older model-type kernel repos. The
+model-type repo is legacy.
+
+### This changes the repo-home ask
+
+Finding #34 concluded the ask to HuggingFace was a `trustedKernelPublisher` flag on the existing
+`aws-neuron` org. That was right but incomplete. The ask is now **two** things, and they are ordered:
+
+1. **Kernel-repo creation access** for the publishing org. Without this there is no kernel repo at
+   all, trusted or otherwise. This is the blocker.
+2. **`trustedKernelPublisher`** so users do not need `trust_remote_code=True`. This is the polish.
+
+It also removes the last argument for `kernels-community` as a shortcut. Publishing there would
+require their maintainers to accept and build our kernel; publishing to `aws-neuron` requires
+HuggingFace to grant an org capability. The second is a smaller, more durable ask, and it is the one
+that keeps versioning control.
+
+### One piece of good news
+
+The spec's documented backend types are `cann, cpu, cuda, metal, neuron, rocm, xpu`. **Neuron is
+already first-class in the Kernel Hub specification** (Finding #37). Our `metadata.json` was
+compliant from the start, and `torch-neuron` resolves ahead of `torch-universal` on Neuron hardware.
+Nothing about the Neuron *format* needs changing. What is missing is publishing access.
+
+### What is proven and what is not
+
+Proven: the layout is correct and loads through the same `_import_from_path` and `Metadata` code the
+Hub path uses; `neuron` is a supported backend; `torch-neuron` beats `torch-universal` in variant
+selection; a model-type upload is unreachable by `get_kernel`.
+
+Not proven, and blocked rather than skipped: the Hub *download* path, and `kernelize()` against a
+Hub-hosted repo. `tests/test_hub_kernel_e2e.py` is written and will run unchanged once a kernel-type
+repo exists — it purges the cache first so a pass cannot be a stale local hit, and it spies the NKI
+entry point directly so a silent fallback cannot masquerade as success.
+
+### Methodological note
+
+The 403 was reached in about fifteen minutes, and only because the 404 URL was read carefully enough
+to notice `api/kernels/` rather than `api/models/`. The tempting inference from a 404 on a private
+repo is an auth problem, and the tempting fix is to make the repo public — which would have been an
+irreversible public upload undertaken to fix a misdiagnosis. Uploading private first cost nothing and
+made the wrong turn recoverable.

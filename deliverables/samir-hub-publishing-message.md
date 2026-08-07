@@ -86,9 +86,15 @@ Also new since v3: a **second** dispatch caching bug, which takes the model-leve
 >
 > Four asks, in order of how much they block us:
 >
-> **1. Where should Neuron kernels live — `kernels-community/` or `aws-neuron/`?** The only one actually
-> blocking publishing. My lean is `aws-neuron/` so we can ship against specific `neuronx-cc` releases,
-> but I'll follow your call. It also decides the `repo_id` in the `_KERNEL_MAPPING` entries we'd PR.
+> **1. Who can grant an AWS org kernel-repository creation access?** This turned out to be the actual
+> blocker, and it is upstream of the repo-home question. Kernels need a first-class `repo_type="kernel"`
+> repo — `kernels-community/activation` exists as both kernel-type and model-type, with different SHAs
+> and variant sets, and model-type is legacy. Creating a kernel repo returns
+> `403 "Kernel repository creation is restricted. Request access in your user or organizations settings."`
+> so I could not test Hub delivery at all. Packaging is done and validated on hardware; only the
+> download is untested. My lean is still `aws-neuron/` for the repo home so we can ship against specific
+> `neuronx-cc` releases, but that is moot until some org has kernel-repo access. Note `neuron` is already
+> a documented Hub backend type, so nothing about the format needs changing.
 >
 > **2. `use_kernels=True` can't reach a `"neuron"` entry today, and it fails silently.** `kernelize()`
 > derives the device from `model.device.type`, which on Neuron is `"cpu"` or `"xla"`, never `"neuron"`.
@@ -129,7 +135,8 @@ Also new since v3: a **second** dispatch caching bug, which takes the model-leve
 | Accuracy | isolated layers `cos_sim 1.000000`; e2e logits `1.000001` (dense) / `1.000002` (MoE) |
 | Provenance | RoPE ported from `nkilib.core.embeddings.rope_hf`. RMSNorm and SiLU are tutorial-derived **because no standalone versions exist in nkilib** — `rmsnorm_quant.py` always quantises and there is no activations module |
 | Loading | flat layout, `LocalLayerRepository`. Works, but only because build-variant resolution fails and falls back to importing the repo root |
-| Published | **nothing.** No external side effects were permitted for this PoC |
+| Published | `bbioren/neuron-rmsnorm` (private, model-type). **Unreachable by `get_kernel`** — kernels need `repo_type="kernel"`, and creating one returns `403 "Kernel repository creation is restricted. Request access in your user or organizations settings."` Everything downstream of the download verified via `LOCAL_KERNELS`: 9/9 swapped, 9 NKI calls, 0 fallbacks, `cos_sim 1.000000` |
+| Layout | **Solved.** `scripts/build_hub_repo.py` emits the spec-compliant `build/<variant>/` tree with both the primary `__init__.py` and the nested compat copy. `neuron` is already a documented Hub backend type, and `torch-neuron` resolves ahead of `torch-universal` |
 
 ### The two dispatch bugs, both ours
 

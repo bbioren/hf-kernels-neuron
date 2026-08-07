@@ -286,3 +286,41 @@ For the record, and unchanged in character from the DLAMI notes above:
   runtime — but nothing in the drop says so, and the instruction accompanying it says to install them.
   Worth confirming with the drop's owners which parts are actually mandatory, because installing them
   is the step most likely to break an existing working environment.
+
+### Publishing a kernel to the Hub is gated, and nothing tells you that until you try
+
+A developer who writes a NKI kernel today and wants to share it hits a wall that no error message,
+tutorial, or getting-started page warns about in advance.
+
+The sequence, which took a working morning to establish:
+
+1. `create_repo(..., repo_type="model")` succeeds. The upload succeeds. It looks done.
+2. `get_kernel("<user>/<name>")` fails with `RepositoryNotFoundError: 404` on
+   `https://huggingface.co/api/kernels/<user>/<name>/tree/...`. The message says "Repository Not
+   Found" and suggests checking `repo_id`, `repo_type`, and authentication.
+3. Every one of those suggestions is a dead end. The repo exists, the id is right, and auth is fine.
+   The actual cause is legible only by noticing the URL says `api/kernels/` rather than `api/models/`.
+4. `create_repo(..., repo_type="kernel")` fails client-side, because
+   `huggingface_hub.constants.REPO_TYPES` is `[None, "model", "dataset", "space"]` — `kernel` is
+   absent, even though `REPO_TYPE_KERNEL` exists in the same file and
+   `REPO_TYPES_URL_PREFIXES` maps `"kernel" -> "kernels/"`.
+5. Only a raw `POST /api/repos/create` with `{"type": "kernel"}` returns the real reason:
+   `403 Kernel repository creation is restricted. Request access in your user or organizations settings.`
+
+**The information a developer needs is four layers down**, and the one error that states it plainly is
+reachable only by bypassing the client library. Two specific problems:
+
+- **The 404 actively misleads.** For a private repo the natural reading is an auth failure, and the
+  natural fix is to make the repo public. That is an irreversible public upload performed to fix a
+  misdiagnosis. Uploading private first is what made the wrong turn recoverable here.
+- **`REPO_TYPES` omitting `kernel` means the client cannot produce the useful error.** Adding `kernel`
+  to the list would surface the server's 403 — which is clear and actionable — instead of a local
+  validation failure.
+
+Worth raising with the kernels team, because it costs a would-be kernel author their first afternoon
+and the fix is small: mention the access requirement in the publishing docs, and let the client attempt
+`repo_type="kernel"` so the server's own message gets through.
+
+Relevant to Neuron specifically: none of this is Neuron's fault or Neuron's to fix. `neuron` is already
+a documented backend type in the Hub kernel spec, and our layout was compliant. The gap is purely
+publishing access, which is an org-level capability someone at AWS has to request.

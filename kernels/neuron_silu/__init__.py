@@ -1,3 +1,8 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Original work, not a port. NKI exposes `nl.silu` natively, and nki-library has no
+# activations module, so there was nothing upstream to derive from.
 """NKI SiLU activation kernel for Neuron.
 
 Swaps `transformers.activations.SiLUActivation`, which is decorated

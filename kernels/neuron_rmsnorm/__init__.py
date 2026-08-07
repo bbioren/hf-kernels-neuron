@@ -1,3 +1,10 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Derived from the NKI RMSNorm tutorial (aws-neuron/nki-samples), which is MIT-0.
+# MIT-0 requires no attribution; provenance is recorded here as good practice and
+# because the *reason* it is tutorial-derived is itself a finding: nki-library has
+# no standalone RMSNorm, only rmsnorm_quant.py, which always quantises.
 """NKI RMSNorm kernel for Neuron (Trainium/Inferentia).
 
 Ported from the NKI tutorials: awsdocs-neuron.readthedocs-hosted.com/en/v2.25.0/general/nki/tutorials/rmsnorm.html

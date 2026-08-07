@@ -111,12 +111,24 @@ dispatch, and cannot yet be attributed. It bounds the answer instead of settling
 `I <= 4096` — re-tested on the new compiler and unchanged. Qwen3-8B is 12288. Llama-3-8B and
 Mistral-7B are 14336. So the result is real and currently unusable.
 
-**4. Hub publishing is unproven and may not be reachable.** The loader expects
-`build/<variant>/` directories; our flat Python-only layout works through a fallback path;
-`kernel-builder` has no Neuron target at all. Nothing has been uploaded. Kernels also live in a
-distinct `repo_type="kernel"` on the Hub, and `aws-neuron` currently has zero of them. The trust gate
-is a solvable org flag rather than a blocker (see ask 2), but nothing about the *upload* path has been
-exercised end to end.
+**4. Hub publishing is blocked by an access gate, not by anything about Neuron.** Tested rather than
+assumed. The packaging side is solved: `scripts/build_hub_repo.py` emits the spec-compliant
+`build/<variant>/` layout, it loads on hardware, `neuron` is already one of the Hub spec's supported
+backend types, and `torch-neuron` resolves ahead of `torch-universal`. A real upload was made
+(`bbioren/neuron-rmsnorm`, commit `41687c8e`). It is **unreachable by `get_kernel`**, because kernels
+must live in a `repo_type="kernel"` repo and creating one returns:
+
+```
+403 {"error":"Kernel repository creation is restricted.
+              Request access in your user or organizations settings."}
+```
+
+That gate sits *before* the trust gate in ask 2 — `trust_remote_code=True` bypasses trust, not
+creation. Everything downstream of the download was then verified with the network hop stubbed via
+`LOCAL_KERNELS`: `get_kernel` by repo_id, variant resolution, `LayerRepository`, `kernelize()`
+swapping 9/9 `Qwen3RMSNorm`, 9 NKI calls with 0 fallbacks, `cos_sim 1.000000`. So the only untested
+stage is Hub delivery itself, and it is blocked rather than skipped —
+`tests/test_hub_kernel_e2e.py` will run unchanged once a kernel-type repo exists. See Findings #35–38.
 
 **5. Attention wins by bypassing the thing this PoC is about.** The best result came from calling
 `attention_cte` directly, not through the Kernel Hub. Wiring it through transformers' attention
@@ -293,9 +305,26 @@ Ordered by value per unit of effort.
 block in `_KERNEL_MAPPING` and one in `_FUNCTION_KERNEL_MAPPING`. Blocked on the repo-home decision
 below, because the entries name repo IDs.
 
-**2. Publish under `aws-neuron/`, and ask HuggingFace for the `trustedKernelPublisher` flag in
+**2. HuggingFace: grant `aws-neuron` kernel-repository creation access.** This is now the hard
+blocker on publishing anything at all, and it is ordered *before* the trust flag below. Kernels live
+in a first-class `repo_type="kernel"` repo, distinct from a model repo — `kernels-community/activation`
+exists as both, with different SHAs and different `build/` variant sets, and the model-type one is
+legacy. Creating a kernel repo is access-restricted:
+
+```
+403 {"error":"Kernel repository creation is restricted.
+              Request access in your user or organizations settings."}
+```
+
+Nothing on our side works around this. It is not a layout problem (our layout is spec-compliant and
+loads), not a Neuron gap (`neuron` is already a documented Hub backend type), and not the trust gate
+(`trust_remote_code=True` bypasses trust, not creation). Until an org has this capability there is no
+kernel repo to point a mapping entry at, which is why ask 1 is blocked behind it.
+
+**3. Publish under `aws-neuron/`, and ask HuggingFace for the `trustedKernelPublisher` flag in
 parallel.** This replaces an earlier, worse-informed ask that framed this as a choice between
-default-path trust and versioning control. It is neither a choice nor blocking.
+default-path trust and versioning control. It is neither a choice nor blocking — and it is polish
+relative to ask 2, since an untrusted org can still publish while a non-kernel-enabled org cannot.
 
 The Hub trust gate is not a hardcoded `kernels-community` check —
 `kernels/utils.py::_check_trust_remote_code` queries an org-level `trustedKernelPublisher` boolean via
@@ -483,8 +512,12 @@ it constrain the claim.
   Concrete next step, and it is cheap: flip `can_torch_compile = True` on one kernel and see whether
   it traces on native. That single experiment decides whether the eager framing is a constraint or a
   habit.
-- **Hub upload.** Nothing published. Blocked on the repo-home decision, and possibly on the loader's
-  variant-directory expectation.
+- **Hub delivery.** One stage, and it is blocked rather than skipped. Packaging is done and validated
+  (`scripts/build_hub_repo.py`, spec-compliant, loads on hardware); a real upload exists at
+  `bbioren/neuron-rmsnorm`; and everything downstream of the download is verified with the network hop
+  stubbed — `kernelize()` swapping 9/9, 9 NKI calls, 0 fallbacks, `cos_sim 1.000000`. What is missing is
+  a `repo_type="kernel"` repo, and creating one is access-restricted by the Hub (Finding #35). The test
+  is written and runs unchanged once that access exists.
 - **Attention through the Kernel Hub.** The best performance result bypasses the mechanism this PoC is
   about. Wiring it through transformers' attention interface is the obvious next step.
 - **Device-time profiling on native.** Which is why the fused-MLP number is provisional.

@@ -1,0 +1,33 @@
+Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+--------------------------------------------------------------------------------
+Attribution for derivative work
+--------------------------------------------------------------------------------
+
+This project contains a modified derivative of:
+
+  aws-neuron/nki-library  (Apache-2.0)
+  https://github.com/aws-neuron/nki-library
+
+  File: src/nkilib_src/nkilib/core/embeddings/rope_hf.py
+  Used in: kernels/neuron_rope/__init__.py
+
+  The line above this section reproduces the upstream NOTICE, as required by
+  Apache-2.0 section 4(d). Modifications are stated in the file header and the
+  module docstring of kernels/neuron_rope/__init__.py, and analysed in
+  docs/nki-library-porting-analysis.md.
+
+Other kernels in this project and their provenance:
+
+  kernels/neuron_rmsnorm  Derived from the NKI RMSNorm tutorial in
+                          aws-neuron/nki-samples (MIT-0, no attribution
+                          required). Tutorial-derived rather than ported
+                          because nki-library has no standalone RMSNorm --
+                          rmsnorm_quant.py always quantises.
+
+  kernels/neuron_silu     Original work. NKI exposes `nl.silu` natively and
+                          nki-library has no activations module, so there was
+                          nothing upstream to derive from.
+
+  kernels/neuron_identity Original work. A no-op kernel used to verify that the
+                          forward swap fires at all.
