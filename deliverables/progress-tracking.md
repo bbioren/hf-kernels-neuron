@@ -35,7 +35,9 @@ this is not bookkeeping. Next two tasks are both cheap and decisive — see Phas
   repo-home decision. `use_kernels=True` **now works unpatched** on the native stack.
 - **Week 4 — SiLU, full Qwen3 dense e2e, MFU.** Done, then re-done twice after root-causing the
   slowdown.
-- **Week 5 — Qwen3-MoE.** Done. All three kernels transfer with **zero code changes**.
+- **Week 5 — Qwen3-MoE.** Done. All three kernels transfer with **zero code changes**. Scope: a
+  **2.49M-parameter** config (2 layers, 4 experts, top-k 2, hidden 256, random weights), not
+  Qwen3-MoE-30B-A3B, which is ~12,000x larger and has never been run. Correctness claim only.
 - **Week 6 — PoC doc + recommendation.** In progress; the document is live and current.
 
 **Two corrections to the plan's own assumptions.** Upstream coverage is larger than estimated: **115**

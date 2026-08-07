@@ -160,6 +160,18 @@ while the kernel had never run once.
 | NKI version | 0.5.0 | 0.6.0b1 |
 | compiler | neuronx-cc 2.26.6360.0 | neuronx-cc 2.0.266551.0a0 |
 
+**What "Qwen3" and "Qwen3-MoE" mean here.** Stock, unmodified transformers architectures — no fork
+and no patched model code — but every config is constructed in code with **random weights**. No
+pretrained checkpoint is loaded anywhere in this project. The correctness runs use deliberately small
+configs: dense is 2 layers / hidden 256; MoE is 2 layers / hidden 256 / **4 experts, top-k 2**, about
+2.5M parameters total. The MFU runs use Qwen3-0.6B's real shape (28 layers, hidden 1024, intermediate
+3072). Real **Qwen3-MoE-30B-A3B — 48 layers, 128 experts — has never been run.**
+
+So the MoE line above is a **mechanism and correctness** claim, not a performance or scale one: the
+three dense kernels swap into the MoE architecture unchanged and stay numerically exact. It does not
+show anything about MoE performance, and routing across 4 experts is not representative of routing
+across 128. Nothing in this project touched the MoE expert MLP or the router — see the gap analysis.
+
 Two incidental results worth keeping:
 
 - **Qwen3-MoE does not run on Neuron at all by default.** The experts path uses `torch.sort` and

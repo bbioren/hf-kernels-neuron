@@ -68,7 +68,7 @@ the deadline and I will pin calendar dates. Everything in Phase 0 is complete.
 | 0 | NKI RoPE kernel — **real port** of `nkilib/core/embeddings/rope_hf.py` | Ben | — | p0 | — | — | **Done** | 20/20 + 6 guard cases |
 | 0 | NKI SiLU kernel | Ben | — | p1 | — | — | **Done** | 9/9; `nl.silu` is native, nothing to port |
 | 0 | Qwen3 dense end to end | Ben | — | p0 | — | — | **Done** | 9/2/2 swaps, logits cos_sim 1.000001 |
-| 0 | Qwen3-MoE end to end, zero kernel changes | Ben | — | p1 | — | — | **Done** | cos_sim 1.000002. Needs `experts_implementation="batched_mm"` or MoE does not run on Neuron at all |
+| 0 | Qwen3-MoE end to end, zero kernel changes | Ben | — | p1 | — | — | **Done** | cos_sim 1.000002. Needs `experts_implementation="batched_mm"` or MoE does not run on Neuron at all. **Scope: 2 layers, 4 experts, top-k 2, random weights (~2.5M params) — not 30B-A3B.** Correctness claim only |
 | 0 | MFU measurement, denominator stated | Ben | — | p0 | — | — | **Done** | 632 TFLOPS/device TensorEngine ÷ 2 for LNC2 = 316 |
 | 0 | Root-cause the 206x slowdown | Ben | — | p0 | — | — | **Done** | Two framework caching bugs, 322x recovered **on torch-xla**. Only one of the two applies on native, and its value there is unmeasured |
 | 0 | Find a speedup | Ben | Samir | p0 | — | — | **Done** | Flash attention 1.48x @ seq2048, 2.11x @ 3072 |

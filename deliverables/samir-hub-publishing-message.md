@@ -125,7 +125,7 @@ Also new since v3: a **second** dispatch caching bug, which takes the model-leve
 | | status |
 |---|---|
 | Kernels | RMSNorm, RoPE, SiLU — single-file, `metadata.json` with `{"backend": {"type": "neuron"}}` |
-| Models | Qwen3 dense (28 layers) and Qwen3-MoE, both stock from the Hub |
+| Models | Stock **unmodified** transformers architectures — `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`. No fork, no patched model code. Configs are constructed in code with random weights, **not pretrained checkpoints**: dense MFU uses Qwen3-0.6B's real shape (28 layers, hidden 1024, intermediate 3072); correctness runs use 2-layer configs (MoE: 4 experts, top-k 2, hidden 256) |
 | Accuracy | isolated layers `cos_sim 1.000000`; e2e logits `1.000001` (dense) / `1.000002` (MoE) |
 | Provenance | RoPE ported from `nkilib.core.embeddings.rope_hf`. RMSNorm and SiLU are tutorial-derived **because no standalone versions exist in nkilib** — `rmsnorm_quant.py` always quantises and there is no activations module |
 | Loading | flat layout, `LocalLayerRepository`. Works, but only because build-variant resolution fails and falls back to importing the repo root |
