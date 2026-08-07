@@ -70,7 +70,7 @@ the deadline and I will pin calendar dates. Everything in Phase 0 is complete.
 | 0 | Qwen3 dense end to end | Ben | — | p0 | — | — | **Done** | 9/2/2 swaps, logits cos_sim 1.000001 |
 | 0 | Qwen3-MoE end to end, zero kernel changes | Ben | — | p1 | — | — | **Done** | cos_sim 1.000002. Needs `experts_implementation="batched_mm"` or MoE does not run on Neuron at all |
 | 0 | MFU measurement, denominator stated | Ben | — | p0 | — | — | **Done** | 632 TFLOPS/device TensorEngine ÷ 2 for LNC2 = 316 |
-| 0 | Root-cause the 206x slowdown | Ben | — | p0 | — | — | **Done** | Two framework caching bugs, 322x recovered |
+| 0 | Root-cause the 206x slowdown | Ben | — | p0 | — | — | **Done** | Two framework caching bugs, 322x recovered **on torch-xla**. Only one of the two applies on native, and its value there is unmeasured |
 | 0 | Find a speedup | Ben | Samir | p0 | — | — | **Done** | Flash attention 1.48x @ seq2048, 2.11x @ 3072 |
 | 0 | Stand up the Native PyTorch stack | Ben | Samir | p0 | — | — | **Done** | Both integration gates were XLA artifacts |
 | 0 | Fused RMSNorm+MLP (Samir's suggestion) | Ben | Samir | p1 | — | — | **Done** | 1.76x @ Qwen3-0.6B shape; blocked above `I=4096` |
@@ -108,7 +108,7 @@ a fortnight.
 | 3 kernels in the Kernel Hub's single-file format | `kernels/neuron_{rmsnorm,rope,silu}/` |
 | Stock `use_kernels=True` on native, **no patching** | shim asserted absent before the test runs |
 | All 3 kernels on the native compiler + NKI 0.6.0b1 | cos_sim 0.999983 / 0.999980 / 1.000002 |
-| Two framework dispatch bugs found, fixed, accuracy-neutral | 52.25 → 0.162 ms/call, **322x** |
+| Two framework dispatch bugs found, fixed, accuracy-neutral | 52.25 → 0.162 ms/call, **322x — on torch-xla only.** One fix (86.3x) applies on native but is unmeasured there; the other (3.7x) patches `torch_xla` and cannot exist on native |
 | Kernels are provably optimal for unfusable ops | marginal HBM traffic = 1.00x the theoretical floor |
 | The device gap is not a compiler-flag artifact | 5 flag settings; the quantity a flag would move is already at its minimum |
 

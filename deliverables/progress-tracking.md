@@ -91,10 +91,24 @@ integration story, not performance.
 - **Fused RMSNorm+MLP** — **1.76x** at H=1024/I=3072; loses 1.45x at H=4096/I=4096. Wall clock,
   native, so provisional.
 
-Also found and fixed: two framework dispatch bugs worth **322x** combined per kernel call
-(52.25 → 0.162 ms). Both are the same bug twice — a cache exists and the surrounding code path
-defeats it. Neither is a property of per-layer kernel dispatch on Neuron, which is how the slowdown
-had been reported for weeks.
+Also found and fixed: two framework dispatch bugs worth **322x combined per kernel call on
+torch-xla** (52.25 → 0.162 ms). Both are the same bug twice — a cache exists and the surrounding code
+path defeats it — and neither is a property of per-layer kernel dispatch on Neuron, which is how the
+slowdown had been reported for weeks.
+
+**That 322x does not carry over to native, and the doc said so incorrectly until 2026-08-06.** The two
+fixes have different fates:
+
+- `_detect_target` shelling out to `neuron-ls` (worth 86.3x) — the code is present and still uncached
+  on native, so the bug is there, but **its value on native is unmeasured**. It was applied to both
+  native runs above, so those numbers already include it and cannot show what it is worth. Phase 1
+  closes this.
+- Registering the XLA computation once per cache key (a further 3.7x) — **cannot exist on native.** It
+  patches `torch_xla`, which is not importable there. The measurement harness now refuses the flag on
+  that stack rather than reporting a run as carrying a fix that cannot apply.
+
+Whether native has its own equivalent per-call lowering cost is **unmeasured and should not be assumed
+either way** — the dispatch path is entirely different (torch-mlir rather than `torch_xla`).
 
 ## Plan forward
 
@@ -213,8 +227,15 @@ Pinak.
 
 ## Changelog
 
-**2026-08-06** — Set up automated sync from the project repo into this section. Established that Quip
-ignores every table-width hint the API can send, so prose moved out of tables into lists.
+**2026-08-06**
+
+- **Corrected an unscoped number in this document.** It stated the two dispatch fixes were worth
+  "322x combined per kernel call" with no stack attached. That figure is **torch-xla only**: one of the
+  two fixes cannot exist on native, and the other's native value is unmeasured. Caught on review — and
+  it is the exact error this doc warns about two paragraphs earlier, so worth recording rather than
+  quietly editing.
+- Set up automated sync from the project repo into this section. Established that Quip ignores every
+  table-width hint the API can send, so prose moved out of tables into lists.
 
 **2026-08-05**
 
